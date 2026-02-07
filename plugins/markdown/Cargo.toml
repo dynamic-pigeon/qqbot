@@ -1,0 +1,10 @@
+[package]
+name = "markdown"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kovi.workspace = true
+utils.workspace = true
+base64 = "0.22"
+help_msg.workspace = true
