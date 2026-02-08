@@ -3,8 +3,10 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
+use kovi::log::error;
 use kovi::tokio;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ScreenshotManager {
     browser: Arc<tokio::sync::Mutex<Browser>>,
@@ -21,6 +23,8 @@ impl ScreenshotManager {
     async fn launch_browser() -> Result<Browser> {
         let (browser, mut handler) = Browser::launch(
             BrowserConfig::builder()
+                .no_sandbox()
+                .request_timeout(Duration::from_secs(1))
                 .build()
                 .map_err(anyhow::Error::msg)?,
         )
@@ -40,66 +44,58 @@ impl ScreenshotManager {
         let html_ref = html.as_ref();
 
         // 首次尝试截图
+        let mut browser = self.browser.lock().await;
+        if let Ok(bytes) = Self::do_screenshot(&browser, html_ref)
+            .await
+            .inspect_err(|e| error!("Screenshot error: {}", e))
         {
-            let browser = self.browser.lock().await;
-            if let Ok(bytes) = self.do_screenshot(&browser, html_ref).await {
-                return Ok(bytes);
-            }
+            return Ok(bytes);
         }
 
         // 如果失败，重启浏览器后重试
-        eprintln!("Screenshot failed, restarting browser...");
-        {
-            let mut browser_lock = self.browser.lock().await;
-            match Self::launch_browser().await {
-                Ok(new_browser) => {
-                    *browser_lock = new_browser;
-                    self.do_screenshot(&browser_lock, html_ref).await
-                }
-                Err(e) => Err(anyhow::anyhow!("Failed to restart browser: {}", e)),
+        error!("Screenshot failed, restarting browser...");
+        let _ = browser.close().await;
+        match Self::launch_browser().await {
+            Ok(new_browser) => {
+                *browser = new_browser;
+                Self::do_screenshot(&browser, html_ref).await
             }
+            Err(e) => Err(anyhow::anyhow!("Failed to restart browser: {}", e)),
         }
     }
 
-    async fn do_screenshot(&self, browser: &Browser, html: &[u8]) -> Result<Vec<u8>> {
+    async fn do_screenshot(browser: &Browser, html: &[u8]) -> Result<Vec<u8>> {
         let page = browser.new_page("about:blank").await?;
-        page.set_content(std::str::from_utf8(html)?).await?;
+        // 总之这样能保证 page.close() 能执行到
+        let res = async {
+            page.set_content(std::str::from_utf8(html)?).await?;
 
-        let bounding_box = page
-            .find_element("article.markdown-body")
-            .await?
-            .bounding_box()
-            .await?;
-        let viewport = chromiumoxide::cdp::browser_protocol::page::Viewport {
-            x: bounding_box.x,
-            y: bounding_box.y,
-            width: bounding_box.width,
-            height: bounding_box.height,
-            scale: 1.0,
-        };
-        let bytes = page
-            .screenshot(
-                ScreenshotParams::builder()
-                    .format(CaptureScreenshotFormat::Png)
-                    .clip(viewport)
-                    .full_page(true)
-                    .build(),
-            )
-            .await?;
+            let bounding_box = page
+                .find_element("article.markdown-body")
+                .await?
+                .bounding_box()
+                .await?;
+            let viewport = chromiumoxide::cdp::browser_protocol::page::Viewport {
+                x: bounding_box.x,
+                y: bounding_box.y,
+                width: bounding_box.width,
+                height: bounding_box.height,
+                scale: 1.0,
+            };
+            let bytes = page
+                .screenshot(
+                    ScreenshotParams::builder()
+                        .format(CaptureScreenshotFormat::Png)
+                        .clip(viewport)
+                        .capture_beyond_viewport(true)
+                        .build(),
+                )
+                .await?;
+            Ok(bytes)
+        }
+        .await;
         page.close().await?;
 
-        Ok(bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn test_screenshot() {
-        let manager = ScreenshotManager::init().await.unwrap();
-        let html = "<html><body><h1>Hello, world!</h1></body></html>";
-        let png_data = manager.screenshot(html).await.unwrap();
-        std::fs::write("screenshot.png", png_data).unwrap();
+        res
     }
 }

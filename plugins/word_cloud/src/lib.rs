@@ -70,7 +70,8 @@ async fn main() {
         let db = Arc::clone(&db);
         async move {
             let config = CONFIG.get().unwrap();
-            let notify_group = &config.read().await.notify_group;
+            let guard = config.read().await;
+            let notify_group = &guard.notify_group;
 
             for &group_id in notify_group {
                 let bot = Arc::clone(&bot);
@@ -81,6 +82,7 @@ async fn main() {
                 });
             }
 
+            drop(guard);
             remove_before(&db, chrono::Utc::now() - chrono::Duration::days(7)).await;
         }
     })

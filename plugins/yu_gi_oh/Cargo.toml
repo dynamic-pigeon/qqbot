@@ -1,0 +1,13 @@
+[package]
+name = "yu_gi_oh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kovi.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+help_msg.workspace = true
+base64.workspace = true
+bytes.workspace = true

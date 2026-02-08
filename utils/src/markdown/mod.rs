@@ -74,6 +74,10 @@ fn main() {
 
 $\sum_{1}^{2}$
 $$E = mc^2$$
+
+![Image](https://www.rust-lang.org/logos/rust-logo-512x512.png)
+
+![Image2](https://kovi.oss-cn-beijing.aliyuncs.com/kovi/logo/kovi-logo-512x512.png)
         
 "##;
         let png_data = md_to_img(html).await.unwrap();

@@ -9,12 +9,14 @@ kovi = "0.12.6"
 kovi-plugin-cmd = "0.3.0"
 markdown = { version = "0.1.0", path = "plugins/markdown" }
 word_cloud = { version = "0.1.0", path = "plugins/word_cloud" }
+yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
 
 [workspace]
 members = [
     "plugins/help_msg",
     "plugins/markdown",
     "plugins/word_cloud",
+    "plugins/yu_gi_oh",
     "utils",
 ]
 
@@ -25,3 +27,5 @@ serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 utils = { path = "utils" }
+base64 = "0.22"
+bytes = "1.4"

@@ -20,13 +20,13 @@ async fn main() {
         let img = match utils::md_to_img(md_content).await {
             Ok(data) => data,
             Err(err) => {
-                event.reply(format!("Error generating image: {}", err));
+                event.reply_and_quote(format!("Error generating image: {}", err));
                 return;
             }
         };
 
         let base64_img = base64::engine::general_purpose::STANDARD.encode(&img);
         let msg = Message::new().add_image(&format!("base64://{}", base64_img));
-        event.reply(msg);
+        event.reply_and_quote(msg);
     });
 }

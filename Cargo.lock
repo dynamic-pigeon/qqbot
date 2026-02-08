@@ -211,6 +211,7 @@ dependencies = [
  "kovi-plugin-cmd",
  "markdown",
  "word_cloud",
+ "yu_gi_oh",
 ]
 
 [[package]]
@@ -3960,6 +3961,19 @@ dependencies = [
  "quote",
  "syn 2.0.114",
  "synstructure",
+]
+
+[[package]]
+name = "yu_gi_oh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "help_msg",
+ "kovi",
+ "reqwest 0.13.2",
+ "serde",
 ]
 
 [[package]]
