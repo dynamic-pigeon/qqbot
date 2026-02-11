@@ -7,7 +7,7 @@ edition = "2024"
 pulldown-cmark = "0.13"
 kovi.workspace = true
 anyhow.workspace = true
-base64 = "0.22"
+base64.workspace = true
 serde.workspace = true
 reqwest = { workspace = true }
 chromiumoxide = "0.8.0"

@@ -27,11 +27,11 @@ pub static HTML_2_NEXT_IS_HIGHLIGHT_CSS: &str = r#"
     padding: 12px 12px 20px 12px;
     height: auto;
 
-    font-family: "MiSans", -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+    font-family: "Noto Sans SC", "MiSans", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
 }
 
 body{
-    font-family: Arial, sans-serif; /* 选择无衬线字体 */
+    font-family: "Noto Sans SC", "MiSans", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
     margin: 0;
     padding: 0;
     overflow: hidden;
@@ -101,11 +101,7 @@ pub static END: &str = r#"</body></html>"#;
 
 pub static HIGH_LIGHT_JS_NEXT_IS_HTML_END: &str = include_str!("html/highlight.js");
 
-// pub static HIGH_LIGHT_DARK_CSS_NEXT_IS_HTML3: &str = include_str!("html/highlight_github_dark.css");
-
 pub static HIGH_LIGHT_LIGHT_CSS_NEXT_IS_HTML3: &str =
     include_str!("html/highlight_github_light.css");
 
 pub static GITHUB_MARKDOWN_LIGHT_NEXT_IS_HTML2: &str = include_str!("html/github_md_light.css");
-
-// pub static GITHUB_MARKDOWN_DARK_NEXT_IS_HTML2: &str = include_str!("html/github_md_dark.css");

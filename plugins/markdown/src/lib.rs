@@ -3,12 +3,7 @@ use kovi::{Message, PluginBuilder as plugin};
 
 #[kovi::plugin]
 async fn main() {
-    help_msg::register_help(
-        "md".to_string(),
-        "根据 md 生成图片".to_string(),
-        Some("!md [md context]".to_string()),
-    )
-    .await;
+    help_msg::register_help("md", "根据 md 生成图片", "!md [md context]").await;
 
     plugin::on_msg(|event| async move {
         let msg = event.borrow_text().unwrap_or_default();

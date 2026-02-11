@@ -1,14 +1,14 @@
-mod fetch_card;
-
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin, log};
+
+mod fetch_card;
 
 #[kovi::plugin]
 async fn main() {
     help_msg::register_help(
-        "游戏王查卡".to_string(),
-        "与游戏王卡片信息查询相关的命令".to_string(),
-        Some("/查卡 [卡片名称] - 查询卡片信息".to_string()),
+        "游戏王查卡",
+        "与游戏王卡片信息查询相关的命令",
+        "/查卡 [卡片名称] - 查询卡片信息",
     )
     .await;
 

@@ -1,5 +1,3 @@
-// 腾讯云API签名v3 Rust实现
-// 本代码基于腾讯云API签名v3文档实现: https://cloud.tencent.com/document/product/213/30654
 use std::{
     sync::{Arc, LazyLock},
     time::Duration,

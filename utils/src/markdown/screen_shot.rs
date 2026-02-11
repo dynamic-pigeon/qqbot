@@ -1,22 +1,23 @@
-use anyhow::Result;
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::page::ScreenshotParams;
-use futures::StreamExt;
-use kovi::log::error;
-use kovi::tokio;
-use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
+use chromiumoxide::{
+    browser::{Browser, BrowserConfig},
+    cdp::browser_protocol::page::CaptureScreenshotFormat,
+    page::ScreenshotParams,
+};
+use futures::StreamExt;
+use kovi::{log::error, tokio};
+
 pub struct ScreenshotManager {
-    browser: Arc<tokio::sync::Mutex<Browser>>,
+    browser: tokio::sync::Mutex<Browser>,
 }
 
 impl ScreenshotManager {
     pub async fn init() -> Result<Self> {
         let browser = Self::launch_browser().await?;
         Ok(Self {
-            browser: Arc::new(tokio::sync::Mutex::new(browser)),
+            browser: tokio::sync::Mutex::new(browser),
         })
     }
 
@@ -25,6 +26,7 @@ impl ScreenshotManager {
             BrowserConfig::builder()
                 .no_sandbox()
                 .request_timeout(Duration::from_secs(1))
+                .window_size(1920, 1080)
                 .build()
                 .map_err(anyhow::Error::msg)?,
         )
@@ -45,16 +47,15 @@ impl ScreenshotManager {
 
         // 首次尝试截图
         let mut browser = self.browser.lock().await;
-        if let Ok(bytes) = Self::do_screenshot(&browser, html_ref)
-            .await
-            .inspect_err(|e| error!("Screenshot error: {}", e))
-        {
-            return Ok(bytes);
+        match Self::do_screenshot(&browser, html_ref).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => error!("Screenshot error: {}", e),
         }
 
         // 如果失败，重启浏览器后重试
         error!("Screenshot failed, restarting browser...");
         let _ = browser.close().await;
+        let _ = browser.wait().await;
         match Self::launch_browser().await {
             Ok(new_browser) => {
                 *browser = new_browser;

@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use kovi::serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 
-use crate::CONFIG;
+use crate::read_config;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -34,7 +34,7 @@ fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
 
 /// 执行腾讯云OCR API调用
 pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
-    let config = CONFIG.get().unwrap().read().await;
+    let config = read_config().await;
 
     // 密钥信息从配置读取
     let secret_id = &config.secret_id;

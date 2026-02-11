@@ -5,6 +5,7 @@ use pulldown_cmark::Options;
 
 mod html;
 mod screen_shot;
+
 static SCREEN_SHOT: OnceCell<screen_shot::ScreenshotManager> = OnceCell::const_new();
 
 pub async fn md_to_img(md: &str) -> Result<Vec<u8>> {
@@ -55,8 +56,9 @@ async fn md_to_html(md: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use kovi::tokio;
+
+    use super::*;
     #[tokio::test]
     async fn test_screenshot() {
         let html = r##"# Hello, world!
@@ -76,9 +78,6 @@ $\sum_{1}^{2}$
 $$E = mc^2$$
 
 ![Image](https://www.rust-lang.org/logos/rust-logo-512x512.png)
-
-![Image2](https://kovi.oss-cn-beijing.aliyuncs.com/kovi/logo/kovi-logo-512x512.png)
-        
 "##;
         let png_data = md_to_img(html).await.unwrap();
         std::fs::write("screenshot.png", png_data).unwrap();

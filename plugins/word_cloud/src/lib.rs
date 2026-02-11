@@ -4,18 +4,17 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot, chrono,
     log::{self, debug, info},
     tokio::{
         self,
         io::AsyncWriteExt,
-        sync::{RwLock, RwLockWriteGuard},
+        sync::{RwLock, RwLockReadGuard},
     },
 };
-
-use anyhow::Result;
-use base64::{Engine, engine::general_purpose::STANDARD};
 
 mod ocr;
 
@@ -24,9 +23,9 @@ static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 #[kovi::plugin]
 async fn main() {
     help_msg::register_help(
-        "wordcloud".to_string(),
-        "启用或禁用词云功能（管理员专用命令）".to_string(),
-        Some("/wordcloud enable - 启用词云功能\n/wordcloud disable - 禁用词云功能".to_string()),
+        "wordcloud",
+        "启用或禁用词云功能（管理员专用命令）",
+        "/wordcloud enable - 启用词云功能\n/wordcloud disable - 禁用词云功能",
     )
     .await;
 
@@ -69,9 +68,8 @@ async fn main() {
         let bot = Arc::clone(&bot);
         let db = Arc::clone(&db);
         async move {
-            let config = CONFIG.get().unwrap();
-            let guard = config.read().await;
-            let notify_group = &guard.notify_group;
+            let config = read_config().await;
+            let notify_group = &config.notify_group;
 
             for &group_id in notify_group {
                 let bot = Arc::clone(&bot);
@@ -81,8 +79,7 @@ async fn main() {
                     send_word_cloud(&bot, group_id, &path, &db).await;
                 });
             }
-
-            drop(guard);
+            drop(config);
             remove_before(&db, chrono::Utc::now() - chrono::Duration::days(7)).await;
         }
     })
@@ -115,14 +112,7 @@ async fn main() {
                 return;
             }
 
-            if !CONFIG
-                .get()
-                .unwrap()
-                .read()
-                .await
-                .notify_group
-                .contains(&group_id)
-            {
+            if !read_config().await.notify_group.contains(&group_id) {
                 return;
             }
 
@@ -140,36 +130,24 @@ async fn main() {
 async fn exe_cmd(cmd: &str, group_id: i64) -> Result<&str> {
     match cmd {
         "enable" => {
-            let cfg = CONFIG.get().unwrap();
-            let mut config = cfg.write().await;
-            if !config.notify_group.contains(&group_id) {
-                config.notify_group.push(group_id);
-                write_config(config).await?;
-            }
+            modify_config(|config| {
+                if !config.notify_group.contains(&group_id) {
+                    config.notify_group.push(group_id);
+                }
+            })
+            .await?;
             Ok("启用成功")
         }
         "disable" => {
-            let cfg = CONFIG.get().unwrap();
-            let mut config = cfg.write().await;
-            if let Some(pos) = config.notify_group.iter().position(|&x| x == group_id) {
-                config.notify_group.remove(pos);
-                write_config(config).await?;
-            }
+            modify_config(|config| {
+                config.notify_group.retain(|&id| id != group_id);
+            })
+            .await?;
             Ok("停用成功")
         }
         _ => {
             anyhow::bail!("未知命令: {}", cmd);
         }
-    }
-}
-
-async fn write_config(config: RwLockWriteGuard<'_, Config>) -> Result<()> {
-    let config_path = &config.path;
-    match kovi::utils::save_json_data(&*config, config_path) {
-        Err(e) => {
-            anyhow::bail!("保存配置文件失败: {}", e);
-        }
-        Ok(_) => Ok(()),
     }
 }
 
@@ -239,29 +217,32 @@ async fn make_word_cloud(path: &Path, notify_group: i64, db: &sqlx::SqlitePool) 
         .collect::<Vec<_>>()
         .join(" ");
 
-    let wc_cli = CONFIG
-        .get()
-        .unwrap()
-        .read()
-        .await
-        .wordcloud_cli_path
-        .clone();
+    let wc_cli = read_config().await.wordcloud_cli_path.clone();
     let mask_path = path.join("mask.jpg");
     let stop_word_path = path.join("stopword.txt");
     let fontfile_path = path.join("font.otf");
 
-    let mut child = tokio::process::Command::new(wc_cli)
-        .arg("--mask")
-        .arg(mask_path)
+    let mut command = tokio::process::Command::new(wc_cli);
+
+    command
         .args(["--background", "white"])
-        .arg("--stopwords")
-        .arg(stop_word_path)
-        .arg("--fontfile")
-        .arg(fontfile_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    if mask_path.exists() {
+        command.arg("--mask").arg(mask_path);
+    }
+
+    if stop_word_path.exists() {
+        command.arg("--stopwords").arg(stop_word_path);
+    }
+
+    if fontfile_path.exists() {
+        command.arg("--fontfile").arg(fontfile_path);
+    }
+
+    let mut child = command.spawn()?;
 
     child
         .stdin
@@ -271,6 +252,13 @@ async fn make_word_cloud(path: &Path, notify_group: i64, db: &sqlx::SqlitePool) 
         .await?;
 
     let output = child.wait_with_output().await?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "wordcloud_cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     Ok(output.stdout)
 }
@@ -356,5 +344,32 @@ impl Default for Config {
             secret_key: "".to_string(),
             path: PathBuf::new(),
         }
+    }
+}
+
+#[inline(always)]
+async fn modify_config<F>(f: F) -> Result<()>
+where
+    F: FnOnce(&mut Config),
+{
+    let cfg = CONFIG.get().unwrap();
+    let mut config = cfg.write().await;
+    f(&mut config);
+    write_config(&mut config).await
+}
+
+#[inline(always)]
+async fn read_config<'a>() -> RwLockReadGuard<'a, Config> {
+    let cfg = CONFIG.get().unwrap();
+    cfg.read().await
+}
+
+async fn write_config(config: &mut Config) -> Result<()> {
+    let config_path = &config.path;
+    match kovi::utils::save_json_data(&*config, config_path) {
+        Err(e) => {
+            anyhow::bail!("保存配置文件失败: {}", e);
+        }
+        Ok(_) => Ok(()),
     }
 }
