@@ -1,21 +1,15 @@
 use anyhow::Result;
 use html::END;
-use kovi::{log::error, tokio::sync::OnceCell};
+use kovi::log::error;
 use pulldown_cmark::Options;
 
 mod html;
-mod screen_shot;
-
-static SCREEN_SHOT: OnceCell<screen_shot::ScreenshotManager> = OnceCell::const_new();
 
 pub async fn md_to_img(md: &str) -> Result<Vec<u8>> {
     let html = md_to_html(md).await;
 
-    let screenshot_lock = SCREEN_SHOT
-        .get_or_init(async || screen_shot::ScreenshotManager::init().await.unwrap())
-        .await;
-
-    let png_data = match screenshot_lock.screenshot(&html).await {
+    let png_data = match crate::screen_shot::screenshot(&html, Some("article.markdown-body")).await
+    {
         Ok(v) => v,
         Err(err) => {
             error!("{}", err);

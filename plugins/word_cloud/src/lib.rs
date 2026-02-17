@@ -327,12 +327,17 @@ async fn remove_before(db: &sqlx::SqlitePool, time: chrono::DateTime<chrono::Utc
 struct Config {
     pub wordcloud_cli_path: String,
     pub notify_group: Vec<i64>,
+    pub tencent: Option<TencentCloudConfig>,
+    #[serde(skip)]
+    pub path: PathBuf,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug)]
+struct TencentCloudConfig {
     #[serde(rename = "SecretId")]
     pub secret_id: String,
     #[serde(rename = "SecretKey")]
     pub secret_key: String,
-    #[serde(skip)]
-    pub path: PathBuf,
 }
 
 impl Default for Config {
@@ -340,8 +345,7 @@ impl Default for Config {
         Self {
             wordcloud_cli_path: "wordcloud_cli".to_string(),
             notify_group: vec![],
-            secret_id: "".to_string(),
-            secret_key: "".to_string(),
+            tencent: None,
             path: PathBuf::new(),
         }
     }
