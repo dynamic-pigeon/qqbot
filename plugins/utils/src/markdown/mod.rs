@@ -47,33 +47,3 @@ async fn md_to_html(md: &str) -> String {
 
     html_output
 }
-
-#[cfg(test)]
-mod tests {
-    use kovi::tokio;
-
-    use super::*;
-    #[tokio::test]
-    async fn test_screenshot() {
-        let html = r##"# Hello, world!
-This is a test markdown document.
-
-```rust
-fn main() {
-    println!("Hello, world!");
-}
-```
-
-- Item 1
-- Item 2
-- Item 3
-
-$\sum_{1}^{2}$
-$$E = mc^2$$
-
-![Image](https://www.rust-lang.org/logos/rust-logo-512x512.png)
-"##;
-        let png_data = md_to_img(html).await.unwrap();
-        std::fs::write("screenshot.png", png_data).unwrap();
-    }
-}

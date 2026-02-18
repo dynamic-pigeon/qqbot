@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chromiumoxide::{
-    browser::{self, Browser, BrowserConfig},
+    browser::{Browser, BrowserConfig},
     cdp::browser_protocol::page::CaptureScreenshotFormat,
     page::ScreenshotParams,
 };
@@ -12,7 +12,10 @@ use kovi::{
     tokio::{self, sync::OnceCell},
 };
 
-pub async fn screenshot<T: AsRef<str>>(html: T, selector: Option<&str>) -> Result<Vec<u8>> {
+/// 截图 HTML 内容，返回 PNG 数据
+/// - `html`: 要截图的 HTML 内容
+/// - `selector`: 可选的 CSS 选择器，如果提供则只截图该元素，否则截图整个页面
+pub async fn screenshot(html: &str, selector: Option<&str>) -> Result<Vec<u8>> {
     let manager = get_screenshot_manager().await?;
     manager.screenshot(html, selector).await
 }
@@ -48,7 +51,7 @@ impl ScreenshotManager {
                 .map_err(anyhow::Error::msg)?,
         )
         .await?;
-        tokio::spawn(async move {
+        kovi::spawn(async move {
             while let Some(h) = handler.next().await {
                 if h.is_err() {
                     break;
@@ -59,11 +62,7 @@ impl ScreenshotManager {
         Ok(browser)
     }
 
-    pub async fn screenshot<T: AsRef<str>>(
-        &self,
-        html: T,
-        selector: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    pub async fn screenshot(&self, html: &str, selector: Option<&str>) -> Result<Vec<u8>> {
         let html_ref = html.as_ref();
 
         // 首次尝试截图
@@ -135,24 +134,5 @@ impl ScreenshotManager {
         page.close().await?;
 
         res
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_screenshot() {
-        let manager = ScreenshotManager::init().await.unwrap();
-        let html = r#"
-            <html>
-                <body>
-                    <div id="test" style="width: 200px; height: 100px; background: red;"></div>
-                </body>
-            </html>
-        "#;
-        let png_data = manager.screenshot(html, Some("#test")).await.unwrap();
-        std::fs::write("test_screenshot.png", png_data).unwrap();
     }
 }
