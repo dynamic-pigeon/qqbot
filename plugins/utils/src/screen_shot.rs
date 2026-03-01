@@ -63,11 +63,9 @@ impl ScreenshotManager {
     }
 
     pub async fn screenshot(&self, html: &str, selector: Option<&str>) -> Result<Vec<u8>> {
-        let html_ref = html.as_ref();
-
         // 首次尝试截图
         let browser = self.browser.read().await;
-        match Self::do_screenshot(&browser, html_ref, selector).await {
+        match Self::do_screenshot(&browser, html, selector).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) => error!("Screenshot error: {}", e),
         }
@@ -89,7 +87,7 @@ impl ScreenshotManager {
 
         // 重试截图
         let browser = self.browser.read().await;
-        Self::do_screenshot(&browser, html_ref, selector).await
+        Self::do_screenshot(&browser, html, selector).await
     }
 
     async fn do_screenshot(

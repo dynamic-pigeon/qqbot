@@ -1,5 +1,4 @@
 /target
 kovi.conf.toml
 kovi.plugin.toml
-data/word_cloud/config.json
-data/word_cloud/word_cloud.db
+data/
