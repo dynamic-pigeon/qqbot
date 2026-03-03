@@ -3,28 +3,29 @@ use std::{cmp::Reverse, sync::Arc};
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
-use kovi::{PluginBuilder as plugin, RuntimeBot, log, tokio};
+use futures::TryFutureExt as _;
+use help_msg::register_help;
+use kovi::{PluginBuilder as plugin, RuntimeBot, log};
 
 mod user_info;
 
 pub async fn init() -> Result<()> {
+    register_help("今日发言排行", "今日发言排行", "#今日发言排行").await;
     let bot = crate::plugin::get_runtime_bot();
     plugin::on_group_msg(move |event| {
         let bot = Arc::clone(&bot);
         async move {
-            if !bot.get_all_admin().unwrap().contains(&event.user_id) {
+            let text = event.borrow_text().unwrap_or_default();
+            if text.trim() != "#今日发言排行" {
                 return;
             }
-            let text = event.borrow_text().unwrap_or_default();
-            let Some(id) = text.strip_prefix("/msg_cnt") else {
-                return;
-            };
-            let group = id.trim().parse::<i64>().unwrap();
-            match gen_daily_rank_html(&bot, group).await {
-                Ok(html) => {
-                    let html = utils::screenshot(&html, None).await.unwrap();
-                    let base64_html = STANDARD.encode(html);
-                    let msg = kovi::Message::new().add_image(&format!("base64://{}", base64_html));
+            match gen_daily_rank_html(&bot, event.group_id)
+                .and_then(async |html| utils::screenshot(&html, None).await)
+                .await
+            {
+                Ok(image) => {
+                    let base64_image = STANDARD.encode(image);
+                    let msg = kovi::Message::new().add_image(&format!("base64://{}", base64_image));
                     event.reply(msg);
                 }
                 Err(e) => {

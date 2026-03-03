@@ -1691,6 +1691,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "futures",
  "help_msg",
  "hex",
  "hmac",

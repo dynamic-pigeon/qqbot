@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::{Ok, Result};
 use kovi::{
     RuntimeBot, log,
@@ -7,6 +5,7 @@ use kovi::{
 };
 
 pub(crate) struct UserInfo {
+    #[allow(dead_code)]
     pub user_id: i64,
     // QQ昵称或者群名片
     pub nickname: String,
