@@ -34,3 +34,4 @@ moka = { version = "0.12.10", features = ["future"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 futures-util = "0.3"
 futures = "0.3"
+itertools = "0.14.0"

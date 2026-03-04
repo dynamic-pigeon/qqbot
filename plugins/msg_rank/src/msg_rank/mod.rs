@@ -5,6 +5,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
 use futures::TryFutureExt as _;
 use help_msg::register_help;
+use itertools::izip;
 use kovi::{PluginBuilder as plugin, RuntimeBot, log};
 
 mod user_info;
@@ -20,7 +21,7 @@ pub async fn init() -> Result<()> {
                 return;
             }
             match gen_daily_rank_html(&bot, event.group_id)
-                .and_then(async |html| utils::screenshot(&html, None).await)
+                .and_then(async |html| utils::screenshot(html.into(), None).await)
                 .await
             {
                 Ok(image) => {
@@ -56,7 +57,7 @@ async fn today_msg_cnt(group_id: i64) -> Result<Vec<(i64, u32)>> {
     Ok(msg_cnts)
 }
 
-/// 生成每日发言排行 HTML（仅展示前 5 名），并写入指定路径，返回写入路径
+/// 生成每日发言排行 HTML（仅展示前 5 名）
 pub async fn gen_daily_rank_html(bot: &RuntimeBot, group_id: i64) -> Result<String> {
     // 获取今日各用户发言数
     let mut msg_cnts = today_msg_cnt(group_id).await?;
@@ -97,14 +98,19 @@ fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> String {
     let date_str = chrono::Local::now().format("%Y年%m月%d日").to_string();
 
     // 徽章：前三名特殊颜色
-    let medal_colors = ["#FFD700", "#C0C0C0", "#CD7F32"];
-    let medals = ["🥇", "🥈", "🥉", "4", "5"];
+    let medal_colors = ["#FFD700", "#C0C0C0", "#CD7F32"]
+        .into_iter()
+        .chain((0..).map(|_| "#6c757d"));
+    let medals = ["🥇", "🥈", "🥉"]
+        .into_iter()
+        .map(|s| s.to_string())
+        .chain((4..).map(|n| n.to_string()));
 
     let mut rows = String::new();
-    for (i, (info, cnt)) in entries.iter().enumerate() {
+    for (i, ((info, cnt), medal, medal_color)) in
+        izip!(entries.iter(), medals, medal_colors).enumerate()
+    {
         let rank = i + 1;
-        let medal = medals.get(i).copied().unwrap_or("?");
-        let medal_color = medal_colors.get(i).copied().unwrap_or("#6c757d");
 
         // 将头像转为 base64 data URL（若为空则使用占位 SVG）
         let avatar_src = if info.avatar.is_empty() {

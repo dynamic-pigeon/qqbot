@@ -8,7 +8,11 @@ mod html;
 pub async fn md_to_img(md: &str) -> Result<Vec<u8>> {
     let html = md_to_html(md).await;
 
-    let png_data = match crate::screen_shot::screenshot(&html, Some("article.markdown-body")).await
+    let png_data = match crate::screen_shot::screenshot(
+        html.into(),
+        Some(std::borrow::Cow::Borrowed("article.markdown-body")),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
