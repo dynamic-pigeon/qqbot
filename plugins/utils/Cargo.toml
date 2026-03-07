@@ -12,5 +12,4 @@ serde.workspace = true
 reqwest = { workspace = true }
 chromiumoxide = "0.8.0"
 futures = "0.3"
-askama = "0.12"
 tokio = { version = "1", features = ["macros", "time", "rt"] }
