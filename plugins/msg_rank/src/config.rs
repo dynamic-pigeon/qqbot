@@ -1,6 +1,7 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use kovi::tokio::sync::RwLockReadGuard;
-use std::path::PathBuf;
 
 static CONFIG: kovi::tokio::sync::OnceCell<kovi::tokio::sync::RwLock<Config>> =
     kovi::tokio::sync::OnceCell::const_new();

@@ -1,5 +1,4 @@
-use std::time::Duration;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use chromiumoxide::{
@@ -12,8 +11,10 @@ use kovi::{
     log::{error, info},
     tokio::sync::{OnceCell, mpsc, oneshot},
 };
-use tokio::task::JoinSet;
-use tokio::time::{self, Instant};
+use tokio::{
+    task::JoinSet,
+    time::{self, Instant},
+};
 
 /// 浏览器空闲超时时间，超过此时间没有截图任务则自动关闭浏览器
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -117,11 +118,11 @@ async fn screenshot_worker(mut rx: mpsc::Receiver<ScreenshotTask>) {
             // 空闲超时：浏览器已启动且无活跃任务时生效
             () = &mut idle_deadline, if idle_eligible => {
                 info!("Screenshot worker: idle timeout, shutting down browser");
-                if let Some(b) = browser.take() {
-                    if let Ok(mut b) = Arc::try_unwrap(b) {
+                if let Some(b) = browser.take()
+                    && let Ok(mut b) = Arc::try_unwrap(b)
+                {
                         let _ = b.close().await;
                         let _ = b.wait().await;
-                    }
                 }
             }
 
@@ -134,11 +135,11 @@ async fn screenshot_worker(mut rx: mpsc::Receiver<ScreenshotTask>) {
     while tasks.join_next().await.is_some() {}
 
     // 退出前关闭浏览器
-    if let Some(b) = browser.take() {
-        if let Ok(mut b) = Arc::try_unwrap(b) {
-            let _ = b.close().await;
-            let _ = b.wait().await;
-        }
+    if let Some(b) = browser.take()
+        && let Ok(mut b) = Arc::try_unwrap(b)
+    {
+        let _ = b.close().await;
+        let _ = b.wait().await;
     }
 }
 
