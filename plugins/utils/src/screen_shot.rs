@@ -72,7 +72,7 @@ async fn screenshot_worker(mut rx: mpsc::Receiver<ScreenshotTask>) {
     let mut tasks: JoinSet<()> = JoinSet::new();
 
     let idle_deadline = time::sleep(IDLE_TIMEOUT);
-    tokio::pin!(idle_deadline);
+    let mut idle_deadline = std::pin::pin!(idle_deadline);
 
     loop {
         let idle_eligible = browser.is_some() && tasks.is_empty();

@@ -1,8 +1,5 @@
 use anyhow::{Ok, Result};
-use kovi::{
-    RuntimeBot, log,
-    serde_json::{self, Value},
-};
+use kovi::{RuntimeBot, log, serde_json};
 
 pub(crate) struct UserInfo {
     #[allow(dead_code)]
@@ -41,11 +38,7 @@ async fn parse_api_res(resp: kovi::ApiReturn) -> Result<UserInfo> {
         anyhow::bail!("API请求失败: {:?}", resp);
     }
 
-    let Value::Object(data) = resp.data else {
-        anyhow::bail!("API响应格式错误");
-    };
-
-    let item = serde_json::from_value::<UserInfoApiResponse>(Value::Object(data))?;
+    let item = serde_json::from_value::<UserInfoApiResponse>(resp.data)?;
     let avatar = get_avatar(item.user_id).await?;
     let nickname = if item.card.is_empty() {
         item.nickname
