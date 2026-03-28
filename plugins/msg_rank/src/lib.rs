@@ -32,7 +32,13 @@ async fn main() {
 }
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
-    let text = get_text(&event.message).await;
+    let group = event.group_id;
+    let text = if config::read_config().await.notify_group.contains(&group) {
+        &get_text(&event.message).await
+    } else {
+        // 如果不在监控的群里，就不进行OCR，直接返回文本内容
+        event.borrow_text().unwrap_or_default()
+    };
     if let Err(e) = db::add_msg(event.group_id, event.user_id, &text).await {
         log::error!("添加消息失败: {}", e);
     }
