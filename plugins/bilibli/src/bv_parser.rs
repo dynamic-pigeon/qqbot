@@ -139,14 +139,33 @@ mod tests {
     use kovi::tokio;
 
     use super::*;
+
     #[tokio::test]
-    async fn test() {
-        let url = "https://b23.tv/2xGmyVK";
+    async fn test_long() {
+        let url = "https://www.bilibili.com/video/BV198XLBaEYp";
         let info = parse_url(url).await.unwrap();
         println!("标题: {}", info.title);
         println!("作者: {}", info.name);
         println!("观看: {}", info.view);
         println!("评论: {}", info.coin);
         println!("点赞: {}", info.like);
+    }
+
+    #[tokio::test]
+    async fn test_invalid() {
+        let url = "https://www.bilibili.com/video/invalid";
+        let res = parse_url(url).await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_v_text() {
+        let txt = "【Fate/strange Fake】第13话（完结）[图片]UP主：花园字幕组
+点赞：130 投币：47
+收藏：72 观看：8359
+https://www.bilibili.com/video/BV198XLBaEYp";
+
+        let res = parse_url(txt).await;
+        assert!(res.is_ok());
     }
 }
