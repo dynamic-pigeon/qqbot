@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use itertools::Itertools as _;
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
     event::GroupMsgEvent,
@@ -135,8 +136,7 @@ async fn send_word_cloud(
 ) {
     let image = match make_word_cloud(path, group_id, duration).await {
         Ok(image) if !image.is_empty() => image,
-        Ok(image) => {
-            assert!(image.is_empty());
+        Ok(_) => {
             info!("word cloud is empty, group_id: {}", group_id);
             return;
         }
@@ -178,7 +178,6 @@ async fn make_word_cloud(
         .cut(&messages, true)
         .into_iter()
         .filter(|s| s.chars().count() > 1)
-        .collect::<Vec<_>>()
         .join(" ");
 
     let wc_cli = read_config().await.wordcloud_cli_path.clone();

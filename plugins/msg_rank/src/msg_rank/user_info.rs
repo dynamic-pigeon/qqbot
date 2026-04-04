@@ -1,6 +1,8 @@
 use anyhow::{Ok, Result};
 use kovi::{RuntimeBot, log, serde_json};
 
+use crate::HTTP_CLIENT;
+
 pub(crate) struct UserInfo {
     #[allow(dead_code)]
     pub user_id: i64,
@@ -55,7 +57,7 @@ async fn parse_api_res(resp: kovi::ApiReturn) -> Result<UserInfo> {
 
 async fn get_avatar(user_id: i64) -> Result<bytes::Bytes> {
     let avatar_url = format!("https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640");
-    let resp = reqwest::get(&avatar_url).await?;
+    let resp = HTTP_CLIENT.get(&avatar_url).send().await?;
     let bytes = resp.bytes().await?;
     Ok(bytes)
 }

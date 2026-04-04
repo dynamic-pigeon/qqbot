@@ -11,6 +11,14 @@ pub(crate) async fn init_db(path: &Path) -> Result<()> {
         .get_or_try_init(async || {
             SqlitePoolOptions::new()
                 .max_connections(2)
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA synchronous = NORMAL;")
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
                 .connect_lazy(path.to_str().unwrap())
         })
         .await?;

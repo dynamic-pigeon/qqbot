@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, log, tokio};
 
@@ -7,6 +10,14 @@ mod db;
 mod msg_rank;
 mod ocr;
 mod word_cloud;
+
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(16)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+});
 
 #[kovi::plugin]
 async fn main() {
@@ -39,7 +50,7 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
         // 如果不在监控的群里，就不进行OCR，直接返回文本内容
         event.borrow_text().unwrap_or_default()
     };
-    if let Err(e) = db::add_msg(event.group_id, event.user_id, &text).await {
+    if let Err(e) = db::add_msg(event.group_id, event.user_id, text).await {
         log::error!("添加消息失败: {}", e);
     }
 }
