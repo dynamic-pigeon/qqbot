@@ -1,4 +1,7 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use anyhow::Result;
 
@@ -46,12 +49,28 @@ pub struct BvInfo {
     pub favorite: u32,
 }
 
+static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::REFERER,
+        reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
+    );
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(16)
+        .default_headers(headers)
+        .build()
+        .unwrap()
+});
+
 impl ApiRes {
-    async fn to_bv_info(self, url: String) -> Result<BvInfo> {
+    async fn into_bv_info(self, url: String) -> Result<BvInfo> {
         if self.code != 0 {
             anyhow::bail!("请求失败: {}", self.message);
         }
-        let pic = reqwest::get(&self.data.pic).await?.bytes().await?;
+        let pic = CLIENT.get(&self.data.pic).send().await?.bytes().await?;
 
         Ok(BvInfo {
             title: self.data.title,
@@ -67,6 +86,13 @@ impl ApiRes {
     }
 }
 
+static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"https?://www\.bilibili\.com/video/(?P<bv>BV[0-9A-Za-z]{10})").unwrap()
+});
+
+static SHORT_URL_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap());
+
 pub async fn parse_url(url: &str) -> Result<Arc<BvInfo>> {
     match parse_long_url(url).await {
         Ok(info) => Ok(info),
@@ -75,8 +101,7 @@ pub async fn parse_url(url: &str) -> Result<Arc<BvInfo>> {
 }
 
 async fn parse_long_url(url: &str) -> Result<Arc<BvInfo>> {
-    let re = regex::Regex::new(r"https?://www\.bilibili\.com/video/(?P<bv>BV\w+)").unwrap();
-    if let Some(caps) = re.captures(url) {
+    if let Some(caps) = LONG_URL_RE.captures(url) {
         let bv = &caps["bv"];
         return parse_bv(bv).await;
     }
@@ -84,11 +109,10 @@ async fn parse_long_url(url: &str) -> Result<Arc<BvInfo>> {
 }
 
 async fn parse_short_url(url: &str) -> Result<Arc<BvInfo>> {
-    let re = regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap();
-    if !re.is_match(url) {
+    if !SHORT_URL_RE.is_match(url) {
         anyhow::bail!("未匹配到短链接");
     }
-    let resp = reqwest::get(url).await?;
+    let resp = CLIENT.get(url).send().await?;
     let final_url = resp.url();
     parse_long_url(final_url.as_str()).await
 }
@@ -105,25 +129,9 @@ async fn parse_bv(bv: &str) -> Result<Arc<BvInfo>> {
         .entry_by_ref(bv)
         .or_try_insert_with(async {
             let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::REFERER,
-                reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
-            );
-            let client = reqwest::Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                .default_headers(headers)
-                .build()
-                .unwrap();
-            let res = client
-                .get(&url)
-                .send()
-                .await
-                .unwrap()
-                .json::<ApiRes>()
-                .await?;
+            let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
 
-            res.to_bv_info(format!("https://www.bilibili.com/video/{}", bv))
+            res.into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
                 .await
                 .map(Arc::new)
         })

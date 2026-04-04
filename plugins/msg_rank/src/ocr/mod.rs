@@ -13,6 +13,8 @@ mod tencent;
 
 use tencent::get_ocr;
 
+use crate::HTTP_CLIENT;
+
 static OCR_MEMORY: LazyLock<OcrMemory> = LazyLock::new(OcrMemory::new);
 
 struct OcrMemory {
@@ -73,7 +75,7 @@ pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
 
 /// 从URL获取图片
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
-    let req = reqwest::get(img_url).await?;
+    let req = HTTP_CLIENT.get(img_url).send().await?;
     if !req.status().is_success() {
         return Err(anyhow::anyhow!("Failed to get image from URL"));
     }

@@ -11,7 +11,7 @@ use kovi::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::config::read_config;
+use crate::{config::read_config, ocr::HTTP_CLIENT};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -118,9 +118,8 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
 
     // ************* 步骤 5：构造并发起请求 *************
     let url = format!("https://{}", host);
-    let client = reqwest::Client::new();
 
-    let mut request = client
+    let mut request = HTTP_CLIENT
         .post(&url)
         .header("Authorization", authorization)
         .header("Content-Type", "application/json; charset=utf-8")

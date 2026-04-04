@@ -23,6 +23,12 @@ pub struct BvParser {
     cache: moka::future::Cache<String, ()>,
 }
 
+impl Default for BvParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BvParser {
     pub fn new() -> Self {
         Self {
@@ -33,26 +39,22 @@ impl BvParser {
         }
     }
 
-    pub async fn parse(&self, url: &str) -> Result<Arc<bv_parser::BvInfo>> {
-        let g = self
-            .cache
-            .entry_by_ref(url)
-            .or_insert_with(async { () })
-            .await;
+    pub async fn parse(&self, txt: &str) -> Result<Arc<bv_parser::BvInfo>> {
+        let g = self.cache.entry_by_ref(txt).or_insert_with(async {}).await;
 
         // 每个群每50秒只能解析一次同一个链接，防止和其他机器人死循环
         if !g.is_fresh() {
             anyhow::bail!("已经解析过了");
         }
 
-        parse_url(url).await
+        parse_url(txt).await
     }
 }
 
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
-    static PARSER: LazyLock<DashMap<i64, BvParser>> = LazyLock::new(|| DashMap::new());
+    static PARSER: LazyLock<DashMap<i64, BvParser>> = LazyLock::new(DashMap::new);
     let group_id = event.group_id;
-    let parser = PARSER.entry(group_id).or_insert_with(|| BvParser::new());
+    let parser = PARSER.entry(group_id).or_default();
     for msg in event.message.iter() {
         let bv_info = match msg.type_.as_str() {
             "json" => {

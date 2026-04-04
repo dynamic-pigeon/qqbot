@@ -9,11 +9,12 @@ use chromiumoxide::{
 use futures::StreamExt;
 use kovi::{
     log::{error, info},
-    tokio::sync::{OnceCell, mpsc, oneshot},
-};
-use tokio::{
-    task::JoinSet,
-    time::{self, Instant},
+    tokio::{
+        self,
+        sync::{OnceCell, mpsc, oneshot},
+        task::JoinSet,
+        time::{self, Instant},
+    },
 };
 
 /// 浏览器空闲超时时间，超过此时间没有截图任务则自动关闭浏览器
