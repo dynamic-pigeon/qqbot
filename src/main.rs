@@ -7,7 +7,7 @@ fn main() {
         help_msg,
         markdown,
         yu_gi_oh,
-        bilibli
+        bilibili
     )
     .run();
 }

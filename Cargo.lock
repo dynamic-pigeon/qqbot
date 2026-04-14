@@ -246,7 +246,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bilibli"
+name = "bilibili"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -282,7 +282,7 @@ dependencies = [
 name = "bot"
 version = "0.1.0"
 dependencies = [
- "bilibli",
+ "bilibili",
  "help_msg",
  "kovi",
  "kovi-plugin-cmd",

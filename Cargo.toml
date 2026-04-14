@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bilibli = { version = "0.1.0", path = "plugins/bilibli" }
+bilibili = { version = "0.1.0", path = "plugins/bilibili" }
 help_msg = { version = "0.1.0", path = "plugins/help_msg" }
 kovi = "0.12.6"
 kovi-plugin-cmd = "0.3.0"
@@ -18,7 +18,8 @@ members = [
     "plugins/markdown",
     "plugins/yu_gi_oh",
     "plugins/utils",
-    "plugins/msg_rank", "plugins/bilibli",
+    "plugins/msg_rank",
+    "plugins/bilibili",
 ]
 
 [workspace.dependencies]
