@@ -52,6 +52,7 @@ where
     let cfg = CONFIG.get().unwrap();
     let mut config = cfg.write().await;
     f(&mut config);
+    // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
     write_config(&mut config).await
 }
 
