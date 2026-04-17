@@ -35,42 +35,36 @@ pub(crate) async fn init() -> Result<()> {
     let bot_ = Arc::clone(&bot);
     let path_ = Arc::clone(&path);
     plugin::cron("0 21 * * *", move || {
-        let path = Arc::clone(&path_);
-        let bot = Arc::clone(&bot_);
-        async move {
-            let config = read_config().await;
-            let notify_group = &config.notify_group;
+        let path = &path_;
+        let bot = &bot_;
+        let config = read_config();
+        let notify_group = &config.notify_group;
 
-            for &group_id in notify_group {
-                let bot = Arc::clone(&bot);
-                let path = Arc::clone(&path);
-                kovi::spawn(async move {
-                    send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "今日词云")
-                        .await;
-                });
-            }
-            drop(config);
+        for &group_id in notify_group {
+            let bot = Arc::clone(bot);
+            let path = Arc::clone(path);
+            kovi::spawn(async move {
+                send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "今日词云").await;
+            });
         }
+        async move {}
     })
     .unwrap();
     let bot_ = Arc::clone(&bot);
     plugin::cron("0 10 * * 6", move || {
-        let path = Arc::clone(&path);
-        let bot = Arc::clone(&bot_);
-        async move {
-            let config = read_config().await;
-            let notify_group = &config.notify_group;
+        let path = &path;
+        let bot = &bot_;
+        let config = read_config();
+        let notify_group = &config.notify_group;
 
-            for &group_id in notify_group {
-                let bot = Arc::clone(&bot);
-                let path = Arc::clone(&path);
-                kovi::spawn(async move {
-                    send_word_cloud(&bot, group_id, &path, chrono::Duration::days(7), "上周词云")
-                        .await;
-                });
-            }
-            drop(config);
+        for &group_id in notify_group {
+            let bot = Arc::clone(bot);
+            let path = Arc::clone(path);
+            kovi::spawn(async move {
+                send_word_cloud(&bot, group_id, &path, chrono::Duration::days(7), "上周词云").await;
+            });
         }
+        async move {}
     })
     .unwrap();
     Ok(())
@@ -108,6 +102,14 @@ async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<Ru
                 })
                 .await?;
                 Ok("停用成功")
+            }
+            "status" => {
+                let config = read_config();
+                if config.notify_group.contains(&group_id) {
+                    Ok("词云功能已启用")
+                } else {
+                    Ok("词云功能未启用")
+                }
             }
             _ => {
                 anyhow::bail!("未知命令: {}", cmd);
@@ -180,7 +182,7 @@ async fn make_word_cloud(
         .filter(|s| s.chars().count() > 1)
         .join(" ");
 
-    let wc_cli = read_config().await.wordcloud_cli_path.clone();
+    let wc_cli = crate::config::read_config().wordcloud_cli_path.clone();
     let mask_path = path.join("mask.jpg");
     let stop_word_path = path.join("stopword.txt");
     let fontfile_path = path.join("font.otf");

@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use kovi::tokio::sync::RwLockReadGuard;
+use crossbeam_epoch::{Atomic, Owned};
 
-static CONFIG: kovi::tokio::sync::OnceCell<kovi::tokio::sync::RwLock<Config>> =
+pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<Atomic<Config>> =
     kovi::tokio::sync::OnceCell::const_new();
+static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
     pub wordcloud_cli_path: String,
     pub notify_group: Vec<i64>,
@@ -15,7 +16,7 @@ pub struct Config {
     pub path: PathBuf,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct TencentCloudConfig {
     #[serde(rename = "SecretId")]
     pub secret_id: String,
@@ -34,12 +35,45 @@ impl Default for Config {
     }
 }
 
+pub struct ConfigGuard<'a> {
+    guard: crossbeam_epoch::Guard,
+    config: &'a Atomic<Config>,
+}
+
+impl<'a> ConfigGuard<'a> {
+    fn new(config: &'a Atomic<Config>) -> Self {
+        let guard = crossbeam_epoch::pin();
+        Self { guard, config }
+    }
+
+    fn load(&self) -> &Config {
+        let ptr = self
+            .config
+            .load(std::sync::atomic::Ordering::Relaxed, &self.guard);
+        unsafe { ptr.deref() }
+    }
+}
+
+impl<'a> std::ops::Deref for ConfigGuard<'a> {
+    type Target = Config;
+
+    fn deref(&self) -> &Self::Target {
+        self.load()
+    }
+}
+
+pub fn read_config<'a>() -> ConfigGuard<'a> {
+    let config = CONFIG.get().expect("配置未初始化");
+    ConfigGuard::new(config)
+}
+
 pub async fn init_config(path: PathBuf) -> Result<()> {
     let mut config: Config = kovi::utils::load_json_data(Default::default(), &path).unwrap();
     config.path = path;
-    let rw_lock = kovi::tokio::sync::RwLock::new(config);
+    let rcu = Atomic::new(config);
+
     CONFIG
-        .set(rw_lock)
+        .set(rcu)
         .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
     Ok(())
 }
@@ -49,20 +83,29 @@ pub async fn modify_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
+    // 写路径串行化，避免并发写导致配置覆盖；读路径仍保持无锁快照读取。
+    let _write_guard = CONFIG_WRITE_LOCK.lock().await;
+
     let cfg = CONFIG.get().unwrap();
-    let mut config = cfg.write().await;
-    f(&mut config);
+    let guard = &crossbeam_epoch::pin();
+    guard.flush();
+    let current = cfg.load(std::sync::atomic::Ordering::Relaxed, guard);
+    let mut next = unsafe { current.deref().clone() };
+    f(&mut next);
     // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
-    write_config(&mut config).await
+    write_config(&next)?;
+    let p = cfg.swap(
+        Owned::new(next),
+        std::sync::atomic::Ordering::Relaxed,
+        guard,
+    );
+    unsafe {
+        guard.defer_destroy(p);
+    }
+    Ok(())
 }
 
-#[inline(always)]
-pub async fn read_config<'a>() -> RwLockReadGuard<'a, Config> {
-    let cfg = CONFIG.get().unwrap();
-    cfg.read().await
-}
-
-pub async fn write_config(config: &mut Config) -> Result<()> {
+pub fn write_config(config: &Config) -> Result<()> {
     let config_path = &config.path;
     match kovi::utils::save_json_data(&*config, config_path) {
         Err(e) => {

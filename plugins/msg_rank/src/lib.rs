@@ -5,6 +5,7 @@ use std::{
 
 use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, log, tokio};
 
+#[macro_use]
 mod config;
 mod db;
 mod msg_rank;
@@ -44,7 +45,8 @@ async fn main() {
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
     let group = event.group_id;
-    let text = if config::read_config().await.notify_group.contains(&group) {
+
+    let text = if config::read_config().notify_group.contains(&group) {
         &get_text(&event.message).await
     } else {
         // 如果不在监控的群里，就不进行OCR，直接返回文本内容
