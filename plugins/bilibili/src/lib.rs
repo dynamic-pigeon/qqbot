@@ -1,8 +1,6 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dashmap::DashMap;
 use kovi::{
     Message, PluginBuilder as plugin,
     event::GroupMsgEvent,
@@ -19,42 +17,7 @@ async fn main() {
     plugin::on_group_msg(parse_bv);
 }
 
-pub struct BvParser {
-    cache: moka::future::Cache<String, ()>,
-}
-
-impl Default for BvParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BvParser {
-    pub fn new() -> Self {
-        Self {
-            cache: moka::future::Cache::builder()
-                .max_capacity(100)
-                .time_to_live(std::time::Duration::from_secs(50))
-                .build(),
-        }
-    }
-
-    pub async fn parse(&self, txt: &str) -> Result<Arc<bv_parser::BvInfo>> {
-        let g = self.cache.entry_by_ref(txt).or_insert_with(async {}).await;
-
-        // 每个群每50秒只能解析一次同一个链接，防止和其他机器人死循环
-        if !g.is_fresh() {
-            anyhow::bail!("已经解析过了");
-        }
-
-        parse_url(txt).await
-    }
-}
-
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
-    static PARSER: LazyLock<DashMap<i64, BvParser>> = LazyLock::new(DashMap::new);
-    let group_id = event.group_id;
-    let parser = PARSER.entry(group_id).or_default();
     for msg in event.message.iter() {
         let bv_info = match msg.type_.as_str() {
             "json" => {
@@ -79,18 +42,18 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
                     continue;
                 };
 
-                match parser.parse(url).await {
+                match parse_url(url).await {
                     Ok(info) => Some(info),
                     Err(e) => {
-                        log::error!("解析失败: {}", e);
+                        log::debug!("解析失败: {}", e);
                         None
                     }
                 }
             }
-            "text" => match parser.parse(msg.data["text"].as_str().unwrap()).await {
+            "text" => match parse_url(msg.data["text"].as_str().unwrap()).await {
                 Ok(info) => Some(info),
                 Err(e) => {
-                    log::error!("解析失败: {}", e);
+                    log::debug!("解析失败: {}", e);
                     None
                 }
             },

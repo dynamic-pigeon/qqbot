@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::{sync::LazyLock, time::Duration};
 
 use anyhow::Result;
 
@@ -93,14 +90,14 @@ static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static SHORT_URL_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap());
 
-pub async fn parse_url(url: &str) -> Result<Arc<BvInfo>> {
+pub async fn parse_url(url: &str) -> Result<BvInfo> {
     match parse_long_url(url).await {
         Ok(info) => Ok(info),
         Err(_) => parse_short_url(url).await,
     }
 }
 
-async fn parse_long_url(url: &str) -> Result<Arc<BvInfo>> {
+async fn parse_long_url(url: &str) -> Result<BvInfo> {
     if let Some(caps) = LONG_URL_RE.captures(url) {
         let bv = &caps["bv"];
         return parse_bv(bv).await;
@@ -108,7 +105,7 @@ async fn parse_long_url(url: &str) -> Result<Arc<BvInfo>> {
     anyhow::bail!("未匹配到长链接");
 }
 
-async fn parse_short_url(url: &str) -> Result<Arc<BvInfo>> {
+async fn parse_short_url(url: &str) -> Result<BvInfo> {
     if !SHORT_URL_RE.is_match(url) {
         anyhow::bail!("未匹配到短链接");
     }
@@ -117,29 +114,27 @@ async fn parse_short_url(url: &str) -> Result<Arc<BvInfo>> {
     parse_long_url(final_url.as_str()).await
 }
 
-async fn parse_bv(bv: &str) -> Result<Arc<BvInfo>> {
-    static CACHE: LazyLock<moka::future::Cache<String, Arc<BvInfo>>> = LazyLock::new(|| {
+async fn parse_bv(bv: &str) -> Result<BvInfo> {
+    static CACHE: LazyLock<moka::future::Cache<String, ()>> = LazyLock::new(|| {
         moka::future::Cache::builder()
             .max_capacity(20)
-            .time_to_live(std::time::Duration::from_secs(60 * 60 * 24))
+            .time_to_live(std::time::Duration::from_secs(5))
             .build()
     });
 
-    let guard = CACHE
-        .entry_by_ref(bv)
-        .or_try_insert_with(async {
-            let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
-            let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
+    let guard = CACHE.entry_by_ref(bv).or_insert_with(async {}).await;
+    if !guard.is_fresh() {
+        anyhow::bail!("5秒内同一BV链接只解析一次");
+    }
 
-            res.into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
-                .await
-                .map(Arc::new)
-        })
-        .await
-        .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+    let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
+    let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
 
-    let info = guard.value();
-    Ok(Arc::clone(info))
+    let info = res
+        .into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
+        .await;
+
+    info
 }
 
 #[cfg(test)]

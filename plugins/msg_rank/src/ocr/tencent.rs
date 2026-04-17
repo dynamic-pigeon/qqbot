@@ -11,7 +11,7 @@ use kovi::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{config::read_config, ocr::HTTP_CLIENT};
+use crate::ocr::HTTP_CLIENT;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -37,18 +37,19 @@ fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
 
 /// 执行腾讯云OCR API调用
 pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
-    let config = read_config().await;
-
-    let config = match &config.tencent {
-        Some(cfg) => cfg,
-        None => {
-            warn!("Tencent Cloud OCR configuration is missing");
-            return Ok(String::new());
+    let tencent_config = {
+        let config = crate::config::read_config();
+        match config.tencent.clone() {
+            Some(cfg) => cfg,
+            None => {
+                warn!("Tencent Cloud OCR configuration is missing");
+                return Ok(String::new());
+            }
         }
     };
     // 密钥信息从配置读取
-    let secret_id = &config.secret_id;
-    let secret_key = &config.secret_key;
+    let secret_id = tencent_config.secret_id;
+    let secret_key = tencent_config.secret_key;
 
     let service = "ocr";
     let host = "ocr.tencentcloudapi.com";
