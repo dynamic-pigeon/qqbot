@@ -1,6 +1,6 @@
 use anyhow::Result;
 use html::END;
-use kovi::log::error;
+use tracing::error;
 use pulldown_cmark::Options;
 
 mod html;

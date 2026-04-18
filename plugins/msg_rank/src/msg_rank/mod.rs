@@ -6,7 +6,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
 use futures::TryFutureExt as _;
 use help_msg::register_help;
-use kovi::{PluginBuilder as plugin, RuntimeBot, log};
+use kovi::{PluginBuilder as plugin, RuntimeBot};
+use tracing;
 
 mod user_info;
 
@@ -30,7 +31,7 @@ pub async fn init() -> Result<()> {
                     event.reply(msg);
                 }
                 Err(e) => {
-                    log::error!("生成发言排行失败: {}", e);
+                    tracing::error!("生成发言排行失败: {}", e);
                     event.reply(format!("❌ 生成发言排行失败: {}", e));
                 }
             }
@@ -76,7 +77,7 @@ pub async fn gen_daily_rank_html(bot: &RuntimeBot, group_id: i64) -> Result<Stri
         match user_info::get_user_info(bot, group_id, user_id).await {
             Ok(info) => entries.push((info, cnt)),
             Err(e) => {
-                log::error!("获取用户 {} 信息失败: {}", user_id, e);
+                tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
                 // 使用 user_id 作为昵称占位
                 entries.push((
                     user_info::UserInfo {

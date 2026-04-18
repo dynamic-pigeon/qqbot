@@ -24,3 +24,4 @@ bytes.workspace = true
 futures.workspace = true
 itertools.workspace = true
 crossbeam-epoch = "0.9"
+tracing.workspace = true

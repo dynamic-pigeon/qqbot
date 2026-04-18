@@ -3,7 +3,8 @@ use std::{
     time::Duration,
 };
 
-use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, log, tokio};
+use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, tokio};
+use tracing;
 
 #[macro_use]
 mod config;
@@ -53,7 +54,7 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
         event.borrow_text().unwrap_or_default()
     };
     if let Err(e) = db::add_msg(event.group_id, event.user_id, text).await {
-        log::error!("添加消息失败: {}", e);
+        tracing::error!("添加消息失败: {}", e);
     }
 }
 
@@ -71,7 +72,7 @@ async fn get_text(msg: &Message) -> String {
                     res.push_str(&tx);
                 }
                 Err(e) => {
-                    log::error!("ocr failed: {}", e);
+                    tracing::error!("ocr failed: {}", e);
                 }
             },
             _ => {}

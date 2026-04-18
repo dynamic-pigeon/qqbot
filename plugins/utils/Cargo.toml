@@ -12,3 +12,4 @@ serde.workspace = true
 reqwest = { workspace = true }
 chromiumoxide = "0.9.1"
 futures.workspace = true
+tracing.workspace = true

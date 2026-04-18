@@ -5,9 +5,9 @@ use std::{
 
 use anyhow::{Error, Result};
 use base64::{Engine, engine::general_purpose};
-use kovi::log::debug;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 mod tencent;
 

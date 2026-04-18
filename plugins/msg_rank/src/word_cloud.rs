@@ -10,9 +10,9 @@ use itertools::Itertools as _;
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
     event::GroupMsgEvent,
-    log::{self, info},
     tokio::{self, io::AsyncWriteExt as _},
 };
+use tracing::{self, info};
 
 use crate::config::{modify_config, read_config};
 
@@ -123,7 +123,7 @@ async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<Ru
             event.reply(res);
         }
         Err(e) => {
-            log::error!("执行命令失败: {}", e);
+            tracing::error!("执行命令失败: {}", e);
             event.reply(format!("执行命令失败: {}", e));
         }
     }
@@ -143,7 +143,7 @@ async fn send_word_cloud(
             return;
         }
         Err(e) => {
-            log::error!("make word cloud failed: {}, group_id: {}", e, group_id);
+            tracing::error!("make word cloud failed: {}, group_id: {}", e, group_id);
             bot.send_private_msg(
                 bot.get_main_admin().unwrap(),
                 format!("make word cloud failed: {}, group_id: {}", e, group_id),
