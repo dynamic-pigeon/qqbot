@@ -1,5 +1,6 @@
 use anyhow::{Ok, Result};
-use kovi::{RuntimeBot, log, serde_json};
+use kovi::{RuntimeBot, serde_json};
+use tracing;
 
 use crate::HTTP_CLIENT;
 
@@ -28,7 +29,7 @@ pub(super) async fn get_user_info(
         .get_group_member_info(group_id, user_id, false)
         .await
         .map_err(|e| {
-            log::error!("调用 API get_group_member_info 失败: {}", e);
+            tracing::error!("调用 API get_group_member_info 失败: {}", e);
             anyhow::anyhow!("获取群成员信息失败")
         })?;
 

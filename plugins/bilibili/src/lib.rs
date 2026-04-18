@@ -4,7 +4,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
     Message, PluginBuilder as plugin,
     event::GroupMsgEvent,
-    log,
     serde_json::{self, Value},
 };
 
@@ -44,18 +43,12 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
 
                 match parse_url(url).await {
                     Ok(info) => Some(info),
-                    Err(e) => {
-                        log::debug!("解析失败: {}", e);
-                        None
-                    }
+                    Err(_) => None,
                 }
             }
             "text" => match parse_url(msg.data["text"].as_str().unwrap()).await {
                 Ok(info) => Some(info),
-                Err(e) => {
-                    log::debug!("解析失败: {}", e);
-                    None
-                }
+                Err(_) => None,
             },
             _ => None,
         };

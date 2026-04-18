@@ -35,6 +35,12 @@ impl Default for Config {
     }
 }
 
+impl Drop for Config {
+    fn drop(&mut self) {
+        tracing::debug!("配置已卸载");
+    }
+}
+
 pub struct ConfigGuard<'a> {
     guard: crossbeam_epoch::Guard,
     config: &'a Atomic<Config>,

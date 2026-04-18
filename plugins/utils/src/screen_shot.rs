@@ -8,7 +8,6 @@ use chromiumoxide::{
 };
 use futures::StreamExt;
 use kovi::{
-    log::{error, info},
     tokio::{
         self,
         sync::{OnceCell, mpsc, oneshot},
@@ -16,6 +15,7 @@ use kovi::{
         time::{self, Instant},
     },
 };
+use tracing::{error, info};
 
 /// 浏览器空闲超时时间，超过此时间没有截图任务则自动关闭浏览器
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);

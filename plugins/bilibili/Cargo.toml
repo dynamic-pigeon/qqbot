@@ -13,3 +13,4 @@ regex = "1.12.3"
 base64.workspace = true
 moka.workspace = true
 dashmap = "6.1.0"
+tracing.workspace = true

@@ -11,6 +11,7 @@ kovi-plugin-cmd = "0.3.0"
 markdown = { version = "0.1.0", path = "plugins/markdown" }
 msg_rank = { version = "0.1.0", path = "plugins/msg_rank" }
 yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 
 [workspace]
 members = [
@@ -37,3 +38,9 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
 futures-util = "0.3"
 futures = "0.3"
 itertools = "0.14.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "ansi",
+] }

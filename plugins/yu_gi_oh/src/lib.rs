@@ -1,5 +1,6 @@
 use base64::Engine as _;
-use kovi::{Message, PluginBuilder as plugin, log};
+use kovi::{Message, PluginBuilder as plugin};
+use tracing;
 
 mod fetch_card;
 
@@ -23,7 +24,7 @@ async fn main() {
         let card = match fetch_card::fetch_card(card_name).await {
             Ok(card) => card,
             Err(e) => {
-                log::error!("Fetch card error: {}", e);
+                tracing::error!("Fetch card error: {}", e);
                 event.reply(format!("❌ 查询卡片信息失败: {}", e));
                 return;
             }
@@ -32,7 +33,7 @@ async fn main() {
         let img = match card.fetch_image().await {
             Ok(data) => data,
             Err(e) => {
-                log::error!("Fetch card image error: {}", e);
+                tracing::error!("Fetch card image error: {}", e);
                 event.reply(format!("❌ 获取卡片图片失败: {}", e));
                 event.reply(format!("{}", card));
                 return;
