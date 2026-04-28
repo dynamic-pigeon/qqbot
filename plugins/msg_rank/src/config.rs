@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use crossbeam_epoch::{Atomic, Owned};
+use utils::{RcuCell, RcuReadGuard};
 
-pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<Atomic<Config>> =
+pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<RcuCell<Config>> =
     kovi::tokio::sync::OnceCell::const_new();
 static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
@@ -35,48 +35,12 @@ impl Default for Config {
     }
 }
 
-impl Drop for Config {
-    fn drop(&mut self) {
-        tracing::debug!("配置已卸载");
-    }
-}
-
-pub struct ConfigGuard<'a> {
-    guard: crossbeam_epoch::Guard,
-    config: &'a Atomic<Config>,
-}
-
-impl<'a> ConfigGuard<'a> {
-    fn new(config: &'a Atomic<Config>) -> Self {
-        let guard = crossbeam_epoch::pin();
-        Self { guard, config }
-    }
-
-    fn load(&self) -> &Config {
-        let ptr = self
-            .config
-            .load(std::sync::atomic::Ordering::Relaxed, &self.guard);
-        unsafe { ptr.deref() }
-    }
-}
-
-impl<'a> std::ops::Deref for ConfigGuard<'a> {
-    type Target = Config;
-
-    fn deref(&self) -> &Self::Target {
-        self.load()
-    }
-}
-
-pub fn read_config<'a>() -> ConfigGuard<'a> {
-    let config = CONFIG.get().expect("配置未初始化");
-    ConfigGuard::new(config)
-}
+pub(crate) type ConfigGuard<'a> = RcuReadGuard<'a, Config>;
 
 pub async fn init_config(path: PathBuf) -> Result<()> {
     let mut config: Config = kovi::utils::load_json_data(Default::default(), &path).unwrap();
     config.path = path;
-    let rcu = Atomic::new(config);
+    let rcu = RcuCell::new(config);
 
     CONFIG
         .set(rcu)
@@ -85,6 +49,13 @@ pub async fn init_config(path: PathBuf) -> Result<()> {
 }
 
 #[inline(always)]
+pub fn read_config() -> ConfigGuard<'static> {
+    let config = CONFIG.get().expect("配置未初始化");
+    config.read()
+}
+
+#[cold]
+#[inline(never)]
 pub async fn modify_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
@@ -93,27 +64,17 @@ where
     let _write_guard = CONFIG_WRITE_LOCK.lock().await;
 
     let cfg = CONFIG.get().unwrap();
-    let guard = &crossbeam_epoch::pin();
-    guard.flush();
-    let current = cfg.load(std::sync::atomic::Ordering::Relaxed, guard);
-    let mut next = unsafe { current.deref().clone() };
+    let mut next = cfg.snapshot();
     f(&mut next);
     // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
     write_config(&next)?;
-    let p = cfg.swap(
-        Owned::new(next),
-        std::sync::atomic::Ordering::Relaxed,
-        guard,
-    );
-    unsafe {
-        guard.defer_destroy(p);
-    }
+    cfg.replace(next);
     Ok(())
 }
 
 pub fn write_config(config: &Config) -> Result<()> {
     let config_path = &config.path;
-    match kovi::utils::save_json_data(&*config, config_path) {
+    match kovi::utils::save_json_data(config, config_path) {
         Err(e) => {
             anyhow::bail!("保存配置文件失败: {}", e);
         }

@@ -1,6 +1,5 @@
 use anyhow::{Ok, Result};
 use kovi::{RuntimeBot, serde_json};
-use tracing;
 
 use crate::HTTP_CLIENT;
 

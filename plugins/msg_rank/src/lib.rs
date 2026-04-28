@@ -4,7 +4,6 @@ use std::{
 };
 
 use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, tokio};
-use tracing;
 
 #[macro_use]
 mod config;
@@ -61,21 +60,39 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
 async fn get_text(msg: &Message) -> String {
     let mut res = String::new();
 
+    // 在没有图片的时候只会有栈分配，有图片的时候才会有堆分配，所以这里不需要担心性能问题
+    let mut tasks = Vec::new();
+
+    // 先把文本内容和图片URL提取出来，文本内容直接拼接，图片URL则交给OCR任务处理
+    // 顺序不重要
     for seg in msg.iter() {
         if !res.is_empty() {
             res.push(' ');
         }
         match seg.type_.as_str() {
             "text" => res.push_str(seg.data["text"].as_str().unwrap()),
-            "image" => match ocr::ocr(seg.data["url"].as_str().unwrap()).await {
-                Ok(tx) => {
-                    res.push_str(&tx);
-                }
-                Err(e) => {
-                    tracing::error!("ocr failed: {}", e);
-                }
-            },
+            "image" => {
+                let url = seg.data["url"].as_str().unwrap().to_string();
+                let task = kovi::spawn(async move { ocr::ocr(&url).await });
+                tasks.push(task);
+            }
             _ => {}
+        }
+    }
+
+    for task in tasks {
+        match task.await {
+            Ok(Ok(text)) => {
+                if !text.is_empty() {
+                    res.push_str(&text);
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::error!("OCR 失败: {}", e);
+            }
+            Err(e) => {
+                tracing::error!("OCR 任务失败: {}", e);
+            }
         }
     }
 
