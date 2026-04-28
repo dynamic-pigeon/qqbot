@@ -1,6 +1,5 @@
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
-use tracing;
 
 mod fetch_card;
 

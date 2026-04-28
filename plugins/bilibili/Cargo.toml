@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 kovi.workspace = true
+utils.workspace = true
 serde.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true

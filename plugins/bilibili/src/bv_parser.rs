@@ -1,8 +1,10 @@
-use std::{sync::LazyLock, time::Duration};
+use std::sync::LazyLock;
 
 use anyhow::Result;
 
 use serde::Deserialize;
+
+use crate::CLIENT;
 
 #[derive(Deserialize)]
 struct ApiRes {
@@ -45,22 +47,6 @@ pub struct BvInfo {
     pub url: String,
     pub favorite: u32,
 }
-
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::REFERER,
-        reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
-    );
-    reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(16)
-        .default_headers(headers)
-        .build()
-        .unwrap()
-});
 
 impl ApiRes {
     async fn into_bv_info(self, url: String) -> Result<BvInfo> {
@@ -130,11 +116,8 @@ async fn parse_bv(bv: &str) -> Result<BvInfo> {
     let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
     let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
 
-    let info = res
-        .into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
-        .await;
-
-    info
+    res.into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
+        .await
 }
 
 #[cfg(test)]

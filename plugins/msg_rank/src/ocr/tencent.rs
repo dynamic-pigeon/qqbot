@@ -54,7 +54,7 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     let service = "ocr";
     let host = "ocr.tencentcloudapi.com";
     let region = "";
-    let action = if rand::random_range(0..=1) == 0 {
+    let action = if rand::random::<bool>() {
         "GeneralBasicOCR" // 通用印刷体识别
     } else {
         "GeneralAccurateOCR" // 通用印刷体识别（高精度）
