@@ -6,12 +6,13 @@ edition = "2024"
 [dependencies]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }
 help_msg = { version = "0.1.0", path = "plugins/help_msg" }
-kovi = "0.12.6"
+kovi.workspace = true
 kovi-plugin-cmd = "0.3.0"
 markdown = { version = "0.1.0", path = "plugins/markdown" }
 msg_rank = { version = "0.1.0", path = "plugins/msg_rank" }
 yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 
 [workspace]
 members = [
@@ -44,3 +45,4 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
     "ansi",
 ] }
+tracing-appender = "0.2.5"
