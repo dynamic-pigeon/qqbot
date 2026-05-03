@@ -3,3 +3,4 @@ kovi.conf.toml
 kovi.plugin.toml
 data/
 .vscode
+logs
