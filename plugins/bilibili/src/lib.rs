@@ -5,7 +5,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
-    Message, PluginBuilder as plugin,
+    Message, PluginBuilder as plugin, RuntimeBot,
     event::GroupMsgEvent,
     serde_json::{self, Value},
 };
@@ -13,6 +13,8 @@ use kovi::{
 use crate::bv_parser::parse_url;
 
 mod bv_parser;
+mod config;
+mod living;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -32,7 +34,130 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 #[kovi::plugin]
 async fn main() {
+    let bot = plugin::get_runtime_bot();
+    let path = bot.get_data_path();
+    let config_path = path.join("config.json");
+    config::init_config(config_path).await.unwrap();
+    help_msg::register_help(
+        "直播订阅",
+        "管理本群的 B 站直播订阅",
+        "/live add <uid> - 为本群订阅指定 uid 的开播通知（管理员专用）\n/live rm <uid> - 取消本群的订阅\n/live status - 查看本群订阅列表",
+    )
+    .await;
+    let bot_clone = Arc::clone(&bot);
+    plugin::on_group_msg(move |event| {
+        let bot = Arc::clone(&bot_clone);
+        exec_cmd(event, bot)
+    });
     plugin::on_group_msg(parse_bv);
+    living::init().await;
+}
+
+async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
+    let text = event.borrow_text().unwrap_or_default();
+    let text = text.trim();
+
+    // support: /live add <uid>
+    //          /live rm <uid>
+    //          /live status
+    if !text.starts_with("/live") {
+        return;
+    }
+
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() < 2 {
+        event.reply("用法: /live add <uid> | /live rm <uid> | /live status");
+        return;
+    }
+
+    match parts[1] {
+        "add" => {
+            if !bot
+                .get_all_admin()
+                .unwrap_or_default()
+                .contains(&event.user_id)
+            {
+                event.reply("❌ 管理员专用命令，普通用户无法使用");
+                return;
+            }
+            if parts.len() < 3 {
+                event.reply("请指定要订阅的 uid，例如: /live add 672328094");
+                return;
+            }
+            let uid = match parts[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    event.reply("uid 格式错误，需为整数");
+                    return;
+                }
+            };
+            let group = event.group_id;
+            match config::modify_config(|cfg| {
+                if let Some(sub) = cfg.subscribe.iter_mut().find(|s| s.uid == uid) {
+                    if !sub.groups.contains(&group) {
+                        sub.groups.push(group);
+                    }
+                } else {
+                    cfg.subscribe.push(crate::config::Subscribe {
+                        uid,
+                        groups: vec![group],
+                    });
+                }
+            })
+            .await
+            {
+                Ok(_) => event.reply(format!("已为本群订阅 uid={}", uid)),
+                Err(e) => event.reply(format!("订阅失败: {}", e)),
+            }
+        }
+        "rm" | "remove" => {
+            if parts.len() < 3 {
+                event.reply("请指定要取消订阅的 uid，例如: /live rm 672328094");
+                return;
+            }
+            let uid = match parts[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    event.reply("uid 格式错误，需为整数");
+                    return;
+                }
+            };
+            let group = event.group_id;
+            match config::modify_config(|cfg| {
+                if let Some(idx) = cfg.subscribe.iter().position(|s| s.uid == uid) {
+                    let sub = &mut cfg.subscribe[idx];
+                    sub.groups.retain(|g| *g != group);
+                    if sub.groups.is_empty() {
+                        cfg.subscribe.remove(idx);
+                    }
+                }
+            })
+            .await
+            {
+                Ok(_) => event.reply(format!("已取消本群对 uid={} 的订阅", uid)),
+                Err(e) => event.reply(format!("取消订阅失败: {}", e)),
+            }
+        }
+        "status" => {
+            let group = event.group_id;
+            let cfg = config::read_config().clone();
+            let mut uids: Vec<u64> = cfg
+                .subscribe
+                .iter()
+                .filter(|s| s.groups.contains(&group))
+                .map(|s| s.uid)
+                .collect();
+            if uids.is_empty() {
+                event.reply("本群尚未订阅任何直播间");
+            } else {
+                uids.sort_unstable();
+                event.reply(format!("本群订阅的 uid: {:?}", uids));
+            }
+        }
+        _ => {
+            event.reply("未知子命令，支持: add | rm | status");
+        }
+    }
 }
 
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
