@@ -53,12 +53,7 @@ async fn main() {
         if text.starts_with("/help ") {
             let command = text.strip_prefix("/help ").unwrap().trim();
             if let Some(help_item) = get_help(command).await {
-                let response = format!("📖 `{}` - {}\n", help_item.command, help_item.description);
-                let mut response = Message::from(response);
-                for part in help_item.usage {
-                    response.push(part);
-                }
-                event.reply(response);
+                event.reply(help_item.usage);
             } else {
                 event.reply(format!("❌ 命令 `{}` 的帮助信息不存在", command));
             }

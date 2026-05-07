@@ -2,6 +2,8 @@
 name = "bot"
 version = "0.1.0"
 edition = "2024"
+authors = ["dynamic-pigeon <3040313336@qq.com>"]
+license = "MIT"
 
 [dependencies]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }
@@ -46,3 +48,4 @@ tracing-subscriber = { version = "0.3", features = [
     "ansi",
 ] }
 tracing-appender = "0.2.5"
+arc-swap = "1.9"
