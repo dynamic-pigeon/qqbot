@@ -1,13 +1,13 @@
 use std::{
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::Arc,
 };
 
+use arc_swap::ArcSwap;
 use kovi::{
-    serde_json,
+    PluginBuilder as plugin, serde_json,
     tokio::{self, sync::OnceCell},
 };
-use utils::RcuCell;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Config {
@@ -20,11 +20,14 @@ pub struct Subscribe {
     pub groups: Vec<i64>,
 }
 
-static CONFIG: OnceCell<(RcuCell<Config>, PathBuf)> = OnceCell::const_new();
+static CONFIG: OnceCell<(ArcSwap<Config>, PathBuf)> = OnceCell::const_new();
 
-pub async fn init_config(path: PathBuf) -> anyhow::Result<()> {
-    let config = if path.exists() {
-        let data = tokio::fs::read(&path).await?;
+pub async fn init() -> anyhow::Result<()> {
+    let bot = plugin::get_runtime_bot();
+    let path = bot.get_data_path();
+    let config_path = path.join("config.json");
+    let config = if config_path.exists() {
+        let data = tokio::fs::read(&config_path).await?;
         serde_json::from_slice(&data)?
     } else {
         Config {
@@ -32,37 +35,31 @@ pub async fn init_config(path: PathBuf) -> anyhow::Result<()> {
         }
     };
     CONFIG
-        .set((RcuCell::new(config), path))
+        .set((ArcSwap::new(Arc::new(config)), config_path))
         .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
     Ok(())
 }
 
-type ConfigGuard<'a> = utils::RcuReadGuard<'a, Config>;
-
 #[inline(always)]
-pub fn read_config() -> ConfigGuard<'static> {
+pub fn read_config() -> Arc<Config> {
     let config = CONFIG.get().expect("配置未初始化");
-    config.0.read()
+    config.0.load_full()
 }
 
 #[cold]
 #[inline(never)]
-pub async fn modify_config<F>(f: F) -> anyhow::Result<()>
+pub async fn modify_config<F>(mut f: F) -> anyhow::Result<()>
 where
-    F: FnOnce(&mut Config),
+    F: FnMut(&mut Config),
 {
-    static CONFIG_WRITE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-    // 写路径串行化，避免并发写导致配置覆盖；读路径仍保持无锁快照读取。
-    let _write_guard = CONFIG_WRITE_LOCK.lock().await;
-
-    let config = CONFIG.get().unwrap();
-    let cfg = &config.0;
-    let mut next = cfg.snapshot();
-    f(&mut next);
-    // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
-    write_config(&next, &config.1)?;
-    cfg.replace(next);
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = LOCK.lock().await;
+    let config = CONFIG.get().expect("配置未初始化");
+    let mut new_config = config.0.load_full().as_ref().clone();
+    f(&mut new_config);
+    write_config(&new_config, &config.1)?;
+    let new_config = Arc::new(new_config);
+    config.0.store(new_config);
     Ok(())
 }
 

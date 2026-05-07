@@ -1,6 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json, tokio::sync::Mutex};
 use serde::Deserialize;
 
@@ -32,80 +36,124 @@ pub async fn init() {
     plugin::cron("* */1 * * *", move || {
         let map = Arc::clone(&map);
         let bot = Arc::clone(&bot);
-        async move {
-            let mut map = map.lock().await;
-            let cfg = config::read_config().clone();
-            let uids: Vec<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
-            if uids.is_empty() {
-                return;
+        scheduled_task(map, bot)
+    })
+    .unwrap();
+}
+
+async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::RuntimeBot>) {
+    let mut map = map.lock().await;
+    let cfg = config::read_config();
+
+    let uids: Vec<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
+    if uids.is_empty() {
+        return;
+    }
+    let status = match fetch_living_status(&uids).await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::error!("获取直播状态失败: {}", e);
+            return;
+        }
+    };
+
+    let mut start = Vec::new();
+    let mut end = Vec::new();
+    for (uid, info) in status {
+        let status = info.live_status != 0;
+        match map.entry(uid) {
+            Entry::Vacant(e) => {
+                e.insert(status);
             }
-            match fetch_living_status(&uids).await {
-                Ok(status) => {
-                    let mut start = Vec::new();
-                    let mut end = Vec::new();
-                    for (uid, info) in status {
-                        let status = info.live_status != 0;
-                        if !map.contains_key(&uid) {
-                            map.insert(uid, status);
-                            continue;
-                        }
-                        let prev = map.get(&uid).unwrap();
-                        if *prev != status {
-                            map.insert(uid, status);
-                            if status {
-                                start.push((uid, info));
-                            } else {
-                                end.push((uid, info));
-                            }
-                        }
+            Entry::Occupied(mut e) => {
+                let prev = *e.get();
+                if prev != status {
+                    e.insert(status);
+                    if status {
+                        start.push((uid, info));
+                    } else {
+                        end.push((uid, info));
                     }
-
-                    for (uid, info) in start {
-                        let img = CLIENT
-                            .get(&info.cover_from_user)
-                            .send()
-                            .await
-                            .unwrap()
-                            .bytes()
-                            .await
-                            .unwrap();
-                        let base64_img = STANDARD.encode(img);
-                        let msg = Message::new()
-                            .add_text(format!("{} 开始了直播\n{}", info.uname, info.title))
-                            .add_image(&format!("base64://{}", base64_img))
-                            .add_text(format!("https://live.bilibili.com/{}", info.room_id));
-
-                        for group in cfg
-                            .subscribe
-                            .iter()
-                            .filter(|s| s.uid == uid)
-                            .flat_map(|s| &s.groups)
-                        {
-                            bot.send_group_msg(*group, msg.clone());
-                        }
-                    }
-
-                    for (uid, info) in end {
-                        let msg = Message::new()
-                            .add_text(format!("{} 刚刚结束了直播\n{}", info.uname, info.title));
-
-                        for group in cfg
-                            .subscribe
-                            .iter()
-                            .filter(|s| s.uid == uid)
-                            .flat_map(|s| &s.groups)
-                        {
-                            bot.send_group_msg(*group, msg.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("获取直播状态失败: {}", e);
                 }
             }
         }
-    })
-    .unwrap();
+    }
+
+    for (uid, info) in start {
+        let img = match fetch_img(&info.cover_from_user).await {
+            Ok(img) => img,
+            Err(_) => {
+                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
+                Default::default()
+            }
+        };
+        let base64_img = STANDARD.encode(img);
+        let mut msg = Message::new().add_text(format!(
+            "{}正在直播【{}】\nhttps://live.bilibili.com/{}",
+            info.uname, info.title, info.room_id
+        ));
+        if !base64_img.is_empty() {
+            msg.push_image(&format!("base64://{}", base64_img));
+        }
+
+        for group in cfg
+            .subscribe
+            .iter()
+            .filter(|s| s.uid == uid)
+            .flat_map(|s| &s.groups)
+        {
+            bot.send_group_msg(*group, msg.clone());
+        }
+    }
+
+    for (uid, info) in end {
+        let img = match fetch_img(&info.cover_from_user).await {
+            Ok(img) => img,
+            Err(_) => {
+                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
+                Default::default()
+            }
+        };
+        let base64_img = STANDARD.encode(img);
+        let mut msg = Message::new().add_text(format!("{}直播结束了", info.uname));
+        if !base64_img.is_empty() {
+            msg.push_image(&format!("base64://{}", base64_img));
+        }
+
+        for group in cfg
+            .subscribe
+            .iter()
+            .filter(|s| s.uid == uid)
+            .flat_map(|s| &s.groups)
+        {
+            bot.send_group_msg(*group, msg.clone());
+        }
+    }
+}
+
+async fn fetch_img(url: &str) -> Result<Bytes, reqwest::Error> {
+    let resp = CLIENT.get(url).send().await?;
+    let bytes = resp.bytes().await?;
+    Ok(bytes)
+}
+
+pub async fn check_uid(uid: u64) -> bool {
+    let status = fetch_living_status(&[uid]).await;
+    match status {
+        Ok(status) => status.contains_key(&uid),
+        Err(e) => {
+            tracing::error!("检查 uid 是否存在失败: {}", e);
+            false
+        }
+    }
+}
+
+pub async fn fetch_uid_names(uids: &[u64]) -> anyhow::Result<HashMap<u64, String>> {
+    let status = fetch_living_status(uids).await?;
+    Ok(status
+        .into_iter()
+        .map(|(uid, info)| (uid, info.uname))
+        .collect())
 }
 
 async fn fetch_living_status(uids: &[u64]) -> anyhow::Result<HashMap<u64, LiveRoom>> {
@@ -137,5 +185,22 @@ mod tests {
         let uids = [272925261, 2412572, 518817];
         let status = super::fetch_living_status(&uids).await.unwrap();
         println!("{:#?}", status);
+    }
+
+    #[tokio::test]
+    async fn test_check_uid() {
+        let uid = 272925261;
+        let exists = super::check_uid(uid).await;
+        assert!(exists, "UID {} should exist", uid);
+        let uid = 484415486;
+        let exists = super::check_uid(uid).await;
+        assert!(!exists, "UID {} should not exist", uid);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_uid_names() {
+        let uids = [272925261, 2412572, 518817];
+        let names = super::fetch_uid_names(&uids).await.unwrap();
+        println!("{:#?}", names);
     }
 }
