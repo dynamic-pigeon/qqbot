@@ -208,14 +208,20 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
                     continue;
                 };
 
-                parse_url(url).await.ok()
+                parse_url(url).await
             }
-            "text" => parse_url(msg.data["text"].as_str().unwrap()).await.ok(),
-            _ => None,
+            "text" => parse_url(msg.data["text"].as_str().unwrap()).await,
+            _ => continue,
         };
 
-        let Some(bv_info) = bv_info else {
-            continue;
+        let bv_info = match bv_info {
+            Ok(info) => info,
+            Err(e) => {
+                if !matches!(e, bv_parser::error::BvError::ParseFailed(_)) {
+                    tracing::error!("解析 BV 失败: {}", e);
+                }
+                continue;
+            }
         };
 
         let img_base64 = STANDARD.encode(&bv_info.pic);

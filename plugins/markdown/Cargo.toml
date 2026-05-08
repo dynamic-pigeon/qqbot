@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 kovi.workspace = true
 utils.workspace = true
-base64 = "0.22"
+base64.workspace = true
 help_msg.workspace = true
