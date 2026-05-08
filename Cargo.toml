@@ -49,3 +49,4 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tracing-appender = "0.2.5"
 arc-swap = "1.9"
+thiserror = "2.0"

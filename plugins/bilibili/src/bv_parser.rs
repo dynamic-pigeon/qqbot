@@ -1,16 +1,18 @@
 use std::sync::LazyLock;
 
-use anyhow::Result;
-
 use serde::Deserialize;
 
 use crate::CLIENT;
+
+use error::BvError;
+
+pub mod error;
 
 #[derive(Deserialize)]
 struct ApiRes {
     code: i32,
     message: String,
-    data: Data,
+    data: Option<Data>,
 }
 
 #[derive(Deserialize)]
@@ -49,21 +51,27 @@ pub struct BvInfo {
 }
 
 impl ApiRes {
-    async fn into_bv_info(self, url: String) -> Result<BvInfo> {
+    async fn into_bv_info(self, url: String) -> Result<BvInfo, error::BvError> {
         if self.code != 0 {
-            anyhow::bail!("请求失败: {}", self.message);
+            return Err(BvError::RequestBodyError(format!(
+                "API请求失败: code={}, message={}",
+                self.code, self.message
+            )));
         }
-        let pic = CLIENT.get(&self.data.pic).send().await?.bytes().await?;
+        let data = self
+            .data
+            .ok_or_else(|| BvError::RequestBodyError("API返回缺少data字段".to_string()))?;
+        let pic = CLIENT.get(&data.pic).send().await?.bytes().await?;
 
         Ok(BvInfo {
-            title: self.data.title,
+            title: data.title,
             pic,
-            name: self.data.owner.name,
-            view: self.data.stat.view,
-            coin: self.data.stat.coin,
-            like: self.data.stat.like,
-            duration: self.data.duration,
-            favorite: self.data.stat.favorite,
+            name: data.owner.name,
+            view: data.stat.view,
+            coin: data.stat.coin,
+            like: data.stat.like,
+            duration: data.duration,
+            favorite: data.stat.favorite,
             url,
         })
     }
@@ -76,31 +84,32 @@ static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static SHORT_URL_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap());
 
-pub async fn parse_url(url: &str) -> Result<BvInfo> {
+pub async fn parse_url(url: &str) -> Result<BvInfo, error::BvError> {
     match parse_long_url(url).await {
         Ok(info) => Ok(info),
-        Err(_) => parse_short_url(url).await,
+        Err(BvError::ParseFailed(_)) => parse_short_url(url).await,
+        Err(e) => Err(e),
     }
 }
 
-async fn parse_long_url(url: &str) -> Result<BvInfo> {
+async fn parse_long_url(url: &str) -> Result<BvInfo, error::BvError> {
     if let Some(caps) = LONG_URL_RE.captures(url) {
         let bv = &caps["bv"];
         return parse_bv(bv).await;
     }
-    anyhow::bail!("未匹配到长链接");
+    Err(BvError::ParseFailed("未匹配到长链接"))
 }
 
-async fn parse_short_url(url: &str) -> Result<BvInfo> {
+async fn parse_short_url(url: &str) -> Result<BvInfo, error::BvError> {
     if !SHORT_URL_RE.is_match(url) {
-        anyhow::bail!("未匹配到短链接");
+        return Err(BvError::ParseFailed("未匹配到短链接"));
     }
     let resp = CLIENT.get(url).send().await?;
     let final_url = resp.url();
     parse_long_url(final_url.as_str()).await
 }
 
-async fn parse_bv(bv: &str) -> Result<BvInfo> {
+async fn parse_bv(bv: &str) -> Result<BvInfo, error::BvError> {
     static CACHE: LazyLock<moka::future::Cache<String, ()>> = LazyLock::new(|| {
         moka::future::Cache::builder()
             .max_capacity(20)
@@ -110,7 +119,7 @@ async fn parse_bv(bv: &str) -> Result<BvInfo> {
 
     let guard = CACHE.entry_by_ref(bv).or_insert_with(async {}).await;
     if !guard.is_fresh() {
-        anyhow::bail!("5秒内同一BV链接只解析一次");
+        Err(BvError::Other("请求过于频繁，请稍后再试".to_string()))?;
     }
 
     let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
@@ -139,9 +148,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid() {
-        let url = "https://www.bilibili.com/video/invalid";
+        let url = " https://www.bilibili.com/video/BV1PVdPBxEyr/?share_source=copy_web&vd_source=316166c47890d5daae6c8152b5f3e06f";
         let res = parse_url(url).await;
         assert!(res.is_err());
+        println!("错误信息: {}", res.err().unwrap());
     }
 
     #[tokio::test]

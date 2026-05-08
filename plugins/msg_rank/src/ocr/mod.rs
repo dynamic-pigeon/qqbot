@@ -76,6 +76,13 @@ pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
 /// 从URL获取图片
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
     let req = HTTP_CLIENT.get(img_url).send().await?;
+    if let Some(length) = req.content_length() {
+        // 腾讯云OCR接口限制请求体大小不超过10MB，按照base64编码后大小约为原图的4/3
+        if length * 4 / 3 > 10485760 {
+            return Err(anyhow::anyhow!("Image size exceeds 10MB limit"));
+        }
+    }
+
     if !req.status().is_success() {
         return Err(anyhow::anyhow!("Failed to get image from URL"));
     }

@@ -16,3 +16,4 @@ base64.workspace = true
 moka.workspace = true
 tracing.workspace = true
 arc-swap.workspace = true
+thiserror.workspace = true
