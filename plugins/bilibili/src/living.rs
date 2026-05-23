@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json, tokio::sync::Mutex};
 use serde::Deserialize;
+use utils::retry::retry_async;
 
 use crate::{CLIENT, config};
 
@@ -80,7 +81,7 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
     }
 
     for (uid, info) in start {
-        let img = match fetch_img(&info.cover_from_user).await {
+        let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
             Ok(img) => img,
             Err(_) => {
                 tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
@@ -107,7 +108,7 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
     }
 
     for (uid, info) in end {
-        let img = match fetch_img(&info.cover_from_user).await {
+        let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
             Ok(img) => img,
             Err(_) => {
                 tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
@@ -157,11 +158,10 @@ pub async fn fetch_uid_names(uids: &[u64]) -> anyhow::Result<HashMap<u64, String
 }
 
 async fn fetch_living_status(uids: &[u64]) -> anyhow::Result<HashMap<u64, LiveRoom>> {
-    let client = reqwest::Client::new();
     let body = json!({
         "uids": uids,
     });
-    let resp = client
+    let resp = CLIENT
         .post(LIVING_STATUS_URL)
         .json(&body)
         .send()

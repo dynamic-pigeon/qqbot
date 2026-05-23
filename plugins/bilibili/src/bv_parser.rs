@@ -95,16 +95,21 @@ pub async fn parse_url(url: &str) -> Result<BvInfo, error::BvError> {
 async fn parse_long_url(url: &str) -> Result<BvInfo, error::BvError> {
     if let Some(caps) = LONG_URL_RE.captures(url) {
         let bv = &caps["bv"];
-        return parse_bv(bv).await;
+        parse_bv(bv).await
+    } else {
+        Err(BvError::ParseFailed("未匹配到长链接"))
     }
-    Err(BvError::ParseFailed("未匹配到长链接"))
 }
 
 async fn parse_short_url(url: &str) -> Result<BvInfo, error::BvError> {
-    if !SHORT_URL_RE.is_match(url) {
-        return Err(BvError::ParseFailed("未匹配到短链接"));
-    }
-    let resp = CLIENT.get(url).send().await?;
+    let caps = SHORT_URL_RE
+        .captures(url)
+        .ok_or(BvError::ParseFailed("未匹配到短链接"))?;
+    let short_url = caps
+        .get(0)
+        .ok_or(BvError::ParseFailed("未匹配到短链接"))?
+        .as_str();
+    let resp = CLIENT.get(short_url).send().await?;
     let final_url = resp.url();
     parse_long_url(final_url.as_str()).await
 }
