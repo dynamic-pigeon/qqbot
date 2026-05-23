@@ -39,7 +39,7 @@ pub async fn init() -> Result<()> {
     Ok(())
 }
 
-async fn today_msg_cnt(group_id: i64) -> Result<Vec<(i64, u32)>> {
+fn today_time_range() -> (i64, i64) {
     let now = chrono::Local::now();
     let today_midnight_naive = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
 
@@ -51,23 +51,31 @@ async fn today_msg_cnt(group_id: i64) -> Result<Vec<(i64, u32)>> {
     let start_timestamp = today_start.timestamp();
     // 其实用啥都行，反正只要能保证时间范围是24小时就行了
     let end_timestamp = start_timestamp + 24 * 3600;
-    let msg_cnts =
-        crate::db::msg_count_with_time_range(group_id, start_timestamp, end_timestamp).await?;
 
-    Ok(msg_cnts)
+    (start_timestamp, end_timestamp)
 }
 
 /// 生成每日发言排行 HTML（仅展示前 5 名）
 pub async fn gen_daily_rank_html(bot: &RuntimeBot, group_id: i64) -> Result<String> {
-    // 获取今日各用户发言数
-    let mut msg_cnts = today_msg_cnt(group_id).await?;
+    let (start_timestamp, end_timestamp) = today_time_range();
+    gen_rank_html_with_time_range(bot, group_id, start_timestamp, end_timestamp, 5).await
+}
 
-    // 按发言数降序排序，取前 5
+/// 生成时间范围发言排行 HTML
+pub async fn gen_rank_html_with_time_range(
+    bot: &RuntimeBot,
+    group_id: i64,
+    start_timestamp: i64,
+    end_timestamp: i64,
+    cnt: usize,
+) -> Result<String> {
+    let mut msg_cnts = msg_cnt_with_time_range(group_id, start_timestamp, end_timestamp).await?;
+
     msg_cnts.sort_by_key(|&(_, cnt)| Reverse(cnt));
-    let top5 = msg_cnts.into_iter().take(5).collect::<Vec<_>>();
+    let top5 = msg_cnts.into_iter().take(cnt).collect::<Vec<_>>();
 
     if top5.is_empty() {
-        anyhow::bail!("今日暂无发言数据");
+        anyhow::bail!("该时间范围暂无发言数据");
     }
 
     // 获取每个用户的 UserInfo
@@ -92,6 +100,17 @@ pub async fn gen_daily_rank_html(bot: &RuntimeBot, group_id: i64) -> Result<Stri
 
     let html = render_rank_html(&entries);
     Ok(html)
+}
+
+pub async fn msg_cnt_with_time_range(
+    group_id: i64,
+    start_timestamp: i64,
+    end_timestamp: i64,
+) -> Result<Vec<(i64, u32)>> {
+    let msg_cnts =
+        crate::db::msg_count_with_time_range(group_id, start_timestamp, end_timestamp).await?;
+
+    Ok(msg_cnts)
 }
 
 #[derive(Template)]
