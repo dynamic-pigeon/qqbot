@@ -1,13 +1,10 @@
-pub static HTML_START_NEXT_IS_MD_CSS: &str = concat!(
-    r#"<!doctype html>
+<!doctype html>
 <html>
 <head>
 <meta charset="UTF-8">
 <!-- KaTeX 核心样式 -->
 <style>
-"#,
-    include_str!("html/katex.min.css"),
-    r#"
+{{ katex_css|safe }}
 </style>
 <!-- 自定义数学公式样式 -->
 <style>
@@ -15,10 +12,8 @@ pub static HTML_START_NEXT_IS_MD_CSS: &str = concat!(
     .katex { font-size: 1.1em; }
 </style>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>"#
-);
-
-pub static HTML_2_NEXT_IS_HIGHLIGHT_CSS: &str = r#"
+<style>
+{{ github_md_css|safe }}
 .markdown-body {
     box-sizing: border-box;
     width: 100%;
@@ -38,18 +33,17 @@ body{
 }
 </style>
 <style>
-"#;
-
-pub static HTML_3_NEXT_IS_MD_BODY_AND_THEN_IS_HTML4: &str = r#"</style>
+{{ highlight_css|safe }}
+</style>
 </head>
 <body>
-<article class="markdown-body">"#;
-
-pub static HTML_4_NEXT_IS_HIGH_LIGHT_JS: &str = "</article><script>";
-
-pub static HTML_SCRIPT: &str = include_str!("html/katex.min.js");
-
-pub static HTML_END: &str = r#"</script><script>hljs.highlightAll();</script>
+<article class="markdown-body">
+{{ body|safe }}
+</article>
+<script>
+{{ highlight_js|safe }}
+</script>
+<script>hljs.highlightAll();</script>
 <script>
 const elementsToCheck = ['pre', 'code']; // 需要检测的元素
 
@@ -95,13 +89,8 @@ document.addEventListener("DOMContentLoaded", function() {
     });
     });
 </script>
-"#;
-
-pub static END: &str = r#"</body></html>"#;
-
-pub static HIGH_LIGHT_JS_NEXT_IS_HTML_END: &str = include_str!("html/highlight.js");
-
-pub static HIGH_LIGHT_LIGHT_CSS_NEXT_IS_HTML3: &str =
-    include_str!("html/highlight_github_light.css");
-
-pub static GITHUB_MARKDOWN_LIGHT_NEXT_IS_HTML2: &str = include_str!("html/github_md_light.css");
+<script>
+{{ katex_js|safe }}
+</script>
+</body>
+</html>

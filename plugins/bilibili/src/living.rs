@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 
@@ -34,16 +34,35 @@ struct LiveRoom {
 pub async fn init() {
     let bot = plugin::get_runtime_bot();
     let map = Arc::new(Mutex::new(HashMap::<u64, bool>::new()));
+    let map_ = Arc::clone(&map);
     plugin::cron("* */1 * * *", move || {
         let map = Arc::clone(&map);
         let bot = Arc::clone(&bot);
         scheduled_task(map, bot)
     })
     .unwrap();
+
+    // 每天凌晨0点清理一次订阅列表，移除已取消订阅的uid，避免map无限增长
+    plugin::cron("0 0 * * *", move || {
+        let map = Arc::clone(&map_);
+        async move {
+            let mut map = map.lock().await;
+            let cfg = config::read_config();
+            let uids: HashSet<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
+            map.retain(|&uid, _| uids.contains(&uid));
+            tracing::info!("已清理直播订阅列表，当前订阅数: {}", map.len());
+        }
+    })
+    .unwrap();
 }
 
 async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::RuntimeBot>) {
-    let mut map = map.lock().await;
+    // 如果已经被上一个任务占用，则跳过本次执行
+    let mut map = match map.try_lock() {
+        Ok(map) => map,
+        Err(_) => return,
+    };
+
     let cfg = config::read_config();
 
     let uids: Vec<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();

@@ -3602,6 +3602,7 @@ name = "utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "askama",
  "base64",
  "chromiumoxide",
  "crossbeam-epoch",
