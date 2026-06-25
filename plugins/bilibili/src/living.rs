@@ -6,6 +6,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json, tokio::sync::Mutex};
+use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use serde::Deserialize;
 use utils::retry::retry_async;
 

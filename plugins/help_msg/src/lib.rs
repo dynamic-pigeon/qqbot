@@ -4,6 +4,7 @@ use std::{
 };
 
 use kovi::{Message, PluginBuilder as plugin, tokio::sync::RwLock};
+use kovi_onebot::*;
 
 #[derive(Clone, Debug)]
 pub struct HelpItem {
