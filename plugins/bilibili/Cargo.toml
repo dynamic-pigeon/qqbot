@@ -5,13 +5,14 @@ edition = "2024"
 
 [dependencies]
 kovi.workspace = true
+kovi-onebot.workspace = true
 utils.workspace = true
 serde.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 help_msg.workspace = true
-regex = "1.12.3"
+regex = "1"
 base64.workspace = true
 moka.workspace = true
 tracing.workspace = true

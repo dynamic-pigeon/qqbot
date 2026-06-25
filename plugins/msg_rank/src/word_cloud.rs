@@ -9,9 +9,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use itertools::Itertools as _;
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
-    event::GroupMsgEvent,
     tokio::{self, io::AsyncWriteExt as _},
 };
+use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
 use tracing::{self, info};
 
 use crate::config::{modify_config, read_config};
@@ -80,7 +80,12 @@ async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<Ru
         return;
     };
 
-    if !bot.get_all_admin().unwrap().contains(&event.user_id) {
+    if !bot
+        .get_all_admin()
+        .unwrap()
+        .iter()
+        .any(|id| id.try_as_i64() == Some(event.user_id))
+    {
         event.reply("❌ 管理员专用命令，普通用户无法使用");
         return;
     }
@@ -145,7 +150,7 @@ async fn send_word_cloud(
         Err(e) => {
             tracing::error!("make word cloud failed: {}, group_id: {}", e, group_id);
             bot.send_private_msg(
-                bot.get_main_admin().unwrap(),
+                bot.get_main_admin().unwrap().try_as_i64().unwrap(),
                 format!("make word cloud failed: {}, group_id: {}", e, group_id),
             );
             return;
@@ -179,6 +184,7 @@ async fn make_word_cloud(
     let messages = msg
         .cut(&messages, true)
         .into_iter()
+        .map(|t| t.word)
         .filter(|s| s.chars().count() > 1)
         .join(" ");
 

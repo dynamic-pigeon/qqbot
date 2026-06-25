@@ -1,5 +1,6 @@
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
+use kovi_onebot::*;
 
 #[kovi::plugin]
 async fn main() {

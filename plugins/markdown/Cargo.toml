@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 kovi.workspace = true
+kovi-onebot.workspace = true
 utils.workspace = true
 base64.workspace = true
 help_msg.workspace = true

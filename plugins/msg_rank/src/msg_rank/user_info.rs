@@ -1,5 +1,6 @@
 use anyhow::{Ok, Result};
 use kovi::{RuntimeBot, serde_json};
+use kovi_onebot::OnebotTrait as _;
 
 use crate::HTTP_CLIENT;
 

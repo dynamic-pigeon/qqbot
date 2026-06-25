@@ -7,6 +7,7 @@ use chrono::TimeZone as _;
 use futures::TryFutureExt as _;
 use help_msg::register_help;
 use kovi::{PluginBuilder as plugin, RuntimeBot};
+use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _};
 
 mod user_info;
 

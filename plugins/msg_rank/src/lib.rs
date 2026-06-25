@@ -3,7 +3,8 @@ use std::{
     time::Duration,
 };
 
-use kovi::{Message, PluginBuilder as plugin, event::GroupMsgEvent, tokio};
+use kovi::{Message, PluginBuilder as plugin, tokio};
+use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 
 #[macro_use]
 mod config;
@@ -69,7 +70,7 @@ async fn get_text(msg: &Message) -> String {
         if !res.is_empty() {
             res.push(' ');
         }
-        match seg.type_.as_str() {
+        match seg.kind.as_str() {
             "text" => res.push_str(seg.data["text"].as_str().unwrap()),
             "image" => {
                 let url = seg.data["url"].as_str().unwrap().to_string();

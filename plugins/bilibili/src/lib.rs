@@ -7,9 +7,9 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
-    event::GroupMsgEvent,
     serde_json::{self, Value},
 };
+use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, event::GroupMsgEvent};
 
 use crate::{
     bv_parser::parse_url,
@@ -76,7 +76,8 @@ async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
             if !bot
                 .get_all_admin()
                 .unwrap_or_default()
-                .contains(&event.user_id)
+                .iter()
+                .any(|id| id.try_as_i64() == Some(event.user_id))
             {
                 event.reply("❌ 管理员专用命令，普通用户无法使用");
                 return;
@@ -121,7 +122,8 @@ async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
             if !bot
                 .get_all_admin()
                 .unwrap_or_default()
-                .contains(&event.user_id)
+                .iter()
+                .any(|id| id.try_as_i64() == Some(event.user_id))
             {
                 event.reply("❌ 管理员专用命令，普通用户无法使用");
                 return;
@@ -188,7 +190,7 @@ async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
 
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
     for msg in event.message.iter() {
-        let bv_info = match msg.type_.as_str() {
+        let bv_info = match msg.kind.as_str() {
             "json" => {
                 let Some(obj) = msg
                     .data

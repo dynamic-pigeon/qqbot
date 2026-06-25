@@ -1,8 +1,10 @@
-use kovi::build_bot;
+use kovi::tokio;
+use kovi_onebot::{OneBotDriver, load_local_conf};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化 tracing 订阅器，支持按库设置日志等级
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // 默认配置：不同库设置不同的日志级别
@@ -46,13 +48,11 @@ fn main() {
         )
         .init();
 
-    build_bot!(
-        kovi_plugin_cmd,
-        msg_rank,
-        help_msg,
-        markdown,
-        yu_gi_oh,
-        bilibili
-    )
-    .run();
+    let driver_config = load_local_conf()?;
+    let driver = OneBotDriver::new(driver_config);
+
+    let bot = kovi::build_bot!(driver; kovi_plugin_cmd, msg_rank, help_msg, markdown, yu_gi_oh, bilibili);
+
+    bot.run().await;
+    Ok(())
 }
