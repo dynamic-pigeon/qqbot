@@ -19,7 +19,7 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            background: {{ background }};
+            background: {{ background|safe }};
             font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
             padding: 24px;
         }
@@ -34,7 +34,7 @@
         #word-cloud {
             width: 900px;
             height: 600px;
-            background: {{ background }};
+            background: {{ background|safe }};
         }
     </style>
     {% if has_custom_font %}
@@ -71,7 +71,7 @@
                 weightFactor: function (size) {
                     return Math.pow(size, 1.05) * 0.5 + 10;
                 },
-                fontFamily: "{{ font_family }}",
+                fontFamily: {{ font_family|safe }},
                 color: function () {
                     const colors = [
                         '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
@@ -80,7 +80,7 @@
                     ];
                     return colors[Math.floor(Math.random() * colors.length)];
                 },
-                backgroundColor: "{{ background }}",
+                backgroundColor: {{ background|safe }},
                 rotateRatio: 0.25,
                 minSize: 10,
                 shrinkToFit: true,
