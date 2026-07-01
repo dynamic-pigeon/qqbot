@@ -74,7 +74,7 @@
                 list: words,
                 gridSize: 8,
                 weightFactor: function (size) {
-                    return Math.pow(size, 1.05) * 0.5 + 10;
+                    return Math.pow(size, 0.75) * 1.2 + 10;
                 },
                 fontFamily: {{ font_family|safe }},
                 color: function () {
