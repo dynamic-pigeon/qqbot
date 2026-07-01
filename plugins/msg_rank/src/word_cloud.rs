@@ -345,7 +345,7 @@ async fn render_word_cloud_html(
         (
             false,
             String::new(),
-            "\"Trebuchet MS\", \"Heiti TC\", \"微軟正黑體\", \"Arial Unicode MS\", \"Droid Fallback Sans\", sans-serif".to_string(),
+            "\"STHeiti\", \"Heiti TC\", \"Arial Unicode MS\", \"Microsoft YaHei\", \"PingFang SC\", sans-serif".to_string(),
         )
     };
 
@@ -429,7 +429,7 @@ mod tests {
     async fn test_wordcloud_screenshot_direct() {
         let items: Vec<WordCloudItem> = (0..50)
             .map(|i| WordCloudItem {
-                word: format!("词{}", i),
+                word: format!("word{}", i),
                 weight: (50 - i) as u32,
             })
             .collect();
