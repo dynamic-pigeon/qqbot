@@ -202,10 +202,16 @@ mod tests {
 
     use super::*;
 
+    // 集成测试统一使用 i64::MAX 附近的独立 group_id，
+    // 避免与 `test_rate_limit_per_group` 的 i64::MAX / i64::MAX - 1 互相污染限流状态。
+    const GROUP_LONG: i64 = i64::MAX - 100;
+    const GROUP_INVALID: i64 = i64::MAX - 101;
+    const GROUP_V_TEXT: i64 = i64::MAX - 102;
+
     #[tokio::test]
     async fn test_long() {
         let url = "https://www.bilibili.com/video/BV198XLBaEYp";
-        let info = parse_url(url, 0).await.unwrap();
+        let info = parse_url(url, GROUP_LONG).await.unwrap();
         println!("标题: {}", info.title);
         println!("作者: {}", info.name);
         println!("观看: {}", info.view);
@@ -216,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid() {
         let url = " https://www.bilibili.com/video/BV1PVdPBxEyr/?share_source=copy_web&vd_source=316166c47890d5daae6c8152b5f3e06f";
-        let res = parse_url(url, 0).await;
+        let res = parse_url(url, GROUP_INVALID).await;
         assert!(res.is_err());
         println!("错误信息: {}", res.err().unwrap());
     }
@@ -228,7 +234,7 @@ mod tests {
 收藏：72 观看：8359
 https://www.bilibili.com/video/BV198XLBaEYp";
 
-        let res = parse_url(txt, 0).await;
+        let res = parse_url(txt, GROUP_V_TEXT).await;
         assert!(res.is_ok());
     }
 

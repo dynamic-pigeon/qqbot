@@ -249,6 +249,12 @@ fn generate_word_cloud_image(
         builder = builder.font(font_bytes);
     }
 
+    // 加载自定义遮罩（如果 data 目录下存在 mask.png / mask.jpg）。
+    if let Some(mask_bytes) = load_mask(path) {
+        let mask_bytes = mask_bytes.map_err(|e| anyhow::anyhow!("读取遮罩失败: {e}"))?;
+        builder = builder.mask(mask_bytes);
+    }
+
     // 设置背景色，araea-wordcloud 要求十六进制字符串。
     let background_hex = normalize_background_color(background);
     builder = builder.background(&background_hex);
@@ -259,7 +265,22 @@ fn generate_word_cloud_image(
 
     wordcloud
         .to_png(2.0)
-        .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}").into())
+        .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}"))
+}
+
+/// 尝试读取 data/mask.png 或 data/mask.jpg 作为词云遮罩。
+///
+/// 注意：araea-wordcloud 把**深色区域**视为可放置文字的区域，
+/// **浅色/白色/透明区域**视为被遮挡的区域。因此遮罩图片应让目标形状为深色，
+/// 背景为浅色，这与 Python wordcloud 的遮罩约定一致。
+fn load_mask(path: &Path) -> Option<Result<Vec<u8>, std::io::Error>> {
+    for name in ["mask.png", "mask.jpg", "mask.jpeg"] {
+        let mask_path = path.join(name);
+        if mask_path.exists() {
+            return Some(std::fs::read(&mask_path));
+        }
+    }
+    None
 }
 
 /// 将常见颜色名或十六进制字符串统一为 #RRGGBB。
