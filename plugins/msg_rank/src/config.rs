@@ -9,12 +9,9 @@ static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mute
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
-    /// 已废弃：新实现使用 Playwright 截图，不再调用外部 wordcloud_cli。
-    /// 保留字段是为了兼容旧配置文件，避免反序列化失败。
-    #[serde(default)]
-    pub wordcloud_cli_path: String,
     pub notify_group: Vec<i64>,
     pub tencent: Option<TencentCloudConfig>,
+    /// 词云背景色，araea-wordcloud 接收十六进制字符串。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
     #[serde(skip)]
@@ -36,7 +33,6 @@ pub struct TencentCloudConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            wordcloud_cli_path: "wordcloud_cli".to_string(),
             notify_group: vec![],
             tencent: None,
             wordcloud_background: default_wordcloud_background(),
