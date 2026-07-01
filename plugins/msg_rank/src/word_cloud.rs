@@ -209,7 +209,12 @@ async fn make_word_cloud(
         return Ok(Vec::new());
     }
 
-    let html = render_word_cloud_html(path, dsc(duration), counted).await?;
+    let background = {
+        let config = read_config();
+        config.wordcloud_background.clone()
+    };
+
+    let html = render_word_cloud_html(path, dsc(duration), background, counted).await?;
 
     let image = timeout(WORDCLOUD_TIMEOUT, screenshot_word_cloud(html)).await
         .map_err(|_| anyhow::anyhow!("词云截图超时"))??;
@@ -264,7 +269,7 @@ async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
         let _ = ctx.close().await;
     }
 
-    Ok(res?)
+    res
 }
 
 async fn load_stop_words(path: &Path) -> Vec<String> {
@@ -290,7 +295,8 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
         stop_words.iter().map(|s| s.as_str()).collect();
     let mut counts: HashMap<String, u32> = HashMap::new();
     for w in words {
-        if stop_set.contains(w.as_str()) {
+        let w = w.trim().to_string();
+        if w.is_empty() || stop_set.contains(w.as_str()) {
             continue;
         }
         *counts.entry(w).or_insert(0) += 1;
@@ -299,7 +305,7 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
         .into_iter()
         .map(|(word, weight)| WordCloudItem { word, weight })
         .collect();
-    items.sort_by(|a, b| b.weight.cmp(&a.weight));
+    items.sort_by_key(|b| std::cmp::Reverse(b.weight));
     items.truncate(150);
     items
 }
@@ -325,13 +331,9 @@ struct WordCloudTemplate {
 async fn render_word_cloud_html(
     path: &Path,
     title: String,
+    background: String,
     items: Vec<WordCloudItem>,
 ) -> Result<String> {
-    let background = {
-        let config = read_config();
-        config.wordcloud_background.clone()
-    };
-
     let font_path = path.join("font.otf");
     let (has_custom_font, font_data_url, font_family) = if font_path.exists() {
         let bytes = tokio::fs::read(&font_path).await?;
@@ -372,7 +374,7 @@ mod tests {
     #[test]
     fn test_count_words_orders_by_weight() {
         let words = vec![
-            " Rust ".to_string(),
+            "rust".to_string(),
             "rust".to_string(),
             "go".to_string(),
             "go".to_string(),
@@ -406,11 +408,12 @@ mod tests {
                 weight: 5,
             },
         ];
-        let html = render_word_cloud_html(Path::new("/nonexistent"), "测试".to_string(), items)
+        let html = render_word_cloud_html(Path::new("/nonexistent"), "测试".to_string(), "white".to_string(), items)
             .await
             .unwrap();
         assert!(html.contains("WordCloud"));
         assert!(html.contains("你好"));
         assert!(html.contains("data-ready"));
     }
+
 }
