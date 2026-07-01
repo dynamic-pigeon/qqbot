@@ -5,9 +5,11 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化 tracing 订阅器，支持按库设置日志等级
+    // 加载 .env 文件（如存在）；系统环境变量优先级高于 .env。
+    // dotenvy 默认在当前目录及向上查找 .env 文件。
+    let _ = dotenvy::dotenv();
+
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // 默认配置：不同库设置不同的日志级别
         EnvFilter::new(
             "info,\
             qqbot=info,\

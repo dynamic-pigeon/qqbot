@@ -2,6 +2,14 @@
 <html>
 <head>
 <meta charset="UTF-8">
+<!--
+    内容安全策略：默认禁止所有外部资源；只允许页面内联脚本和样式。
+    配合后端 HTML sanitize，进一步降低 XSS / SSRF 风险。
+    img-src / connect-src 等全部关闭，阻止用户 Markdown 中的图片链接被
+    Chromium 加载后发起内网探测或数据外发。font-src 允许 'self' 和 data:
+    URI，因为 KaTeX 字体已被构建脚本内联为 data URI。
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; font-src 'self' data:; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none';">
 <!-- KaTeX 核心样式 -->
 <style>
 {{ katex_css|safe }}
@@ -45,49 +53,33 @@ body{
 </script>
 <script>hljs.highlightAll();</script>
 <script>
-const elementsToCheck = ['pre', 'code']; // 需要检测的元素
-
-document.addEventListener("DOMContentLoaded", function() {
+document.addEventListener('DOMContentLoaded', () => {
     const markdownBody = document.querySelector('.markdown-body');
-    let foundElement = false;
 
-    elementsToCheck.forEach(tag => {
-        if (markdownBody.querySelector(tag)) {
-            foundElement = true;
-        }
-    });
+    // 根据是否有 <pre>/<code> 调整 markdown-body 宽度
+    const hasCodeBlock = ['pre', 'code'].some(tag => markdownBody.querySelector(tag));
+    markdownBody.style.maxWidth = hasCodeBlock ? '720px' : '500px';
 
-    if (foundElement) {
-        markdownBody.style.maxWidth = '720px';
-    } else {
-        markdownBody.style.maxWidth = '500px';
-    }
-
-    const finishedElement = document.createElement('div');
-
-    finishedElement.classList.add('finish');
-
-    // 完成页面加载
-    document.body.appendChild(finishedElement);
-});
-</script>
-<script>
-    document.addEventListener('DOMContentLoaded', () => {
-    // 渲染行内公式
+    // 渲染 KaTeX 行内公式
     document.querySelectorAll('.math-inline').forEach(el => {
         const tex = el.textContent;
         const span = document.createElement('span');
         katex.render(tex, span, { displayMode: false });
         el.replaceWith(span);
     });
-    // 渲染块级公式
+    // 渲染 KaTeX 块级公式
     document.querySelectorAll('.math-display').forEach(el => {
         const tex = el.textContent;
         const div = document.createElement('div');
         katex.render(tex, div, { displayMode: true });
         el.replaceWith(div);
     });
-    });
+
+    // 完成页面加载的标志
+    const finishedElement = document.createElement('div');
+    finishedElement.classList.add('finish');
+    document.body.appendChild(finishedElement);
+});
 </script>
 <script>
 {{ katex_js|safe }}

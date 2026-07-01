@@ -1,15 +1,41 @@
-use std::{cmp::Reverse, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
-use futures::TryFutureExt as _;
 use help_msg::register_help;
 use kovi::{PluginBuilder as plugin, RuntimeBot};
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _};
 
 mod user_info;
+
+/// 每群连续两次 `#今日发言排行` 之间的最短间隔。
+const RANK_COOLDOWN_SECS: u64 = 30;
+
+/// 每群上一次执行 `#今日发言排行` 的时间戳，用于节流防止恶意刷屏打满
+/// DB 连接池与 chromium 渲染进程。`LazyLock<Mutex<_>>` 的锁只覆盖
+/// 「读上次时间 + 写入新时间」O(1) 临界区，不跨 await。
+static RANK_COOLDOWN: LazyLock<Mutex<HashMap<i64, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 检查并更新每群调用节流。返回 `Some(剩余秒数)` 表示仍在冷却中，`None` 表示放行。
+fn check_rank_cooldown(group_id: i64) -> Option<u64> {
+    let mut map = RANK_COOLDOWN.lock().unwrap();
+    let now = Instant::now();
+    if let Some(&last) = map.get(&group_id) {
+        let elapsed = now.duration_since(last);
+        if elapsed < Duration::from_secs(RANK_COOLDOWN_SECS) {
+            return Some(RANK_COOLDOWN_SECS - elapsed.as_secs());
+        }
+    }
+    map.insert(group_id, now);
+    None
+}
 
 pub async fn init() -> Result<()> {
     register_help("今日发言排行", "今日发言排行", "#今日发言排行").await;
@@ -21,10 +47,18 @@ pub async fn init() -> Result<()> {
             if text.trim() != "#今日发言排行" {
                 return;
             }
-            match gen_daily_rank_html(&bot, event.group_id)
-                .and_then(async |html| utils::screenshot(html.into(), None).await)
-                .await
-            {
+            if let Some(remain) = check_rank_cooldown(event.group_id) {
+                event.reply(format!("⏳ 刚跑完，{} 秒后再试一次喵～", remain));
+                return;
+            }
+            let reply = async {
+                let html = gen_daily_rank_html(&bot, event.group_id).await?;
+                let image = utils::screenshot(html.into(), None).await?;
+                Result::<Vec<u8>>::Ok(image)
+            }
+            .await;
+
+            match reply {
                 Ok(image) => {
                     let base64_image = STANDARD.encode(image);
                     let msg = kovi::Message::new().add_image(&format!("base64://{}", base64_image));
@@ -70,18 +104,20 @@ pub async fn gen_rank_html_with_time_range(
     end_timestamp: i64,
     cnt: usize,
 ) -> Result<String> {
-    let mut msg_cnts = msg_cnt_with_time_range(group_id, start_timestamp, end_timestamp).await?;
+    let top = crate::db::msg_count_top_with_time_range(
+        group_id,
+        start_timestamp,
+        end_timestamp,
+        cnt as i64,
+    )
+    .await?;
 
-    msg_cnts.sort_by_key(|&(_, cnt)| Reverse(cnt));
-    let top5 = msg_cnts.into_iter().take(cnt).collect::<Vec<_>>();
-
-    if top5.is_empty() {
+    if top.is_empty() {
         anyhow::bail!("该时间范围暂无发言数据");
     }
 
-    // 获取每个用户的 UserInfo
-    let mut entries: Vec<(user_info::UserInfo, u32)> = Vec::with_capacity(top5.len());
-    for (user_id, cnt) in top5 {
+    let mut entries: Vec<(user_info::UserInfo, u32)> = Vec::with_capacity(top.len());
+    for (user_id, cnt) in top {
         match user_info::get_user_info(bot, group_id, user_id).await {
             Ok(info) => entries.push((info, cnt)),
             Err(e) => {
@@ -99,19 +135,8 @@ pub async fn gen_rank_html_with_time_range(
         }
     }
 
-    let html = render_rank_html(&entries);
+    let html = render_rank_html(&entries)?;
     Ok(html)
-}
-
-pub async fn msg_cnt_with_time_range(
-    group_id: i64,
-    start_timestamp: i64,
-    end_timestamp: i64,
-) -> Result<Vec<(i64, u32)>> {
-    let msg_cnts =
-        crate::db::msg_count_with_time_range(group_id, start_timestamp, end_timestamp).await?;
-
-    Ok(msg_cnts)
 }
 
 #[derive(Template)]
@@ -131,10 +156,9 @@ struct RankItem {
     bar_pct: u32,
 }
 
-fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> String {
+fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> Result<String> {
     let date_str = chrono::Local::now().format("%Y年%m月%d日").to_string();
 
-    // 徽章：前三名特殊颜色
     let medal_colors = ["#FFD700", "#C0C0C0", "#CD7F32"];
     let medals = ["🥇", "🥈", "🥉"];
 
@@ -144,14 +168,12 @@ fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> String {
         .map(|(i, (info, cnt))| {
             let rank = i + 1;
 
-            // 获取徽章和颜色
             let (medal, medal_color) = if i < 3 {
                 (medals[i].to_string(), medal_colors[i])
             } else {
                 (rank.to_string(), "#6c757d")
             };
 
-            // 将头像转为 base64 data URL（若为空则使用占位 SVG）
             let avatar_src = if info.avatar.is_empty() {
                 format!(
                     "data:image/svg+xml;base64,{}",
@@ -183,7 +205,7 @@ fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> String {
         items,
     };
 
-    template.render().unwrap()
+    Ok(template.render()?)
 }
 
 /// 计算相对于第一名的进度条百分比

@@ -28,7 +28,6 @@ struct LiveRoom {
     room_id: u64,
     // 0: 未直播, 1: 直播中, 2: 轮播中
     live_status: i32,
-    // 直播封面图URL
     cover_from_user: String,
 }
 
@@ -58,7 +57,6 @@ pub async fn init() {
 }
 
 async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::RuntimeBot>) {
-    // 如果已经被上一个任务占用，则跳过本次执行
     let mut map = match map.try_lock() {
         Ok(map) => map,
         Err(_) => return,
@@ -101,54 +99,55 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
     }
 
     for (uid, info) in start {
-        let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
-            Ok(img) => img,
-            Err(_) => {
-                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
-                Default::default()
-            }
-        };
-        let base64_img = STANDARD.encode(img);
-        let mut msg = Message::new().add_text(format!(
-            "{}正在直播【{}】\nhttps://live.bilibili.com/{}",
-            info.uname, info.title, info.room_id
-        ));
-        if !base64_img.is_empty() {
-            msg.push_image(&format!("base64://{}", base64_img));
-        }
-
-        for group in cfg
-            .subscribe
-            .iter()
-            .filter(|s| s.uid == uid)
-            .flat_map(|s| &s.groups)
-        {
-            bot.send_group_msg(*group, msg.clone());
-        }
+        notify(&bot, &cfg, uid, &info, NotifyKind::Start).await;
     }
 
     for (uid, info) in end {
-        let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
-            Ok(img) => img,
-            Err(_) => {
-                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
-                Default::default()
-            }
-        };
-        let base64_img = STANDARD.encode(img);
-        let mut msg = Message::new().add_text(format!("{}直播结束了", info.uname));
-        if !base64_img.is_empty() {
-            msg.push_image(&format!("base64://{}", base64_img));
-        }
+        notify(&bot, &cfg, uid, &info, NotifyKind::End).await;
+    }
+}
 
-        for group in cfg
-            .subscribe
-            .iter()
-            .filter(|s| s.uid == uid)
-            .flat_map(|s| &s.groups)
-        {
-            bot.send_group_msg(*group, msg.clone());
+enum NotifyKind {
+    Start,
+    End,
+}
+
+async fn notify(
+    bot: &kovi::RuntimeBot,
+    cfg: &crate::config::Config,
+    uid: u64,
+    info: &LiveRoom,
+    kind: NotifyKind,
+) {
+    let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
+        Ok(img) => img,
+        Err(_) => {
+            tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
+            Default::default()
         }
+    };
+    let base64_img = STANDARD.encode(&img);
+
+    let text = match kind {
+        NotifyKind::Start => format!(
+            "{}正在直播【{}】\nhttps://live.bilibili.com/{}",
+            info.uname, info.title, info.room_id
+        ),
+        NotifyKind::End => format!("{}直播结束了", info.uname),
+    };
+
+    let mut msg = Message::new().add_text(text);
+    if !base64_img.is_empty() {
+        msg.push_image(&format!("base64://{}", base64_img));
+    }
+
+    for group in cfg
+        .subscribe
+        .iter()
+        .filter(|s| s.uid == uid)
+        .flat_map(|s| &s.groups)
+    {
+        bot.send_group_msg(*group, msg.clone());
     }
 }
 
@@ -200,14 +199,10 @@ async fn fetch_living_status(uids: &[u64]) -> anyhow::Result<HashMap<u64, LiveRo
 mod tests {
     use kovi::tokio;
 
+    // 依赖公网网络 + B 站 API 实际响应，CI/本地都不稳定。
+    // 手动回归时 `cargo test -- --ignored` 跑。
     #[tokio::test]
-    async fn test_fetch_living_status() {
-        let uids = [272925261, 2412572, 518817];
-        let status = super::fetch_living_status(&uids).await.unwrap();
-        println!("{:#?}", status);
-    }
-
-    #[tokio::test]
+    #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
     async fn test_check_uid() {
         let uid = 272925261;
         let exists = super::check_uid(uid).await;
@@ -215,12 +210,5 @@ mod tests {
         let uid = 484415486;
         let exists = super::check_uid(uid).await;
         assert!(!exists, "UID {} should not exist", uid);
-    }
-
-    #[tokio::test]
-    async fn test_fetch_uid_names() {
-        let uids = [272925261, 2412572, 518817];
-        let names = super::fetch_uid_names(&uids).await.unwrap();
-        println!("{:#?}", names);
     }
 }

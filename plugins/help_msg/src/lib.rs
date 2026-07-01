@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
+    fmt::Write as _,
     sync::{Arc, LazyLock},
 };
 
@@ -13,10 +14,10 @@ pub struct HelpItem {
     pub usage: Message,
 }
 
-type HelpRegistry = Arc<RwLock<HashMap<String, HelpItem>>>;
+type HelpRegistry = Arc<RwLock<BTreeMap<String, HelpItem>>>;
 
 static HELP_REGISTRY: LazyLock<HelpRegistry> =
-    LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
+    LazyLock::new(|| Arc::new(RwLock::new(BTreeMap::new())));
 
 /// 注册帮助信息
 pub async fn register_help(
@@ -50,9 +51,12 @@ async fn main() {
     plugin::on_msg(|event| async move {
         let text = event.borrow_text().unwrap_or_default();
 
-        // 处理 /help <command> 格式
         if text.starts_with("/help ") {
             let command = text.strip_prefix("/help ").unwrap().trim();
+            if command.is_empty() {
+                event.reply("⚠️ 请提供命令名，例如 `/help md`");
+                return;
+            }
             if let Some(help_item) = get_help(command).await {
                 event.reply(help_item.usage);
             } else {
@@ -61,7 +65,6 @@ async fn main() {
             return;
         }
 
-        // 处理 /help 显示所有命令
         if text == "/help" {
             let help_items = get_all_help().await;
             if help_items.is_empty() {
@@ -69,7 +72,7 @@ async fn main() {
             } else {
                 let mut response = String::from("📚 可用命令:\n");
                 for item in help_items {
-                    response.push_str(&format!("• `{}`: {}\n", item.command, item.description));
+                    let _ = writeln!(response, "• `{}`: {}", item.command, item.description);
                 }
                 response.push_str("\n使用 `/help <命令>` 查看详细用法");
                 event.reply(response);

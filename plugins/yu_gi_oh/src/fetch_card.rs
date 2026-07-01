@@ -39,7 +39,10 @@ impl Display for Card {
 }
 
 pub async fn fetch_card(name: &str) -> Result<Card> {
-    let url = format!("https://ygocdb.com/api/v0/?search={}", name);
+    let url = format!(
+        "https://ygocdb.com/api/v0/?search={}",
+        urlencoding::encode(name)
+    );
     let resp: ApiRes = reqwest::get(&url).await?.json().await?;
     let ret = resp
         .result
