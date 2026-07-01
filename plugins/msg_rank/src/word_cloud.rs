@@ -2,15 +2,14 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 use anyhow::Result;
-use askama::Template;
+use araea_wordcloud::{WordCloudBuilder, WordInput};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
-    tokio::{self, time::timeout},
+    tokio,
 };
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
 use tracing::{self, info};
@@ -19,11 +18,19 @@ use crate::config::{modify_config, read_config};
 
 static JIEBA: LazyLock<jieba_rs::Jieba> = LazyLock::new(jieba_rs::Jieba::new);
 
-/// 词云绘制库源码，编译时嵌入，避免运行时依赖网络或外部文件。
-const WORDCLOUD_JS: &str = include_str!("../assets/wordcloud2.js");
+/// 输出词云布局尺寸。实际 PNG 通过 `to_png(2.0)` 渲染成 800×800，
+/// 既保持 400×400 布局的紧凑填充，又获得高清晰度。
+const WORDCLOUD_WIDTH: u32 = 400;
+const WORDCLOUD_HEIGHT: u32 = 400;
 
-/// 截图整体超时。wordcloud2.js 绘制加上浏览器渲染通常很快，保留 60s 以应对首次启动浏览器。
-const WORDCLOUD_TIMEOUT: Duration = Duration::from_secs(60);
+/// 最大词数。
+const MAX_WORDS: usize = 150;
+
+/// 接近 Python wordcloud 默认 viridis 风格的配色。
+const WORDCLOUD_COLORS: [&str; 10] = [
+    "#440154", "#472878", "#3e4a89", "#31688e", "#26828e",
+    "#21918c", "#35b779", "#90d743", "#fde725", "#5c2686",
+];
 
 pub(crate) async fn init() -> Result<()> {
     help_msg::register_help(
@@ -204,8 +211,8 @@ async fn make_word_cloud(
     }
 
     let stop_words = load_stop_words(path).await;
-    let counted = count_words(raw_words, &stop_words);
-    if counted.is_empty() {
+    let items = count_words(raw_words, &stop_words);
+    if items.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -214,64 +221,67 @@ async fn make_word_cloud(
         config.wordcloud_background.clone()
     };
 
-    let html = render_word_cloud_html(path, dsc(duration), background, counted).await?;
-
-    let image = timeout(WORDCLOUD_TIMEOUT, screenshot_word_cloud(html)).await
-        .map_err(|_| anyhow::anyhow!("词云截图超时"))??;
-
-    Ok(image)
+    generate_word_cloud_image(path, items, &background)
 }
 
-/// 根据时间跨度生成标题描述。
-fn dsc(duration: chrono::Duration) -> String {
-    let days = duration.num_days();
-    if days >= 7 {
-        "上周词云".to_string()
-    } else {
-        "今日词云".to_string()
+/// 使用 araea-wordcloud 直接生成 PNG 词云图。
+fn generate_word_cloud_image(
+    path: &Path,
+    items: Vec<WordCloudItem>,
+    background: &str,
+) -> Result<Vec<u8>> {
+    let words: Vec<WordInput> = items
+        .into_iter()
+        .map(|item| WordInput::new(item.word, item.weight as f32))
+        .collect();
+
+    let mut builder = WordCloudBuilder::new()
+        .size(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
+        .colors(WORDCLOUD_COLORS)
+        .padding(2)
+        .angles(vec![0.0]);
+
+    // 加载自定义字体（如果 data 目录下存在 font.otf）。
+    let font_path = path.join("font.otf");
+    if font_path.exists() {
+        let font_bytes = std::fs::read(&font_path)
+            .map_err(|e| anyhow::anyhow!("读取字体失败: {e}"))?;
+        builder = builder.font(font_bytes);
     }
+
+    // 设置背景色，araea-wordcloud 要求十六进制字符串。
+    let background_hex = normalize_background_color(background);
+    builder = builder.background(&background_hex);
+
+    let wordcloud = builder
+        .build(&words)
+        .map_err(|e| anyhow::anyhow!("生成词云失败: {e}"))?;
+
+    wordcloud
+        .to_png(2.0)
+        .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}").into())
 }
 
-async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
-    let mut guard = utils::get_context().await?;
-    // 克隆 BrowserContext handle，避免后续可变借用 guard 冲突。
-    let ctx = playwright_rs::protocol::BrowserContext::clone(&guard);
+/// 将常见颜色名或十六进制字符串统一为 #RRGGBB。
+fn normalize_background_color(color: &str) -> String {
+    let color = color.trim();
+    if color.starts_with('#') && color.len() == 7 {
+        return color.to_string();
+    }
 
-    let res = async {
-        let page = ctx.new_page().await?;
-        let screenshot_res = async {
-            page.set_content(&html, None).await?;
-            // 等待 wordcloud2.js 绘制完成（body 上设置 data-ready）。
-            page.evaluate::<(), bool>(
-                "async () => {\n\
-                 const deadline = Date.now() + 30000;\n\
-                 while (document.body.getAttribute('data-ready') !== 'true') {\n\
-                     if (Date.now() > deadline) throw new Error('wordcloud render timeout');\n\
-                     const err = document.body.getAttribute('data-error');\n\
-                     if (err) throw new Error('wordcloud render failed: ' + err);\n\
-                     await new Promise(r => setTimeout(r, 50));\n\
-                 }\n\
-                 return true;\n\
-                 }",
-                None,
-            )
-            .await?;
-            let locator = page.locator(".card").await;
-            let bytes = locator.screenshot(None).await?;
-            Ok::<Vec<u8>, anyhow::Error>(bytes)
+    match color.to_lowercase().as_str() {
+        "white" => "#FFFFFF".to_string(),
+        "black" => "#000000".to_string(),
+        "red" => "#FF0000".to_string(),
+        "green" => "#008000".to_string(),
+        "blue" => "#0000FF".to_string(),
+        "yellow" => "#FFFF00".to_string(),
+        "transparent" => "#FFFFFF".to_string(),
+        _ => {
+            tracing::warn!("无法解析背景色 '{}', 使用默认白色", color);
+            "#FFFFFF".to_string()
         }
-        .await;
-        let _ = page.close().await;
-        screenshot_res
     }
-    .await;
-
-    if res.is_err() {
-        guard.mark_unhealthy();
-        let _ = ctx.close().await;
-    }
-
-    res
 }
 
 async fn load_stop_words(path: &Path) -> Vec<String> {
@@ -308,7 +318,7 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
         .map(|(word, weight)| WordCloudItem { word, weight })
         .collect();
     items.sort_by_key(|b| std::cmp::Reverse(b.weight));
-    items.truncate(250);
+    items.truncate(MAX_WORDS);
     items
 }
 
@@ -316,63 +326,6 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
 struct WordCloudItem {
     word: String,
     weight: u32,
-}
-
-#[derive(Template)]
-#[template(path = "wordcloud.html")]
-struct WordCloudTemplate {
-    title: String,
-    background: String,
-    has_custom_font: bool,
-    font_data_url: String,
-    font_family: String,
-    words_json: String,
-    word_count: usize,
-    script: String,
-}
-
-async fn render_word_cloud_html(
-    path: &Path,
-    title: String,
-    background: String,
-    items: Vec<WordCloudItem>,
-) -> Result<String> {
-    let font_path = path.join("font.otf");
-    let (has_custom_font, font_data_url, font_family) = if font_path.exists() {
-        let bytes = tokio::fs::read(&font_path).await?;
-        let data_url = format!("data:font/otf;base64,{}", STANDARD.encode(&bytes));
-        (true, data_url, "\"CustomWordCloudFont\"".to_string())
-    } else {
-        (
-            false,
-            String::new(),
-            "\"STHeiti\", \"Heiti TC\", \"Arial Unicode MS\", \"Microsoft YaHei\", \"PingFang SC\", sans-serif".to_string(),
-        )
-    };
-
-    let word_count = items.len();
-    let words_json = serde_json::to_string(
-        &items
-            .into_iter()
-            .map(|item| (item.word, item.weight))
-            .collect::<Vec<_>>(),
-    )?;
-
-    // 作为 JS 字符串字面量序列化，避免模板注入和引号问题。
-    let background = serde_json::to_string(&background)?;
-    let font_family = serde_json::to_string(&font_family)?;
-    let template = WordCloudTemplate {
-        title,
-        background,
-        has_custom_font,
-        font_data_url,
-        font_family,
-        words_json,
-        word_count,
-        script: WORDCLOUD_JS.to_string(),
-    };
-
-    Ok(template.render()?)
 }
 
 #[cfg(test)]
@@ -404,117 +357,28 @@ mod tests {
         assert_eq!(items[0].word, "rust");
     }
 
-    #[tokio::test]
-    async fn test_render_wordcloud_html_contains_script() {
-        let items = vec![
-            WordCloudItem {
-                word: "你好".to_string(),
-                weight: 10,
-            },
-            WordCloudItem {
-                word: "世界".to_string(),
-                weight: 5,
-            },
-        ];
-        let html = render_word_cloud_html(Path::new("/nonexistent"), "测试".to_string(), "white".to_string(), items)
-            .await
-            .unwrap();
-        assert!(html.contains("WordCloud"));
-        assert!(html.contains("你好"));
-        assert!(html.contains("data-ready"));
+    #[test]
+    fn test_normalize_background_color() {
+        assert_eq!(normalize_background_color("#161628"), "#161628");
+        assert_eq!(normalize_background_color("white"), "#FFFFFF");
+        assert_eq!(normalize_background_color("black"), "#000000");
+        assert_eq!(normalize_background_color("unknown"), "#FFFFFF");
     }
 
-    /// 直接启动 Playwright 验证词云截图。需要 Chromium 环境，默认忽略。
-    /// 手动运行：cargo test -p msg_rank test_wordcloud_screenshot_direct -- --ignored
+    /// 直接生成词云 PNG 验证 araea-wordcloud 集成。默认忽略，需手动运行。
+    /// cargo test -p msg_rank test_wordcloud_generate_direct -- --ignored
     #[tokio::test]
     #[ignore]
-    async fn test_wordcloud_screenshot_direct() {
-        let items: Vec<WordCloudItem> = (0..50)
-            .map(|i| WordCloudItem {
-                word: format!("word{}", i),
-                weight: (50 - i) as u32,
-            })
+    async fn test_wordcloud_generate_direct() {
+        let text = std::fs::read_to_string("/tmp/article.txt").unwrap();
+        let raw_words: Vec<String> = JIEBA
+            .cut(&text, true)
+            .into_iter()
+            .map(|t| t.word.to_string())
+            .filter(|s| s.chars().count() > 1)
             .collect();
-        let html = render_word_cloud_html(
-            Path::new("/nonexistent"),
-            "截图测试".to_string(),
-            "white".to_string(),
-            items,
-        )
-        .await
-        .unwrap();
-
-        let playwright = playwright_rs::Playwright::launch().await.unwrap();
-        let browser = playwright
-            .chromium()
-            .launch_with_options(
-                playwright_rs::LaunchOptions::new()
-                    .headless(true)
-                    .args(vec![
-                        "--disable-dev-shm-usage".to_string(),
-                        "--disable-background-networking".to_string(),
-                        "--disable-default-apps".to_string(),
-                        "--disable-extensions".to_string(),
-                        "--disable-sync".to_string(),
-                        "--disable-translate".to_string(),
-                        "--no-first-run".to_string(),
-                        "--mute-audio".to_string(),
-                        "--password-store=basic".to_string(),
-                        "--use-mock-keychain".to_string(),
-                    ]),
-            )
-            .await
-            .unwrap();
-        let viewport = playwright_rs::protocol::Viewport {
-            width: 1920,
-            height: 1080,
-        };
-        let opts = playwright_rs::protocol::BrowserContextOptions::builder()
-            .viewport(viewport)
-            .build();
-        let context = browser.new_context_with_options(opts).await.unwrap();
-        context.set_default_timeout(30_000.0).await;
-        let page = context.new_page().await.unwrap();
-        page.set_content(&html, None).await.unwrap();
-        let diag: serde_json::Value = page
-            .evaluate::<(), serde_json::Value>(
-                "async () => {\n\
-                 const info = {\n\
-                     hasWordCloud: typeof WordCloud !== 'undefined',\n\
-                     isSupported: typeof WordCloud !== 'undefined' && WordCloud.isSupported,\n\
-                     wordCount: (function() {\n\
-                         try { return window.wordcloudWords ? window.wordcloudWords.length : 'no window.wordcloudWords'; }\n\
-                         catch (e) { return String(e); }\n\
-                     })(),\n\
-                     bodyReady: document.body.getAttribute('data-ready'),\n\
-                     bodyError: document.body.getAttribute('data-error')\n\
-                 };\n\
-                 const deadline = Date.now() + 30000;\n\
-                 while (document.body.getAttribute('data-ready') !== 'true') {\n\
-                     if (Date.now() > deadline) {\n\
-                         info.timeout = true;\n\
-                         return info;\n\
-                     }\n\
-                     if (info.bodyError) {\n\
-                         info.renderError = info.bodyError;\n\
-                         return info;\n\
-                     }\n\
-                     await new Promise(r => setTimeout(r, 50));\n\
-                 }\n\
-                 info.ready = true;\n\
-                 return info;\n\
-                 }",
-                None,
-            )
-            .await
-            .unwrap();
-        if diag.get("ready").and_then(|v| v.as_bool()) != Some(true) {
-            panic!("wordcloud render did not finish: {:?}", diag);
-        }
-        let locator = page.locator(".card").await;
-        let png = locator.screenshot(None).await.unwrap();
-        page.close().await.unwrap();
-
+        let items = count_words(raw_words, &[]);
+        let png = generate_word_cloud_image(Path::new("/nonexistent"), items, "white").unwrap();
         assert!(!png.is_empty());
         tokio::fs::write("/tmp/wordcloud_test.png", &png).await.unwrap();
     }

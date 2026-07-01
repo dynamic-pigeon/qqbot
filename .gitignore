@@ -4,3 +4,4 @@ kovi.plugin.toml
 data/
 .*
 logs
+docs/superpowers/
