@@ -14,6 +14,9 @@ pub struct Config {
     /// 词云背景色，araea-wordcloud 接收十六进制字符串。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
+    /// 是否对 OCR 图片 URL 做 DNS 预解析校验。默认关闭，避免本地 DNS 劫持导致误杀。
+    #[serde(default)]
+    pub validate_image_url_dns: bool,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -36,6 +39,7 @@ impl Default for Config {
             notify_group: vec![],
             tencent: None,
             wordcloud_background: default_wordcloud_background(),
+            validate_image_url_dns: false,
             path: PathBuf::new(),
         }
     }

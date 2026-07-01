@@ -60,7 +60,7 @@ pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// 异步校验图片 URL：在 [`validate_image_url`] 基础上对域名做 DNS 预解析，
+/// 异步校验图片 URL：在 [`validate_image_url`] 基础上可选对域名做 DNS 预解析，
 /// 确保所有 A/AAAA 记录都是公网单播地址。
 ///
 /// 防 DNS rebinding 的关键：attacker 控制权威 DNS 时，可在 URL 字符串校验阶段
@@ -71,8 +71,18 @@ pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
 ///
 /// 仍存在极小的 TOCTOU 窗口（attacker 在校验通过后、reqwest 实际 connect 前切 DNS），
 /// 配合 HTTP 客户端的 redirect = none + 短超时足够覆盖绝大多数攻击面。
-pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Result<()> {
+///
+/// `check_dns` 控制是否执行 DNS 预解析；本地存在 DNS 劫持等场景时可关闭。
+pub async fn validate_image_url_async_with_options(
+    url: &str,
+    allowed_hosts: &[&str],
+    check_dns: bool,
+) -> Result<()> {
     validate_image_url(url, allowed_hosts)?;
+
+    if !check_dns {
+        return Ok(());
+    }
 
     let parsed = reqwest::Url::parse(url)?;
     let host = parsed
@@ -102,6 +112,12 @@ pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Resu
             public_addrs.push(ip);
         }
     }
+    tracing::debug!(
+        "validate_image_url_async: {} -> all: {:?}, public: {:?}",
+        host,
+        all_addrs,
+        public_addrs
+    );
     if all_addrs.is_empty() {
         return Err(anyhow::anyhow!("DNS 解析返回空: {}", host));
     }
@@ -114,6 +130,13 @@ pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Resu
     }
 
     Ok(())
+}
+
+/// 异步校验图片 URL，默认启用 DNS 预解析。
+///
+/// 等价于 `validate_image_url_async_with_options(url, allowed_hosts, true)`。
+pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Result<()> {
+    validate_image_url_async_with_options(url, allowed_hosts, true).await
 }
 
 /// IP 是否是公网单播地址（可路由）。
