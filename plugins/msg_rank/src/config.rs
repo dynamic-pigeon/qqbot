@@ -22,7 +22,7 @@ pub struct Config {
 }
 
 fn default_wordcloud_background() -> String {
-    "white".to_string()
+    "#161628".to_string()
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]

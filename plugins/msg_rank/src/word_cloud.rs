@@ -256,7 +256,7 @@ async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
                 None,
             )
             .await?;
-            let locator = page.locator("#word-cloud").await;
+            let locator = page.locator(".card").await;
             let bytes = locator.screenshot(None).await?;
             Ok::<Vec<u8>, anyhow::Error>(bytes)
         }
@@ -327,6 +327,7 @@ struct WordCloudTemplate {
     font_data_url: String,
     font_family: String,
     words_json: String,
+    word_count: usize,
     script: String,
 }
 
@@ -349,6 +350,7 @@ async fn render_word_cloud_html(
         )
     };
 
+    let word_count = items.len();
     let words_json = serde_json::to_string(
         &items
             .into_iter()
@@ -359,7 +361,6 @@ async fn render_word_cloud_html(
     // 作为 JS 字符串字面量序列化，避免模板注入和引号问题。
     let background = serde_json::to_string(&background)?;
     let font_family = serde_json::to_string(&font_family)?;
-
     let template = WordCloudTemplate {
         title,
         background,
@@ -367,6 +368,7 @@ async fn render_word_cloud_html(
         font_data_url,
         font_family,
         words_json,
+        word_count,
         script: WORDCLOUD_JS.to_string(),
     };
 
@@ -509,7 +511,7 @@ mod tests {
         if diag.get("ready").and_then(|v| v.as_bool()) != Some(true) {
             panic!("wordcloud render did not finish: {:?}", diag);
         }
-        let locator = page.locator("#word-cloud").await;
+        let locator = page.locator(".card").await;
         let png = locator.screenshot(None).await.unwrap();
         page.close().await.unwrap();
 

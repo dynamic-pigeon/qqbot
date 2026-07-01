@@ -19,22 +19,48 @@
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            background: {{ background|safe }};
+            background: linear-gradient(135deg, #0d0d1a 0%, #12122b 50%, #0a1a2f 100%);
             font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-            padding: 24px;
+            padding: 40px;
         }
 
-        h1 {
-            font-size: 26px;
-            color: #333;
+        .card {
+            background: rgba(22, 22, 40, 0.95);
+            border-radius: 28px;
+            box-shadow: 0 32px 80px rgba(0, 0, 0, 0.55);
+            padding: 36px;
+            text-align: center;
+            width: fit-content;
+        }
+
+        .card h1 {
+            font-size: 28px;
+            color: #ffffff;
             margin-bottom: 20px;
-            font-weight: 600;
+            font-weight: 700;
+            letter-spacing: 2px;
+        }
+
+        .card h1 span {
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.55);
+            display: block;
+            margin-top: 6px;
+            font-weight: 400;
+            letter-spacing: 0;
         }
 
         #word-cloud {
             width: 800px;
             height: 800px;
-            background: {{ background|safe }};
+            display: block;
+            background: transparent;
+        }
+
+        .footer {
+            color: rgba(255, 255, 255, 0.45);
+            font-size: 12px;
+            margin-top: 16px;
         }
     </style>
     {% if has_custom_font %}
@@ -48,8 +74,11 @@
 </head>
 
 <body>
-    <h1>{{ title }}</h1>
-    <canvas id="word-cloud" width="800" height="800"></canvas>
+    <div class="card">
+        <h1>{{ title }}<span>msg_rank word cloud</span></h1>
+        <canvas id="word-cloud" width="800" height="800"></canvas>
+        <div class="footer">Top {{ word_count }} · 由消息统计生成</div>
+    </div>
     <script>
         {{ script|safe }}
     </script>
@@ -79,9 +108,9 @@
                 fontFamily: {{ font_family|safe }},
                 color: function () {
                     const colors = [
-                        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
-                        '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
-                        '#bcbd22', '#17becf', '#393b79', '#637939'
+                        '#FFD700', '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4',
+                        '#FFEAA7', '#DDA0DD', '#87CEEB', '#FF85A2', '#B4E7CE',
+                        '#FDCB6E', '#6C5CE7', '#A8E6CF', '#FF7675', '#74B9FF'
                     ];
                     return colors[Math.floor(Math.random() * colors.length)];
                 },
