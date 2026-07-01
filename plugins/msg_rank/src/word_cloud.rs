@@ -1,16 +1,16 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use anyhow::Result;
+use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use itertools::Itertools as _;
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
-    tokio::{self, io::AsyncWriteExt as _, time::timeout},
+    tokio::{self, time::timeout},
 };
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
 use tracing::{self, info};
@@ -19,16 +19,11 @@ use crate::config::{modify_config, read_config};
 
 static JIEBA: LazyLock<jieba_rs::Jieba> = LazyLock::new(jieba_rs::Jieba::new);
 
-/// wordcloud_cli 进程池容量。每日 cron 同时给所有 notify_group 跑，存在 N 个并发子进程的
-/// 风险（每个都跑分词 + 起 chromium/cli + 内存塞几 MB stdin），把并发上限压到 2。
-const WORDCLOUD_POOL_MAX: usize = 2;
+/// 词云绘制库源码，编译时嵌入，避免运行时依赖网络或外部文件。
+const WORDCLOUD_JS: &str = include_str!("../assets/wordcloud2.js");
 
-/// 获取 wordcloud 进程池许可的最长等待。超过此值直接报错返回，让上层 cron 路径走
-/// `send_word_cloud` 既有的失败→私聊 admin 通知路径。
-const WORDCLOUD_POOL_WAIT: Duration = Duration::from_secs(5);
-
-static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> =
-    LazyLock::new(|| utils::BoundedPool::new(WORDCLOUD_POOL_MAX));
+/// 截图整体超时。wordcloud2.js 绘制加上浏览器渲染通常很快，保留 60s 以应对首次启动浏览器。
+const WORDCLOUD_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) async fn init() -> Result<()> {
     help_msg::register_help(
@@ -65,8 +60,9 @@ pub(crate) async fn init() -> Result<()> {
     })
     .unwrap();
     let bot_ = Arc::clone(&bot);
+    let path_ = Arc::clone(&path);
     plugin::cron("0 10 * * 6", move || {
-        let path = &path;
+        let path = &path_;
         let bot = &bot_;
         let config = read_config();
         let notify_group = &config.notify_group;
@@ -185,9 +181,6 @@ async fn make_word_cloud(
     notify_group: i64,
     duration: chrono::Duration,
 ) -> Result<Vec<u8>> {
-    // 进程池 gate：池满则排队等 ≤ 5s，超时直接 bail；许可在函数结尾 drop 自动归还。
-    let _permit = WORDCLOUD_POOL.acquire(WORDCLOUD_POOL_WAIT).await?;
-
     let end_time = chrono::Local::now();
     let start_time = end_time - duration;
 
@@ -199,78 +192,225 @@ async fn make_word_cloud(
     .await?
     .join(" ");
 
-    let messages = JIEBA
+    let raw_words: Vec<String> = JIEBA
         .cut(&messages, true)
         .into_iter()
-        .map(|t| t.word)
+        .map(|t| t.word.to_string())
         .filter(|s| s.chars().count() > 1)
-        .join(" ");
+        .collect();
 
-    let wc_cli = crate::config::read_config().wordcloud_cli_path.clone();
-    let wc_cli = validate_wordcloud_cli_path(&wc_cli)
-        .map_err(|e| anyhow::anyhow!("wordcloud_cli 路径不合法: {e}"))?;
-    let mask_path = path.join("mask.jpg");
-    let stop_word_path = path.join("stopword.txt");
-    let fontfile_path = path.join("font.otf");
-
-    let mut command = tokio::process::Command::new(wc_cli);
-
-    command
-        .args(["--background", "white"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if mask_path.exists() {
-        command.arg("--mask").arg(mask_path);
+    if raw_words.is_empty() {
+        return Ok(Vec::new());
     }
 
-    if stop_word_path.exists() {
-        command.arg("--stopwords").arg(stop_word_path);
+    let stop_words = load_stop_words(path).await;
+    let counted = count_words(raw_words, &stop_words);
+    if counted.is_empty() {
+        return Ok(Vec::new());
     }
 
-    if fontfile_path.exists() {
-        command.arg("--fontfile").arg(fontfile_path);
-    }
+    let html = render_word_cloud_html(path, dsc(duration), counted).await?;
 
-    let mut child = command.spawn()?;
+    let image = timeout(WORDCLOUD_TIMEOUT, screenshot_word_cloud(html)).await
+        .map_err(|_| anyhow::anyhow!("词云截图超时"))??;
 
-    let output = match timeout(Duration::from_secs(60), async {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("无法获取 wordcloud_cli 的 stdin"))?;
-        stdin.write_all(messages.as_bytes()).await?;
-        stdin.shutdown().await?;
-        drop(stdin);
-        let output = child.wait_with_output().await?;
-        anyhow::Ok(output)
-    })
-    .await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => anyhow::bail!("wordcloud_cli 执行超时"),
-    };
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "wordcloud_cli failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(output.stdout)
+    Ok(image)
 }
 
-/// 校验 wordcloud_cli 路径：必须是绝对路径且文件存在。
-fn validate_wordcloud_cli_path(path: &str) -> Result<PathBuf> {
-    let p = Path::new(path);
-    if !p.is_absolute() {
-        anyhow::bail!("必须是绝对路径");
+/// 根据时间跨度生成标题描述。
+fn dsc(duration: chrono::Duration) -> String {
+    let days = duration.num_days();
+    if days >= 7 {
+        "上周词云".to_string()
+    } else {
+        "今日词云".to_string()
     }
-    if !p.is_file() {
-        anyhow::bail!("wordcloud_cli 必须是可执行文件: {}", p.display());
+}
+
+async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
+    let mut guard = utils::get_context().await?;
+    // 克隆 BrowserContext handle，避免后续可变借用 guard 冲突。
+    let ctx = playwright_rs::protocol::BrowserContext::clone(&guard);
+
+    let res = async {
+        let page = ctx.new_page().await?;
+        let screenshot_res = async {
+            page.set_content(&html, None).await?;
+            // 等待 wordcloud2.js 绘制完成（body 上设置 data-ready）。
+            page.evaluate::<(), bool>(
+                "async () => {\n\
+                 const deadline = Date.now() + 10000;\n\
+                 while (document.body.getAttribute('data-ready') !== 'true') {\n\
+                     if (Date.now() > deadline) throw new Error('wordcloud render timeout');\n\
+                     await new Promise(r => setTimeout(r, 50));\n\
+                 }\n\
+                 return true;\n\
+                 }",
+                None,
+            )
+            .await?;
+            let locator = page.locator("#word-cloud").await;
+            let bytes = locator.screenshot(None).await?;
+            Ok::<Vec<u8>, anyhow::Error>(bytes)
+        }
+        .await;
+        let _ = page.close().await;
+        screenshot_res
     }
-    Ok(p.to_path_buf())
+    .await;
+
+    if res.is_err() {
+        guard.mark_unhealthy();
+        let _ = ctx.close().await;
+    }
+
+    Ok(res?)
+}
+
+async fn load_stop_words(path: &Path) -> Vec<String> {
+    let stop_word_path = path.join("stopword.txt");
+    if !stop_word_path.exists() {
+        return Vec::new();
+    }
+    match tokio::fs::read_to_string(&stop_word_path).await {
+        Ok(content) => content
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("读取停用词文件失败: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> {
+    let stop_set: std::collections::HashSet<&str> =
+        stop_words.iter().map(|s| s.as_str()).collect();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for w in words {
+        if stop_set.contains(w.as_str()) {
+            continue;
+        }
+        *counts.entry(w).or_insert(0) += 1;
+    }
+    let mut items: Vec<WordCloudItem> = counts
+        .into_iter()
+        .map(|(word, weight)| WordCloudItem { word, weight })
+        .collect();
+    items.sort_by(|a, b| b.weight.cmp(&a.weight));
+    items.truncate(150);
+    items
+}
+
+#[derive(serde::Serialize)]
+struct WordCloudItem {
+    word: String,
+    weight: u32,
+}
+
+#[derive(Template)]
+#[template(path = "wordcloud.html")]
+struct WordCloudTemplate {
+    title: String,
+    background: String,
+    has_custom_font: bool,
+    font_data_url: String,
+    font_family: String,
+    words_json: String,
+    script: String,
+}
+
+async fn render_word_cloud_html(
+    path: &Path,
+    title: String,
+    items: Vec<WordCloudItem>,
+) -> Result<String> {
+    let background = {
+        let config = read_config();
+        config.wordcloud_background.clone()
+    };
+
+    let font_path = path.join("font.otf");
+    let (has_custom_font, font_data_url, font_family) = if font_path.exists() {
+        let bytes = tokio::fs::read(&font_path).await?;
+        let data_url = format!("data:font/otf;base64,{}", STANDARD.encode(&bytes));
+        (true, data_url, "\"CustomWordCloudFont\"".to_string())
+    } else {
+        (
+            false,
+            String::new(),
+            "\"PingFang SC\", \"Microsoft YaHei\", \"Segoe UI\", sans-serif".to_string(),
+        )
+    };
+
+    let words_json = serde_json::to_string(
+        &items
+            .into_iter()
+            .map(|item| (item.word, item.weight))
+            .collect::<Vec<_>>(),
+    )?;
+
+    let template = WordCloudTemplate {
+        title,
+        background,
+        has_custom_font,
+        font_data_url,
+        font_family,
+        words_json,
+        script: WORDCLOUD_JS.to_string(),
+    };
+
+    Ok(template.render()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_count_words_orders_by_weight() {
+        let words = vec![
+            " Rust ".to_string(),
+            "rust".to_string(),
+            "go".to_string(),
+            "go".to_string(),
+            "go".to_string(),
+        ];
+        let items = count_words(words, &[]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].word, "go");
+        assert_eq!(items[0].weight, 3);
+        assert_eq!(items[1].word, "rust");
+        assert_eq!(items[1].weight, 2);
+    }
+
+    #[test]
+    fn test_count_words_respects_stop_words() {
+        let words = vec!["rust".to_string(), "the".to_string(), "the".to_string()];
+        let items = count_words(words, &["the".to_string()]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].word, "rust");
+    }
+
+    #[tokio::test]
+    async fn test_render_wordcloud_html_contains_script() {
+        let items = vec![
+            WordCloudItem {
+                word: "你好".to_string(),
+                weight: 10,
+            },
+            WordCloudItem {
+                word: "世界".to_string(),
+                weight: 5,
+            },
+        ];
+        let html = render_word_cloud_html(Path::new("/nonexistent"), "测试".to_string(), items)
+            .await
+            .unwrap();
+        assert!(html.contains("WordCloud"));
+        assert!(html.contains("你好"));
+        assert!(html.contains("data-ready"));
+    }
 }
