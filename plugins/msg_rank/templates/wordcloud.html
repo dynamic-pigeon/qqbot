@@ -55,16 +55,21 @@
     </script>
     <script>
         const words = {{ words_json|safe }};
+        window.wordcloudWords = words;
         const canvas = document.getElementById('word-cloud');
 
-        function onReady() {
+        function onReady(err) {
+            if (err) {
+                document.body.setAttribute('data-error', String(err));
+            }
             document.body.setAttribute('data-ready', 'true');
         }
 
         if (words.length === 0) {
-            onReady();
+            onReady(null);
         } else {
-            canvas.addEventListener('wordcloudstop', onReady, { once: true });
+            canvas.addEventListener('wordcloudstop', () => onReady(null), { once: true });
+            canvas.addEventListener('wordcloudabort', (evt) => onReady(evt.detail), { once: true });
             WordCloud(canvas, {
                 list: words,
                 gridSize: 8,
