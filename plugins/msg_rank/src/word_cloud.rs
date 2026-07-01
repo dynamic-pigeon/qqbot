@@ -308,7 +308,7 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
         .map(|(word, weight)| WordCloudItem { word, weight })
         .collect();
     items.sort_by_key(|b| std::cmp::Reverse(b.weight));
-    items.truncate(150);
+    items.truncate(250);
     items
 }
 
