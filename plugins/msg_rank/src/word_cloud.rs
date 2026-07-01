@@ -244,9 +244,11 @@ async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
             // 等待 wordcloud2.js 绘制完成（body 上设置 data-ready）。
             page.evaluate::<(), bool>(
                 "async () => {\n\
-                 const deadline = Date.now() + 10000;\n\
+                 const deadline = Date.now() + 30000;\n\
                  while (document.body.getAttribute('data-ready') !== 'true') {\n\
                      if (Date.now() > deadline) throw new Error('wordcloud render timeout');\n\
+                     const err = document.body.getAttribute('data-error');\n\
+                     if (err) throw new Error('wordcloud render failed: ' + err);\n\
                      await new Promise(r => setTimeout(r, 50));\n\
                  }\n\
                  return true;\n\
@@ -343,7 +345,7 @@ async fn render_word_cloud_html(
         (
             false,
             String::new(),
-            "\"PingFang SC\", \"Microsoft YaHei\", \"Segoe UI\", sans-serif".to_string(),
+            "\"Trebuchet MS\", \"Heiti TC\", \"微軟正黑體\", \"Arial Unicode MS\", \"Droid Fallback Sans\", sans-serif".to_string(),
         )
     };
 
@@ -353,6 +355,10 @@ async fn render_word_cloud_html(
             .map(|item| (item.word, item.weight))
             .collect::<Vec<_>>(),
     )?;
+
+    // 作为 JS 字符串字面量序列化，避免模板注入和引号问题。
+    let background = serde_json::to_string(&background)?;
+    let font_family = serde_json::to_string(&font_family)?;
 
     let template = WordCloudTemplate {
         title,
@@ -416,4 +422,98 @@ mod tests {
         assert!(html.contains("data-ready"));
     }
 
+    /// 直接启动 Playwright 验证词云截图。需要 Chromium 环境，默认忽略。
+    /// 手动运行：cargo test -p msg_rank test_wordcloud_screenshot_direct -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_wordcloud_screenshot_direct() {
+        let items: Vec<WordCloudItem> = (0..50)
+            .map(|i| WordCloudItem {
+                word: format!("词{}", i),
+                weight: (50 - i) as u32,
+            })
+            .collect();
+        let html = render_word_cloud_html(
+            Path::new("/nonexistent"),
+            "截图测试".to_string(),
+            "white".to_string(),
+            items,
+        )
+        .await
+        .unwrap();
+
+        let playwright = playwright_rs::Playwright::launch().await.unwrap();
+        let browser = playwright
+            .chromium()
+            .launch_with_options(
+                playwright_rs::LaunchOptions::new()
+                    .headless(true)
+                    .args(vec![
+                        "--disable-dev-shm-usage".to_string(),
+                        "--disable-background-networking".to_string(),
+                        "--disable-default-apps".to_string(),
+                        "--disable-extensions".to_string(),
+                        "--disable-sync".to_string(),
+                        "--disable-translate".to_string(),
+                        "--no-first-run".to_string(),
+                        "--mute-audio".to_string(),
+                        "--password-store=basic".to_string(),
+                        "--use-mock-keychain".to_string(),
+                    ]),
+            )
+            .await
+            .unwrap();
+        let viewport = playwright_rs::protocol::Viewport {
+            width: 1920,
+            height: 1080,
+        };
+        let opts = playwright_rs::protocol::BrowserContextOptions::builder()
+            .viewport(viewport)
+            .build();
+        let context = browser.new_context_with_options(opts).await.unwrap();
+        context.set_default_timeout(30_000.0).await;
+        let page = context.new_page().await.unwrap();
+        page.set_content(&html, None).await.unwrap();
+        let diag: serde_json::Value = page
+            .evaluate::<(), serde_json::Value>(
+                "async () => {\n\
+                 const info = {\n\
+                     hasWordCloud: typeof WordCloud !== 'undefined',\n\
+                     isSupported: typeof WordCloud !== 'undefined' && WordCloud.isSupported,\n\
+                     wordCount: (function() {\n\
+                         try { return window.wordcloudWords ? window.wordcloudWords.length : 'no window.wordcloudWords'; }\n\
+                         catch (e) { return String(e); }\n\
+                     })(),\n\
+                     bodyReady: document.body.getAttribute('data-ready'),\n\
+                     bodyError: document.body.getAttribute('data-error')\n\
+                 };\n\
+                 const deadline = Date.now() + 30000;\n\
+                 while (document.body.getAttribute('data-ready') !== 'true') {\n\
+                     if (Date.now() > deadline) {\n\
+                         info.timeout = true;\n\
+                         return info;\n\
+                     }\n\
+                     if (info.bodyError) {\n\
+                         info.renderError = info.bodyError;\n\
+                         return info;\n\
+                     }\n\
+                     await new Promise(r => setTimeout(r, 50));\n\
+                 }\n\
+                 info.ready = true;\n\
+                 return info;\n\
+                 }",
+                None,
+            )
+            .await
+            .unwrap();
+        if diag.get("ready").and_then(|v| v.as_bool()) != Some(true) {
+            panic!("wordcloud render did not finish: {:?}", diag);
+        }
+        let locator = page.locator("#word-cloud").await;
+        let png = locator.screenshot(None).await.unwrap();
+        page.close().await.unwrap();
+
+        assert!(!png.is_empty());
+        tokio::fs::write("/tmp/wordcloud_test.png", &png).await.unwrap();
+    }
 }
