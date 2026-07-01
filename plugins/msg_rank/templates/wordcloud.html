@@ -32,8 +32,8 @@
         }
 
         #word-cloud {
-            width: 900px;
-            height: 600px;
+            width: 800px;
+            height: 800px;
             background: {{ background|safe }};
         }
     </style>
@@ -49,7 +49,7 @@
 
 <body>
     <h1>{{ title }}</h1>
-    <canvas id="word-cloud" width="900" height="600"></canvas>
+    <canvas id="word-cloud" width="800" height="800"></canvas>
     <script>
         {{ script|safe }}
     </script>
@@ -74,7 +74,7 @@
                 list: words,
                 gridSize: 8,
                 weightFactor: function (size) {
-                    return Math.pow(size, 0.75) * 1.2 + 10;
+                    return Math.pow(size, 0.75) * 1.5 + 12;
                 },
                 fontFamily: {{ font_family|safe }},
                 color: function () {
@@ -86,10 +86,12 @@
                     return colors[Math.floor(Math.random() * colors.length)];
                 },
                 backgroundColor: {{ background|safe }},
-                rotateRatio: 0.25,
+                rotateRatio: 0.1,
                 minSize: 10,
                 shrinkToFit: true,
                 drawOutOfBound: false,
+                shape: 'square',
+                ellipticity: 1.0,
                 wait: 0
             });
         }
