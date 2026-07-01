@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{{ title }}</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            width: 100vw;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: {{ background }};
+            font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+            padding: 24px;
+        }
+
+        h1 {
+            font-size: 26px;
+            color: #333;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+
+        #word-cloud {
+            width: 900px;
+            height: 600px;
+            background: {{ background }};
+        }
+    </style>
+    {% if has_custom_font %}
+    <style>
+        @font-face {
+            font-family: "CustomWordCloudFont";
+            src: url("{{ font_data_url }}");
+        }
+    </style>
+    {% endif %}
+</head>
+
+<body>
+    <h1>{{ title }}</h1>
+    <canvas id="word-cloud" width="900" height="600"></canvas>
+    <script>
+        {{ script|safe }}
+    </script>
+    <script>
+        const words = {{ words_json|safe }};
+        const canvas = document.getElementById('word-cloud');
+
+        function onReady() {
+            document.body.setAttribute('data-ready', 'true');
+        }
+
+        if (words.length === 0) {
+            onReady();
+        } else {
+            canvas.addEventListener('wordcloudstop', onReady, { once: true });
+            WordCloud(canvas, {
+                list: words,
+                gridSize: 8,
+                weightFactor: function (size) {
+                    return Math.pow(size, 1.05) * 0.5 + 10;
+                },
+                fontFamily: "{{ font_family }}",
+                color: function () {
+                    const colors = [
+                        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+                        '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
+                        '#bcbd22', '#17becf', '#393b79', '#637939'
+                    ];
+                    return colors[Math.floor(Math.random() * colors.length)];
+                },
+                backgroundColor: "{{ background }}",
+                rotateRatio: 0.25,
+                minSize: 10,
+                shrinkToFit: true,
+                drawOutOfBound: false,
+                wait: 0
+            });
+        }
+    </script>
+</body>
+
+</html>
