@@ -21,7 +21,8 @@ impl<T> RcuCell<T> {
 
     pub fn replace(&self, next: T) {
         let guard = &crossbeam_epoch::pin();
-        let prev = self.inner.swap(Owned::new(next), Ordering::Relaxed, guard);
+        // Release: 保证新值在指针发布前对所有读者可见。
+        let prev = self.inner.swap(Owned::new(next), Ordering::Release, guard);
         // Safety: the old value stays valid until all active readers leave their epoch.
         unsafe {
             guard.defer_destroy(prev);
@@ -33,7 +34,8 @@ impl<T> RcuCell<T> {
         T: Clone,
     {
         let guard = &crossbeam_epoch::pin();
-        let current = self.inner.load(Ordering::Relaxed, guard);
+        // Acquire: 与 writer 的 Release swap 配对，确保读到完整初始化的新值。
+        let current = self.inner.load(Ordering::Acquire, guard);
         // Safety: pointer remains valid while the guard is pinned.
         unsafe { current.deref().clone() }
     }

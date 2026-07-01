@@ -18,7 +18,10 @@ use crate::{
 
 mod bv_parser;
 mod config;
+pub mod dynamics;
 mod living;
+
+static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -27,11 +30,12 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
     );
     reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0")
+        .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
         .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
 });
@@ -39,6 +43,9 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 #[kovi::plugin]
 async fn main() {
     config::init().await.unwrap();
+    // 启动期强制解析硬编码 SPACE_FEED_URL，让 URL 被未来编辑损坏时立刻 panic，
+    // 而不是等到第一次 /dynamic fetch / cron 才暴露。
+    dynamics::warm_up();
     help_msg::register_help(
         "直播订阅",
         "管理本群的 B 站直播订阅",
@@ -46,12 +53,19 @@ async fn main() {
     )
     .await;
     let bot = plugin::get_runtime_bot();
+    let bot_for_exec = Arc::clone(&bot);
+    let bot_for_dyn = Arc::clone(&bot);
     plugin::on_group_msg(move |event| {
-        let bot = Arc::clone(&bot);
+        let bot = Arc::clone(&bot_for_exec);
         exec_cmd(event, bot)
     });
     plugin::on_group_msg(parse_bv);
+    plugin::on_group_msg(move |event| {
+        let bot = Arc::clone(&bot_for_dyn);
+        dynamic_cmd(event, bot)
+    });
     living::init().await;
+    dynamics::init().await;
 }
 
 async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
@@ -188,6 +202,151 @@ async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     }
 }
 
+async fn dynamic_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
+    let text = event.borrow_text().unwrap_or_default();
+    let text = text.trim();
+    if !text.starts_with("/dynamic") {
+        return;
+    }
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() < 2 {
+        event.reply("用法: /dynamic add <uid> | /dynamic rm <uid> | /dynamic list | /dynamic fetch <uid>");
+        return;
+    }
+    let group = event.group_id;
+
+    match parts[1] {
+        "add" => {
+            if !is_admin(&bot, event.user_id) {
+                event.reply("❌ 管理员专用命令");
+                return;
+            }
+            if parts.len() < 3 {
+                event.reply("请指定 uid，例如: /dynamic add 672328094");
+                return;
+            }
+            let uid = match parts[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    event.reply("uid 格式错误");
+                    return;
+                }
+            };
+            match dynamics::add_subscribe(uid, group).await {
+                Ok(true) => event.reply(format!("已为本群订阅动态 uid={}", uid)),
+                Ok(false) => event.reply(format!("本群已订阅 uid={}", uid)),
+                Err(e) => event.reply(format!("订阅失败: {e}")),
+            }
+        }
+        "rm" => {
+            if !is_admin(&bot, event.user_id) {
+                event.reply("❌ 管理员专用命令");
+                return;
+            }
+            if parts.len() < 3 {
+                event.reply("请指定 uid，例如: /dynamic rm 672328094");
+                return;
+            }
+            let uid = match parts[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    event.reply("uid 格式错误");
+                    return;
+                }
+            };
+            match dynamics::remove_subscribe(uid, group).await {
+                Ok(_) => event.reply(format!("已取消本群对 uid={} 的动态订阅", uid)),
+                Err(e) => event.reply(format!("取消失败: {e}")),
+            }
+        }
+        "list" => {
+            let entries = dynamics::list_subscribes(group).await;
+            if entries.is_empty() {
+                event.reply("本群尚未订阅任何动态");
+                return;
+            }
+            let uids: Vec<u64> = entries.iter().map(|(u, _)| *u).collect();
+            let names = match crate::living::fetch_uid_names(&uids).await {
+                Ok(m) => m,
+                Err(e) => {
+                    event.reply(format!("查询 UP 名失败: {e}"));
+                    return;
+                }
+            };
+            let mut out = String::from("动态订阅列表：");
+            for uid in uids {
+                let name = names.get(&uid).cloned().unwrap_or_default();
+                out.push_str(&format!("\n{} ({})", name, uid));
+            }
+            event.reply(out);
+        }
+        "fetch" => {
+            if !is_admin(&bot, event.user_id) {
+                event.reply("❌ 管理员专用命令");
+                return;
+            }
+            if parts.len() < 3 {
+                event.reply(format!(
+                    "用法: /dynamic fetch <uid> [count]，count 默认 1，最大 {}",
+                    dynamics::MAX_FETCH_COUNT
+                ));
+                return;
+            }
+            let uid = match parts[2].parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    event.reply("uid 格式错误");
+                    return;
+                }
+            };
+            let count: usize = if parts.len() >= 4 {
+                match parts[3].parse::<usize>() {
+                    Ok(n) if (1..=dynamics::MAX_FETCH_COUNT).contains(&n) => n,
+                    _ => {
+                        event.reply(format!(
+                            "count 必须是 1..={}",
+                            dynamics::MAX_FETCH_COUNT
+                        ));
+                        return;
+                    }
+                }
+            } else {
+                1
+            };
+            match dynamics::fetch_recent(uid, count).await {
+                Ok(items) if items.is_empty() => {
+                    event.reply(format!("uid={} 无动态", uid));
+                }
+                Ok(items) => {
+                    let mut pushed = 0usize;
+                    for item in &items {
+                        let author = dynamics::author_of(item);
+                        if let Err(e) = dynamics::push_dynamic(&bot, group, &author, item).await {
+                            tracing::warn!("渲染失败 uid={}: {e}", uid);
+                        } else {
+                            pushed += 1;
+                        }
+                    }
+                    event.reply(format!("已推送 {}/{} 条动态", pushed, items.len()));
+                }
+                Err(e) => {
+                    event.reply(format!("拉取失败: {e}"));
+                }
+            }
+        }
+        _ => {
+            event.reply("未知子命令，支持: add | rm | list | fetch");
+        }
+    }
+}
+
+fn is_admin(bot: &Arc<RuntimeBot>, user_id: i64) -> bool {
+    bot.get_all_admin()
+        .unwrap_or_default()
+        .iter()
+        .any(|id| id.try_as_i64() == Some(user_id))
+}
+
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
     for msg in event.message.iter() {
         let bv_info = match msg.kind.as_str() {
@@ -210,16 +369,21 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
                     continue;
                 };
 
-                parse_url(url).await
+                parse_url(url, event.group_id).await
             }
-            "text" => parse_url(msg.data["text"].as_str().unwrap()).await,
+            "text" => {
+                let Some(text) = msg.data.get("text").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                parse_url(text, event.group_id).await
+            }
             _ => continue,
         };
 
         let bv_info = match bv_info {
             Ok(info) => info,
             Err(e) => {
-                if !matches!(e, bv_parser::error::BvError::ParseFailed(_)) {
+                if !matches!(e, bv_parser::BvError::ParseFailed(_)) {
                     tracing::error!("解析 BV 失败: {}", e);
                 }
                 continue;

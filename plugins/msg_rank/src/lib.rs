@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use futures::future::join_all;
 use kovi::{Message, PluginBuilder as plugin, tokio};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 
@@ -10,13 +11,28 @@ use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 mod config;
 mod db;
 mod msg_rank;
-mod ocr;
+pub mod ocr;
 mod word_cloud;
+
+/// 小写的十六进制编码。`hex::encode` 的极简内联实现，避免引入 hex crate。
+#[inline]
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .pool_max_idle_per_host(16)
         .timeout(Duration::from_secs(10))
+        // SSRF 防御：禁止跟随 redirect，防止 attacker 用公网域名 → 内网 IP 跳转
+        // 绕过 URL host 白名单。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
 });
@@ -27,7 +43,10 @@ async fn main() {
     let path = Arc::new(bot.get_data_path());
 
     let config_path = path.join("config.json");
-    config::init_config(config_path).await.unwrap();
+    if let Err(e) = config::init_config(config_path).await {
+        tracing::error!("初始化配置失败: {e}");
+        return;
+    }
 
     let db_path = path.join("msg.db");
     if !db_path.exists() {
@@ -50,7 +69,6 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
     let text = if config::read_config().notify_group.contains(&group) {
         &get_text(&event.message).await
     } else {
-        // 如果不在监控的群里，就不进行OCR，直接返回文本内容
         event.borrow_text().unwrap_or_default()
     };
     if let Err(e) = db::add_msg(event.group_id, event.user_id, text).await {
@@ -59,43 +77,59 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
 }
 
 async fn get_text(msg: &Message) -> String {
-    let mut res = String::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut ocr_tasks = Vec::new();
 
-    // 在没有图片的时候只会有栈分配，有图片的时候才会有堆分配，所以这里不需要担心性能问题
-    let mut tasks = Vec::new();
-
-    // 先把文本内容和图片URL提取出来，文本内容直接拼接，图片URL则交给OCR任务处理
-    // 顺序不重要
     for seg in msg.iter() {
-        if !res.is_empty() {
-            res.push(' ');
-        }
         match seg.kind.as_str() {
-            "text" => res.push_str(seg.data["text"].as_str().unwrap()),
+            "text" => {
+                if let Some(text) = seg
+                    .data
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.is_empty())
+                {
+                    parts.push(text.to_string());
+                }
+            }
             "image" => {
-                let url = seg.data["url"].as_str().unwrap().to_string();
-                let task = kovi::spawn(async move { ocr::ocr(&url).await });
-                tasks.push(task);
+                if let Some(url) = seg.data.get("url").and_then(|v| v.as_str()) {
+                    let url = url.to_string();
+                    let idx = parts.len();
+                    parts.push(String::new()); // OCR 完成后回填
+                    let task = kovi::spawn(async move { ocr::ocr(&url).await });
+                    ocr_tasks.push((idx, task));
+                }
             }
             _ => {}
         }
     }
 
-    for task in tasks {
-        match task.await {
-            Ok(Ok(text)) => {
-                if !text.is_empty() {
-                    res.push_str(&text);
+    if !ocr_tasks.is_empty() {
+        let fills = join_all(ocr_tasks.into_iter().map(|(idx, task)| async move {
+            let text = match task.await {
+                Ok(Ok(text)) => text.to_string(),
+                Ok(Err(e)) => {
+                    tracing::error!("OCR 失败: {}", e);
+                    String::new()
                 }
-            }
-            Ok(Err(e)) => {
-                tracing::error!("OCR 失败: {}", e);
-            }
-            Err(e) => {
-                tracing::error!("OCR 任务失败: {}", e);
-            }
+                Err(e) => {
+                    tracing::error!("OCR 任务失败: {}", e);
+                    String::new()
+                }
+            };
+            (idx, text)
+        }))
+        .await;
+
+        for (idx, text) in fills {
+            parts[idx] = text;
         }
     }
 
-    res
+    parts
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }

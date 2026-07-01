@@ -38,7 +38,8 @@ impl Default for Config {
 pub(crate) type ConfigGuard<'a> = RcuReadGuard<'a, Config>;
 
 pub async fn init_config(path: PathBuf) -> Result<()> {
-    let mut config: Config = kovi::utils::load_json_data(Default::default(), &path).unwrap();
+    let mut config: Config = kovi::utils::load_json_data(Default::default(), &path)
+        .map_err(|e| anyhow::anyhow!("加载配置文件失败: {e}"))?;
     config.path = path;
     let rcu = RcuCell::new(config);
 

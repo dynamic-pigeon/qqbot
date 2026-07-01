@@ -1,12 +1,24 @@
-use std::sync::LazyLock;
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 
 use crate::CLIENT;
 
-use error::BvError;
-
-pub mod error;
+#[derive(thiserror::Error, Debug)]
+pub enum BvError {
+    #[error("请求失败: {0}")]
+    RequestFailed(#[from] reqwest::Error),
+    #[error("解析返回体失败: {0}")]
+    RequestBodyError(String),
+    #[error("解析失败: {0}")]
+    ParseFailed(&'static str),
+    #[error("请求过于频繁，请稍后再试")]
+    RateLimited,
+}
 
 #[derive(Deserialize)]
 struct ApiRes {
@@ -51,7 +63,7 @@ pub struct BvInfo {
 }
 
 impl ApiRes {
-    async fn into_bv_info(self, url: String) -> Result<BvInfo, error::BvError> {
+    async fn into_bv_info(self, url: String) -> Result<BvInfo, BvError> {
         if self.code != 0 {
             return Err(BvError::RequestBodyError(format!(
                 "API请求失败: code={}, message={}",
@@ -77,6 +89,31 @@ impl ApiRes {
     }
 }
 
+/// 每群 5 秒内最多允许 3 次 BV 解析请求。
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
+const RATE_LIMIT_MAX_PER_WINDOW: usize = 3;
+
+static RATE_LIMITER: LazyLock<kovi::tokio::sync::Mutex<HashMap<i64, Vec<Instant>>>> =
+    LazyLock::new(|| kovi::tokio::sync::Mutex::new(HashMap::new()));
+
+/// 检查指定群是否在滑动窗口内超过请求上限。
+///
+/// 返回 `true` 表示允许本次请求，并记录请求时间；
+/// 返回 `false` 表示该群已触发限流。
+async fn check_rate_limit(group_id: i64) -> bool {
+    let mut map = RATE_LIMITER.lock().await;
+    let now = Instant::now();
+    let entries = map.entry(group_id).or_default();
+    entries.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+
+    if entries.len() >= RATE_LIMIT_MAX_PER_WINDOW {
+        false
+    } else {
+        entries.push(now);
+        true
+    }
+}
+
 static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"https?://www\.bilibili\.com/video/(?P<bv>BV[0-9A-Za-z]{10})").unwrap()
 });
@@ -84,24 +121,41 @@ static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static SHORT_URL_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap());
 
-pub async fn parse_url(url: &str) -> Result<BvInfo, error::BvError> {
-    match parse_long_url(url).await {
+pub async fn parse_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
+    match parse_long_url(url, group_id).await {
         Ok(info) => Ok(info),
-        Err(BvError::ParseFailed(_)) => parse_short_url(url).await,
+        Err(BvError::ParseFailed(_)) => parse_short_url(url, group_id).await,
         Err(e) => Err(e),
     }
 }
 
-async fn parse_long_url(url: &str) -> Result<BvInfo, error::BvError> {
+async fn parse_long_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
     if let Some(caps) = LONG_URL_RE.captures(url) {
         let bv = &caps["bv"];
-        parse_bv(bv).await
+        parse_bv(bv, group_id).await
     } else {
         Err(BvError::ParseFailed("未匹配到长链接"))
     }
 }
 
-async fn parse_short_url(url: &str) -> Result<BvInfo, error::BvError> {
+/// 判断 URL 是否指向 Bilibili 允许解析的域名。
+///
+/// 仅允许 `bilibili.com` / `www.bilibili.com` / `m.bilibili.com`，
+/// 防止 b23.tv 短链重定向到内网或第三方站点造成 SSRF。
+fn is_bilibili_url(url: &str) -> bool {
+    [
+        "https://www.bilibili.com/",
+        "http://www.bilibili.com/",
+        "https://bilibili.com/",
+        "http://bilibili.com/",
+        "https://m.bilibili.com/",
+        "http://m.bilibili.com/",
+    ]
+    .iter()
+    .any(|prefix| url.starts_with(prefix))
+}
+
+async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
     let caps = SHORT_URL_RE
         .captures(url)
         .ok_or(BvError::ParseFailed("未匹配到短链接"))?;
@@ -109,22 +163,30 @@ async fn parse_short_url(url: &str) -> Result<BvInfo, error::BvError> {
         .get(0)
         .ok_or(BvError::ParseFailed("未匹配到短链接"))?
         .as_str();
+
     let resp = CLIENT.get(short_url).send().await?;
-    let final_url = resp.url();
-    parse_long_url(final_url.as_str()).await
+
+    // 已关闭自动重定向，短链必须返回 3xx 并携带 Location。
+    if !resp.status().is_redirection() {
+        return Err(BvError::ParseFailed("短链未返回重定向"));
+    }
+
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(BvError::ParseFailed("短链未返回 Location"))?;
+
+    if !is_bilibili_url(location) {
+        return Err(BvError::ParseFailed("短链重定向目标不是 Bilibili 域名"));
+    }
+
+    parse_long_url(location, group_id).await
 }
 
-async fn parse_bv(bv: &str) -> Result<BvInfo, error::BvError> {
-    static CACHE: LazyLock<moka::future::Cache<String, ()>> = LazyLock::new(|| {
-        moka::future::Cache::builder()
-            .max_capacity(20)
-            .time_to_live(std::time::Duration::from_secs(5))
-            .build()
-    });
-
-    let guard = CACHE.entry_by_ref(bv).or_insert_with(async {}).await;
-    if !guard.is_fresh() {
-        Err(BvError::Other("请求过于频繁，请稍后再试".to_string()))?;
+async fn parse_bv(bv: &str, group_id: i64) -> Result<BvInfo, BvError> {
+    if !check_rate_limit(group_id).await {
+        return Err(BvError::RateLimited);
     }
 
     let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
@@ -143,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn test_long() {
         let url = "https://www.bilibili.com/video/BV198XLBaEYp";
-        let info = parse_url(url).await.unwrap();
+        let info = parse_url(url, 0).await.unwrap();
         println!("标题: {}", info.title);
         println!("作者: {}", info.name);
         println!("观看: {}", info.view);
@@ -154,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid() {
         let url = " https://www.bilibili.com/video/BV1PVdPBxEyr/?share_source=copy_web&vd_source=316166c47890d5daae6c8152b5f3e06f";
-        let res = parse_url(url).await;
+        let res = parse_url(url, 0).await;
         assert!(res.is_err());
         println!("错误信息: {}", res.err().unwrap());
     }
@@ -166,7 +228,30 @@ mod tests {
 收藏：72 观看：8359
 https://www.bilibili.com/video/BV198XLBaEYp";
 
-        let res = parse_url(txt).await;
+        let res = parse_url(txt, 0).await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_per_group() {
+        // 使用极大 group_id 避免与真实网络测试冲突。
+        let group_a = i64::MAX;
+        let group_b = i64::MAX - 1;
+
+        {
+            let mut map = RATE_LIMITER.lock().await;
+            map.remove(&group_a);
+            map.remove(&group_b);
+        }
+
+        // group_a 前 3 次允许。
+        assert!(check_rate_limit(group_a).await);
+        assert!(check_rate_limit(group_a).await);
+        assert!(check_rate_limit(group_a).await);
+        // 第 4 次应被限流。
+        assert!(!check_rate_limit(group_a).await);
+
+        // group_b 不受 group_a 影响。
+        assert!(check_rate_limit(group_b).await);
     }
 }

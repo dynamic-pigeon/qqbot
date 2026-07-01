@@ -11,7 +11,7 @@ use kovi::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::ocr::HTTP_CLIENT;
+use crate::{HTTP_CLIENT, hex_encode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -25,7 +25,7 @@ fn get_date(timestamp: i64) -> String {
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
-    hex::encode(hasher.finalize())
+    hex_encode(hasher.finalize().as_slice())
 }
 
 /// HMAC-SHA256计算
@@ -47,7 +47,6 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
             }
         }
     };
-    // 密钥信息从配置读取
     let secret_id = tencent_config.secret_id;
     let secret_key = tencent_config.secret_key;
 
@@ -61,14 +60,12 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     };
     let version = "2018-11-19";
 
-    // 获取当前时间戳
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
     let date = get_date(timestamp);
 
-    // ************* 步骤 1：拼接规范请求串 *************
     let http_request_method = "POST";
     let canonical_uri = "/";
     let canonical_query_string = "";
@@ -78,7 +75,6 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     );
     let signed_headers = "content-type;host";
 
-    // 构造请求体
     let payload = serde_json::json!({
         "ImageBase64": img_base64
     })
@@ -95,7 +91,6 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
         hashed_request_payload
     );
 
-    // ************* 步骤 2：拼接待签名字符串 *************
     let algorithm = "TC3-HMAC-SHA256";
     let request_timestamp = timestamp.to_string();
     let credential_scope = format!("{}/{}/tc3_request", date, service);
@@ -105,19 +100,16 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
         algorithm, request_timestamp, credential_scope, hashed_canonical_request
     );
 
-    // ************* 步骤 3：计算签名 *************
     let secret_date = hmac_sha256(format!("TC3{}", secret_key).as_bytes(), &date);
     let secret_service = hmac_sha256(&secret_date, service);
     let secret_signing = hmac_sha256(&secret_service, "tc3_request");
-    let signature = hex::encode(hmac_sha256(&secret_signing, &string_to_sign));
+    let signature = hex_encode(&hmac_sha256(&secret_signing, &string_to_sign));
 
-    // ************* 步骤 4：拼接 Authorization *************
     let authorization = format!(
         "{} Credential={}/{}, SignedHeaders={}, Signature={}",
         algorithm, secret_id, credential_scope, signed_headers, signature
     );
 
-    // ************* 步骤 5：构造并发起请求 *************
     let url = format!("https://{}", host);
 
     let mut request = HTTP_CLIENT
@@ -143,9 +135,7 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
 
     let response_json: Value = response.json().await?;
 
-    // 解析响应
     if let Some(response_obj) = response_json.get("Response") {
-        // 检查是否有错误
         if let Some(error) = response_obj.get("Error") {
             return Err(anyhow::anyhow!(
                 "OCR API error: {}",
@@ -156,7 +146,6 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
             ));
         }
 
-        // 提取文本检测结果
         let text_detections = response_obj
             .get("TextDetections")
             .and_then(|v| v.as_array())

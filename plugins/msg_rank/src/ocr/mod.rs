@@ -15,6 +15,18 @@ use tencent::get_ocr;
 
 use crate::HTTP_CLIENT;
 
+/// OCR 输入图片的 QQ CDN 域名白名单，用于 `validate_image_url_async` 的 SSRF 防御。
+pub const ALLOWED_QQ_HOSTS: &[&str] = &[
+    "multimedia.nt.qq.com.cn",
+    "gchat.qpic.cn",
+    "c2cpicdw.qpic.cn",
+    "txmov2.a.yximgs.com",
+    "yximgs.com",
+    "qq.com",
+    "gtimg.cn",
+    "qpic.cn",
+];
+
 static OCR_MEMORY: LazyLock<OcrMemory> = LazyLock::new(OcrMemory::new);
 
 struct OcrMemory {
@@ -62,11 +74,12 @@ impl OcrMemory {
 /// 对图片URL进行OCR识别
 ///
 /// # 参数
-/// * `img_url` - 图片的URL地址
+/// * `img_url` - 图片的URL地址（必须通过 [`utils::validate_image_url_async`] 校验）
 ///
 /// # 返回
 /// * `Result<Arc<String>>` - OCR识别的文本结果
 pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
+    utils::validate_image_url_async(img_url, ALLOWED_QQ_HOSTS).await?;
     let img = get_img_bytes_from_url(img_url).await?;
     let result = OCR_MEMORY.get_or_insert(img).await?;
 
@@ -75,6 +88,8 @@ pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
 
 /// 从URL获取图片
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
+    // redirect 策略已在 HTTP_CLIENT builder 上设为 none，
+    // 即便 host 是公网域名，attacker 也无法用 redirect 跳到内网 IP。
     let req = HTTP_CLIENT.get(img_url).send().await?;
     if let Some(length) = req.content_length() {
         // 腾讯云OCR接口限制请求体大小不超过10MB，按照base64编码后大小约为原图的4/3
@@ -94,5 +109,8 @@ async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
 fn sha256_hex(data: &bytes::Bytes) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    hex::encode(hasher.finalize())
+    crate::hex_encode(&hasher.finalize())
 }
+
+// OCR URL 校验的 SSRF 防御测试已迁移至 `tests/ocr_validation.rs`（integration test）。
+// 该函数在 `lib.rs` 中通过 `pub use` 重新导出，作为公开 API 在 integration test 中验证。

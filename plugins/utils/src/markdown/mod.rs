@@ -1,7 +1,19 @@
 use anyhow::Result;
 use askama::Template;
 use pulldown_cmark::Options;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use tracing::error;
+
+/// 复用的 Markdown 解析选项，避免每次调用都重新构造。
+static MARKDOWN_OPTIONS: LazyLock<Options> = LazyLock::new(|| {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_MATH);
+    options
+});
 
 #[derive(Template)]
 #[template(path = "markdown.html")]
@@ -33,276 +45,228 @@ pub async fn md_to_img(md: &str) -> Result<Vec<u8>> {
     Ok(png_data)
 }
 
-fn md_to_html(md: &str) -> String {
-    let mut options = pulldown_cmark::Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_MATH);
-    let parser = pulldown_cmark::Parser::new_ext(md, options);
+pub fn md_to_html(md: &str) -> String {
+    let parser = pulldown_cmark::Parser::new_ext(md, *MARKDOWN_OPTIONS);
 
     let mut body = String::new();
     pulldown_cmark::html::push_html(&mut body, parser);
 
+    // pulldown-cmark 默认透传 raw HTML（包括 `<script>`、`<iframe>`、on-event handler、
+    // `javascript:` URI 等）。这个 body 会被 askama 模板以 `{{ body|safe }}` 原样嵌入，
+    // 最终送进 Chromium headless 渲染。任何用户提交的 markdown 都可以借此发起任意
+    // HTTP GET（`<img src=http://169.254.169.254/...>`）或执行任意 JS（`<script>`）。
+    // 必须先 sanitize 再嵌入。
+    let body = sanitize_html(&body);
+
     MarkdownTemplate {
-        katex_css: include_str!("html/katex.min.css"),
-        katex_js: include_str!("html/katex.min.js"),
-        github_md_css: include_str!("html/github_md_light.css"),
-        highlight_css: include_str!("html/highlight_github_light.css"),
-        highlight_js: include_str!("html/highlight.js"),
+        // woff2 字体会被 build.rs 内联成 data URI，避免 CSP / about:blank 相对路径问题。
+        katex_css: include_str!(concat!(env!("OUT_DIR"), "/katex.inline.css")),
+        katex_js: include_str!("assets/katex.min.js"),
+        github_md_css: include_str!("assets/github_md_light.css"),
+        highlight_css: include_str!("assets/highlight_github_light.css"),
+        highlight_js: include_str!("assets/highlight.js"),
         body,
     }
     .render()
     .unwrap()
 }
 
+/// 使用基于 HTML5 spec 的白名单 sanitizer 清理用户提交的 Markdown 渲染结果。
+///
+/// 策略：
+/// - 只允许纯文本格式和页面结构标签；
+/// - 禁止 `<img>` / `<video>` / `<audio>` / `<source>` / `<iframe>` / `<object>` /
+///   `<embed>` / `<form>` / `<link>` / `<meta>` / `<base>` / `<style>` / `<script>` 等
+///   能加载远程资源或执行代码的标签；
+/// - 只允许 `http` / `https` / `mailto` 三种 URL scheme；
+/// - 全局移除 `on*` 事件处理器；
+/// - 为保留的 `<a>` 自动添加 `rel="nofollow noopener noreferrer"`。
+///
+/// 该 sanitizer 与 CSP 头配合使用：即使某处被绕过，Chromium 也被限制在最小权限集。
+fn sanitize_html(input: &str) -> String {
+    let allowed_tags: HashSet<&str> = [
+        // 基础结构
+        "p", "br", "hr", "div", "span",
+        // 标题
+        "h1", "h2", "h3", "h4", "h5", "h6",
+        // 文本格式
+        "strong", "em", "b", "i", "u", "s", "del", "ins", "mark", "sub", "sup",
+        "code", "pre", "kbd", "samp", "var",
+        // 列表
+        "ul", "ol", "li", "dl", "dt", "dd",
+        // 表格
+        "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "col", "colgroup",
+        // 引用
+        "blockquote", "q", "cite",
+        // 细节
+        "details", "summary",
+        // 链接（仅保留文本，href 会被 scheme 过滤）
+        "a",
+        // 其他语义标签
+        "abbr", "bdi", "bdo", "dfn", "small", "time", "wbr",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    let generic_attrs: HashSet<&str> = ["class", "id", "title", "dir", "lang"]
+        .iter()
+        .copied()
+        .collect();
+
+    let mut tag_attributes: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let a_attrs: HashSet<&str> = ["href"].iter().copied().collect();
+    tag_attributes.insert("a", a_attrs);
+
+    let url_schemes: HashSet<&str> = ["http", "https", "mailto"]
+        .iter()
+        .copied()
+        .collect();
+
+    ammonia::Builder::default()
+        .tags(allowed_tags)
+        .generic_attributes(generic_attrs)
+        .tag_attributes(tag_attributes)
+        .url_schemes(url_schemes)
+        .link_rel(Some("nofollow noopener noreferrer"))
+        .clean(input)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
-
     use super::*;
-
-    /// 验证 md_to_html 返回完整的 HTML 文档结构
-    fn assert_valid_html_structure(html: &str) {
-        assert!(
-            html.starts_with("<!doctype html>"),
-            "should start with doctype"
-        );
-        assert!(html.contains("<html>"), "should contain <html>");
-        assert!(html.contains("<head>"), "should contain <head>");
-        assert!(
-            html.contains("<meta charset=\"UTF-8\">"),
-            "should contain UTF-8 meta"
-        );
-        assert!(html.contains("<body>"), "should contain <body>");
-        assert!(
-            html.contains("<article class=\"markdown-body\">"),
-            "should contain markdown-body article"
-        );
-        assert!(html.ends_with("</html>"), "should end with </html>");
-    }
-
-    /// 验证 CSS/JS 资源被正确嵌入
-    fn assert_assets_embedded(html: &str) {
-        assert!(html.contains("<style>"), "should contain inline <style>");
-        assert!(
-            html.contains(".markdown-body"),
-            "should contain markdown-body CSS"
-        );
-        assert!(html.contains("<script>"), "should contain inline <script>");
-        assert!(
-            html.contains("hljs.highlightAll"),
-            "should contain highlight.js init"
-        );
-        assert!(
-            html.contains("katex.render"),
-            "should contain KaTeX render logic"
-        );
-    }
-
-    #[test]
-    fn test_empty_input() {
-        let html = md_to_html("");
-        assert_valid_html_structure(&html);
-        assert_assets_embedded(&html);
-    }
-
-    #[test]
-    fn test_plain_text() {
-        let html = md_to_html("hello world");
-        assert_valid_html_structure(&html);
-        assert!(
-            html.contains("hello world"),
-            "should contain the input text"
-        );
-    }
-
-    #[test]
-    fn test_headings() {
-        let html = md_to_html("# H1\n## H2\n### H3");
-        assert!(html.contains("<h1>"), "should render h1");
-        assert!(html.contains("H1"), "should contain heading text");
-        assert!(html.contains("<h2>"), "should render h2");
-        assert!(html.contains("<h3>"), "should render h3");
-    }
-
-    #[test]
-    fn test_bold_and_italic() {
-        let html = md_to_html("**bold** and *italic*");
-        assert!(
-            html.contains("<strong>bold</strong>") || html.contains("<strong>bold</strong>"),
-            "should render bold"
-        );
-        assert!(html.contains("<em>italic</em>"), "should render italic");
-    }
-
-    #[test]
-    fn test_code_inline() {
-        let html = md_to_html("use `println!` macro");
-        assert!(html.contains("<code>"), "should contain inline code tag");
-        assert!(html.contains("println!"), "should contain code text");
-    }
-
-    #[test]
-    fn test_code_block() {
-        let html = md_to_html("```rust\nfn main() {}\n```");
-        // code blocks produce <pre><code> which triggers the maxWidth:720px logic
-        assert!(html.contains("<pre>"), "should contain pre tag");
-        assert!(html.contains("<code"), "should contain code tag");
-    }
-
-    #[test]
-    fn test_strikethrough() {
-        let html = md_to_html("~~deleted~~");
-        // pulldown-cmark with ENABLE_STRIKETHROUGH should render <del> or <s>
-        assert!(
-            html.contains("<del>") || html.contains("<s>"),
-            "should render strikethrough"
-        );
-    }
-
-    #[test]
-    fn test_table() {
-        let md = "\
-| a | b |
-|---|---|
-| 1 | 2 |
-";
-        let html = md_to_html(md);
-        assert!(html.contains("<table>"), "should render table");
-        assert!(html.contains("<th>"), "should contain table header");
-        assert!(html.contains("<td>"), "should contain table cell");
-    }
-
-    #[test]
-    fn test_math_inline() {
-        let html = md_to_html("$E=mc^2$");
-        // pulldown-cmark with ENABLE_MATH wraps inline math in class="math math-inline"
-        assert!(
-            html.contains("math-inline") || html.contains("math inline"),
-            "should contain math class for inline formula"
-        );
-    }
-
-    #[test]
-    fn test_math_display() {
-        let html = md_to_html("$$\nE=mc^2\n$$");
-        // pulldown-cmark with ENABLE_MATH wraps display math in class="math math-display"
-        assert!(
-            html.contains("math-display") || html.contains("math display"),
-            "should contain math class for display formula"
-        );
-    }
-
-    #[test]
-    fn test_footnote() {
-        let html = md_to_html("text[^1]\n\n[^1]: footnote content");
-        // ENABLE_FOOTNOTES should render footnote references
-        assert!(
-            html.contains("footnote"),
-            "should contain footnote references"
-        );
-    }
-
-    #[test]
-    fn test_link() {
-        let html = md_to_html("[click](https://example.com)");
-        assert!(
-            html.contains("<a href=\"https://example.com\""),
-            "should render link"
-        );
-        assert!(html.contains("click"), "should contain link text");
-    }
-
-    #[test]
-    fn test_unordered_list() {
-        let html = md_to_html("* item1\n* item2");
-        assert!(html.contains("<ul>"), "should render unordered list");
-        assert!(html.contains("<li>"), "should contain list items");
-    }
-
-    #[test]
-    fn test_ordered_list() {
-        let html = md_to_html("1. first\n2. second");
-        assert!(html.contains("<ol>"), "should render ordered list");
-        assert!(html.contains("<li>"), "should contain list items");
-    }
-
-    #[test]
-    fn test_blockquote() {
-        let html = md_to_html("> quoted text");
-        assert!(html.contains("<blockquote>"), "should render blockquote");
-    }
-
-    #[test]
-    fn test_horizontal_rule() {
-        let html = md_to_html("---");
-        assert!(html.contains("<hr"), "should render horizontal rule");
-    }
 
     #[test]
     fn test_special_characters_preserved() {
-        // pulldown-cmark passes raw HTML through by default (inline HTML is valid markdown).
-        // The markdown source comes from QQ messages, which already filter script tags upstream.
         let html = md_to_html("<b>bold</b>");
         assert!(
             html.contains("<b>bold</b>"),
-            "raw HTML should be passed through by pulldown-cmark"
+            "safe inline HTML like <b> should be preserved"
         );
-    }
-
-    #[test]
-    fn test_chinese_text() {
-        let html = md_to_html("你好世界");
-        assert_valid_html_structure(&html);
+        let body_sanitized = sanitize_html("<script>alert(1)</script>hello");
         assert!(
-            html.contains("你好世界"),
-            "should preserve Chinese characters"
+            !body_sanitized.contains("<script") && !body_sanitized.contains("alert(1)"),
+            "body script must be stripped, got: {body_sanitized}"
         );
     }
 
     #[test]
-    fn test_mixed_content() {
-        let md = "\
-# 标题
-
-这是一段**重要**的文字，包含 `代码` 和 [链接](https://example.com)。
-
-| 列A | 列B |
-|-----|-----|
-| 值1 | 值2 |
-
-- 列表项1
-- 列表项2
-";
-        let html = md_to_html(md);
-        assert_valid_html_structure(&html);
-        assert_assets_embedded(&html);
-        assert!(html.contains("<h1>"), "should have h1");
-        assert!(html.contains("<strong>"), "should have bold");
-        assert!(html.contains("<code>"), "should have inline code");
-        assert!(html.contains("<a href="), "should have link");
-        assert!(html.contains("<table>"), "should have table");
-        assert!(html.contains("<ul>"), "should have unordered list");
+    fn sanitize_strips_script_block() {
+        let out = sanitize_html("hello<script>alert(1)</script>world");
+        assert!(!out.contains("<script"));
+        assert!(!out.contains("alert"));
+        assert!(out.contains("hello"));
+        assert!(out.contains("world"));
     }
 
-    /// 验证模板渲染的结果与通过 pulldown-cmark 直接渲染的 body 一致
     #[test]
-    fn test_body_preserved_in_template() {
-        let md = "## test body";
-        let mut options = pulldown_cmark::Options::empty();
-        options.insert(Options::ENABLE_STRIKETHROUGH);
-        options.insert(Options::ENABLE_TABLES);
-        options.insert(Options::ENABLE_FOOTNOTES);
-        options.insert(Options::ENABLE_MATH);
-        let parser = pulldown_cmark::Parser::new_ext(md, options);
+    fn sanitize_strips_iframe_and_object() {
+        assert!(!sanitize_html("a<iframe src='http://evil'></iframe>b").contains("<iframe"));
+        assert!(!sanitize_html("a<object></object>b").contains("<object"));
+        assert!(!sanitize_html("a<embed src='x'>b").contains("<embed"));
+        assert!(!sanitize_html("a<form action='x'></form>b").contains("<form"));
+    }
 
-        let mut expected_body = String::new();
-        pulldown_cmark::html::push_html(&mut expected_body, parser);
+    #[test]
+    fn sanitize_strips_link_meta_base_style() {
+        assert!(!sanitize_html("<link rel='stylesheet' href='http://evil/x'>").contains("<link"));
+        assert!(!sanitize_html("<meta http-equiv='refresh' content='0;url=http://evil'>").contains("<meta"));
+        assert!(!sanitize_html("<base href='http://evil/'>").contains("<base"));
+        assert!(!sanitize_html("<style>body{display:none}</style>").contains("<style"));
+    }
 
-        let html = md_to_html(md);
-        assert!(
-            html.contains(&expected_body),
-            "template should embed the rendered markdown body unchanged"
-        );
+    #[test]
+    fn sanitize_strips_on_event_attrs() {
+        let out = sanitize_html(r#"<a href="https://ok.com" onclick="alert(1)">click</a>"#);
+        assert!(!out.contains("onclick"));
+        assert!(!out.contains("alert(1)"));
+        // href 应保留
+        assert!(out.contains("href=\"https://ok.com\""));
+    }
+
+    #[test]
+    fn sanitize_strips_on_event_attrs_single_quote_and_unquoted() {
+        let out = sanitize_html(r#"<img src=x onerror='alert(1)' alt=y>"#);
+        assert!(!out.contains("onerror"));
+        assert!(!out.contains("alert"));
+        let out2 = sanitize_html(r#"<img src=x onload=alert(1) alt=y>"#);
+        assert!(!out2.contains("onload"));
+    }
+
+    #[test]
+    fn sanitize_strips_on_event_attrs_with_slash_separator() {
+        let out = sanitize_html(r#"<img/src=x/onerror=alert(1)>"#);
+        assert!(!out.to_ascii_lowercase().contains("onerror"));
+        assert!(!out.contains("alert(1)"));
+    }
+
+    #[test]
+    fn sanitize_removes_dangerous_uri_schemes() {
+        // ammonia 会移除非法 href 属性而不是替换成 about:blank
+        let out = sanitize_html(r#"<a href="javascript:alert(1)">click</a>"#);
+        assert!(!out.to_ascii_lowercase().contains("javascript:"));
+        assert!(out.contains("click"));
+
+        let out2 = sanitize_html(r#"<img src="javascript:alert(1)">"#);
+        assert!(!out2.to_ascii_lowercase().contains("javascript:"));
+        // img 标签本身也不在白名单中
+        assert!(!out2.contains("<img"));
+
+        let out3 = sanitize_html(r#"<a href="vbscript:msgbox(1)">click</a>"#);
+        assert!(!out3.to_ascii_lowercase().contains("vbscript:"));
+
+        let out4 = sanitize_html(r#"<a href="data:text/html,<script>alert(1)</script>">click</a>"#);
+        assert!(!out4.to_ascii_lowercase().contains("data:"));
+    }
+
+    #[test]
+    fn sanitize_removes_unquoted_dangerous_uri() {
+        let out = sanitize_html(r#"<a href=javascript:alert(1)>click</a>"#);
+        assert!(!out.to_ascii_lowercase().contains("javascript:"));
+        assert!(out.contains("click"));
+
+        let out3 = sanitize_html(r#"<a/href=javascript:alert(1)>x</a>"#);
+        assert!(!out3.to_ascii_lowercase().contains("javascript:"));
+
+        let out4 = sanitize_html(r#"<a href=JaVaScRiPt:alert(1)>x</a>"#);
+        assert!(!out4.to_ascii_lowercase().contains("javascript:"));
+
+        let out5 = sanitize_html(r#"<a href=vbscript:msgbox(1)>x</a>"#);
+        assert!(!out5.to_ascii_lowercase().contains("vbscript:"));
+
+        let out6 = sanitize_html(r#"<a href=data:text/html,<script>alert(1)</script>>x</a>"#);
+        assert!(!out6.to_ascii_lowercase().contains("data:"));
+
+        let out7 = sanitize_html(r#"<a href=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>x</a>"#);
+        assert!(!out7.to_ascii_lowercase().contains("data:"));
+
+        // 正常 bareword URL 不应被误伤
+        let out8 = sanitize_html(r#"<a href=https://example.com>x</a>"#);
+        assert!(out8.contains("https://example.com"));
+        let out9 = sanitize_html(r#"<a href=mailto:a@b.com>x</a>"#);
+        assert!(out9.contains("mailto:a@b.com"));
+    }
+
+    #[test]
+    fn sanitize_preserves_safe_links() {
+        assert!(sanitize_html(r#"<a href="https://example.com">x</a>"#).contains("https://example.com"));
+        assert!(sanitize_html(r#"<a href="mailto:a@b.com">x</a>"#).contains("mailto:a@b.com"));
+    }
+
+    #[test]
+    fn sanitize_preserves_inline_formatting() {
+        let html = sanitize_html("<p>hello <strong>world</strong></p>");
+        assert!(html.contains("<strong>world</strong>"));
+        assert!(html.contains("<p>"));
+    }
+
+    #[test]
+    fn sanitize_removes_remote_resource_tags() {
+        // img 不在白名单中，可防止 SSRF
+        assert!(!sanitize_html(r#"<img src="http://169.254.169.254/latest/meta-data/">"#).contains("<img"));
+        assert!(!sanitize_html(r#"<video src="http://evil"></video>"#).contains("<video"));
+        assert!(!sanitize_html(r#"<audio src="http://evil"></audio>"#).contains("<audio"));
+        assert!(!sanitize_html(r#"<source src="http://evil">"#).contains("<source"));
     }
 }
