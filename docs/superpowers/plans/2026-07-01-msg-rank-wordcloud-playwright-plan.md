@@ -61,28 +61,35 @@ curl -L https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.js \
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             width: 100vw;
-            height: 100vh;
+            min-height: 100vh;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            background: {{ background }};
+            background: {{ background|safe }};
             font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+            padding: 24px;
         }
         h1 {
-            font-size: 24px;
+            font-size: 26px;
             color: #333;
-            margin-bottom: 16px;
+            margin-bottom: 20px;
+            font-weight: 600;
         }
         #word-cloud {
             width: 900px;
             height: 600px;
+            background: {{ background|safe }};
         }
+    </style>
+    {% if has_custom_font %}
+    <style>
         @font-face {
             font-family: "CustomWordCloudFont";
             src: url("{{ font_data_url }}");
         }
     </style>
+    {% endif %}
 </head>
 <body>
     <h1>{{ title }}</h1>
@@ -92,28 +99,44 @@ curl -L https://cdn.jsdelivr.net/npm/wordcloud@1.2.2/src/wordcloud2.js \
     </script>
     <script>
         const words = {{ words_json|safe }};
-        WordCloud(document.getElementById('word-cloud'), {
-            list: words,
-            gridSize: 8,
-            weightFactor: function (size) {
-                return Math.pow(size, 1.1) * 0.6 + 8;
-            },
-            fontFamily: "{{ font_family }}",
-            color: function () {
-                const colors = [
-                    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
-                    '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
-                    '#bcbd22', '#17becf'
-                ];
-                return colors[Math.floor(Math.random() * colors.length)];
-            },
-            backgroundColor: "{{ background }}",
-            rotateRatio: 0.3,
-            minSize: 10,
-            shrinkToFit: true,
-            drawOutOfBound: false,
-            wait: 50
-        });
+        window.wordcloudWords = words;
+        const canvas = document.getElementById('word-cloud');
+
+        function onReady(err) {
+            if (err) {
+                document.body.setAttribute('data-error', String(err));
+            }
+            document.body.setAttribute('data-ready', 'true');
+        }
+
+        if (words.length === 0) {
+            onReady(null);
+        } else {
+            canvas.addEventListener('wordcloudstop', () => onReady(null), { once: true });
+            canvas.addEventListener('wordcloudabort', (evt) => onReady(evt.detail), { once: true });
+            WordCloud(canvas, {
+                list: words,
+                gridSize: 8,
+                weightFactor: function (size) {
+                    return Math.pow(size, 1.05) * 0.5 + 10;
+                },
+                fontFamily: {{ font_family|safe }},
+                color: function () {
+                    const colors = [
+                        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+                        '#9467bd', '#8c564b', '#e377c2', '#7f7f7f',
+                        '#bcbd22', '#17becf', '#393b79', '#637939'
+                    ];
+                    return colors[Math.floor(Math.random() * colors.length)];
+                },
+                backgroundColor: {{ background|safe }},
+                rotateRatio: 0.25,
+                minSize: 10,
+                shrinkToFit: true,
+                drawOutOfBound: false,
+                wait: 0
+            });
+        }
     </script>
 </body>
 </html>
@@ -202,7 +225,7 @@ git commit -m "feat(msg_rank): add wordcloud_background config and deprecate cli
 - Modify: `plugins/msg_rank/src/word_cloud.rs`
 
 **Interfaces:**
-- Consumes: `utils::screenshot(html.into(), Some("#word-cloud".into()))`
+- Consumes: `utils::get_context()` 获取 `BrowserContext`，在页面内等待 `wordcloud2.js` 绘制完成后截图。
 - Produces: `make_word_cloud(path, group_id, duration) -> Result<Vec<u8>>` 返回 PNG 字节。
 
 - [ ] **Step 1: 重写 `word_cloud.rs` 顶部导入**
@@ -217,7 +240,6 @@ use std::{
 use anyhow::Result;
 use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use itertools::Itertools as _;
 use kovi::{
     Message, PluginBuilder as plugin, RuntimeBot,
     tokio::{self, time::timeout},
@@ -253,6 +275,7 @@ const WORDCLOUD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 struct WordCloudTemplate {
     title: String,
     background: String,
+    has_custom_font: bool,
     font_data_url: String,
     font_family: String,
     words_json: String,
@@ -266,10 +289,11 @@ struct WordCloudItem {
 }
 
 fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> {
-    let mut counts: HashMap<String, u32> = HashMap::new();
     let stop_set: std::collections::HashSet<&str> = stop_words.iter().map(|s| s.as_str()).collect();
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for w in words {
-        if stop_set.contains(w.as_str()) {
+        let w = w.trim().to_string();
+        if w.is_empty() || stop_set.contains(w.as_str()) {
             continue;
         }
         *counts.entry(w).or_insert(0) += 1;
@@ -278,7 +302,7 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
         .into_iter()
         .map(|(word, weight)| WordCloudItem { word, weight })
         .collect();
-    items.sort_by(|a, b| b.weight.cmp(&a.weight));
+    items.sort_by_key(|b| std::cmp::Reverse(b.weight));
     items.truncate(150);
     items
 }
@@ -327,28 +351,32 @@ async fn make_word_cloud(
             .collect::<Vec<_>>(),
     )?;
 
-    let config = read_config();
-    let background = config.wordcloud_background.clone();
-    drop(config); // 释放 RCU guard
+    let background = {
+        let config = read_config();
+        config.wordcloud_background.clone()
+    };
 
     let font_path = path.join("font.otf");
-    let (font_family, font_data_url) = if font_path.exists() {
+    let (has_custom_font, font_data_url, font_family) = if font_path.exists() {
         let bytes = tokio::fs::read(&font_path).await?;
-        let data_url = format!(
-            "data:font/otf;base64,{}",
-            STANDARD.encode(&bytes)
-        );
-        ("CustomWordCloudFont".to_string(), data_url)
+        let data_url = format!("data:font/otf;base64,{}", STANDARD.encode(&bytes));
+        (true, data_url, "\"CustomWordCloudFont\"".to_string())
     } else {
         (
-            "\"PingFang SC\", \"Microsoft YaHei\", \"Segoe UI\", sans-serif".to_string(),
-            "data:font/otf;base64,".to_string(),
+            false,
+            String::new(),
+            "\"Trebuchet MS\", \"Heiti TC\", \"微軟正黑體\", \"Arial Unicode MS\", \"Droid Fallback Sans\", sans-serif".to_string(),
         )
     };
 
+    // 序列化为 JS 字符串字面量，模板内使用 `|safe` 直接注入。
+    let background = serde_json::to_string(&background)?;
+    let font_family = serde_json::to_string(&font_family)?;
+
     let template = WordCloudTemplate {
-        title: "词云".to_string(),
+        title: dsc(duration),
         background,
+        has_custom_font,
         font_data_url,
         font_family,
         words_json,
@@ -356,14 +384,51 @@ async fn make_word_cloud(
     };
     let html = template.render()?;
 
-    let image = timeout(
-        WORDCLOUD_TIMEOUT,
-        utils::screenshot(html.into(), Some("#word-cloud".into())),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("词云截图超时"))??;
+    let image = timeout(WORDCLOUD_TIMEOUT, screenshot_word_cloud(html))
+        .await
+        .map_err(|_| anyhow::anyhow!("词云截图超时"))??;
 
     Ok(image)
+}
+
+async fn screenshot_word_cloud(html: String) -> Result<Vec<u8>> {
+    let mut guard = utils::get_context().await?;
+    let ctx = playwright_rs::protocol::BrowserContext::clone(&guard);
+
+    let res = async {
+        let page = ctx.new_page().await?;
+        let screenshot_res = async {
+            page.set_content(&html, None).await?;
+            page.evaluate::<(), bool>(
+                "async () => {\n\
+                 const deadline = Date.now() + 30000;\n\
+                 while (document.body.getAttribute('data-ready') !== 'true') {\n\
+                     if (Date.now() > deadline) throw new Error('wordcloud render timeout');\n\
+                     const err = document.body.getAttribute('data-error');\n\
+                     if (err) throw new Error('wordcloud render failed: ' + err);\n\
+                     await new Promise(r => setTimeout(r, 50));\n\
+                 }\n\
+                 return true;\n\
+                 }",
+                None,
+            )
+            .await?;
+            let locator = page.locator("#word-cloud").await;
+            let bytes = locator.screenshot(None).await?;
+            Ok::<Vec<u8>, anyhow::Error>(bytes)
+        }
+        .await;
+        let _ = page.close().await;
+        screenshot_res
+    }
+    .await;
+
+    if res.is_err() {
+        guard.mark_unhealthy();
+        let _ = ctx.close().await;
+    }
+
+    res
 }
 
 async fn load_stop_words(path: &Path) -> Vec<String> {
