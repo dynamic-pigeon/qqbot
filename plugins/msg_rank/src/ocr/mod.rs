@@ -75,11 +75,12 @@ impl OcrMemory {
 ///
 /// # 参数
 /// * `img_url` - 图片的URL地址（必须通过 [`utils::validate_image_url_async`] 校验）
+/// * `check_dns` - 是否做 DNS 预解析校验；关闭可避免本地 DNS 劫持导致误杀
 ///
 /// # 返回
 /// * `Result<Arc<String>>` - OCR识别的文本结果
-pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
-    utils::validate_image_url_async(img_url, ALLOWED_QQ_HOSTS).await?;
+pub async fn ocr(img_url: &str, check_dns: bool) -> Result<Arc<String>> {
+    utils::validate_image_url_async_with_options(img_url, ALLOWED_QQ_HOSTS, check_dns).await?;
     let img = get_img_bytes_from_url(img_url).await?;
     let result = OCR_MEMORY.get_or_insert(img).await?;
 

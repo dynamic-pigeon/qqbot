@@ -79,6 +79,7 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
 async fn get_text(msg: &Message) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut ocr_tasks = Vec::new();
+    let check_dns = config::read_config().validate_image_url_dns;
 
     for seg in msg.iter() {
         match seg.kind.as_str() {
@@ -97,7 +98,7 @@ async fn get_text(msg: &Message) -> String {
                     let url = url.to_string();
                     let idx = parts.len();
                     parts.push(String::new()); // OCR 完成后回填
-                    let task = kovi::spawn(async move { ocr::ocr(&url).await });
+                    let task = kovi::spawn(async move { ocr::ocr(&url, check_dns).await });
                     ocr_tasks.push((idx, task));
                 }
             }
