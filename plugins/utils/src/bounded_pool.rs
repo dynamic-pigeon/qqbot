@@ -187,7 +187,9 @@ impl<T: Send + 'static> BoundedResourcePool<T> {
     }
 }
 
-fn lock_idle<T>(idle: &Mutex<VecDeque<IdleEntry<T>>>) -> std::sync::MutexGuard<'_, VecDeque<IdleEntry<T>>> {
+fn lock_idle<T>(
+    idle: &Mutex<VecDeque<IdleEntry<T>>>,
+) -> std::sync::MutexGuard<'_, VecDeque<IdleEntry<T>>> {
     idle.lock().unwrap_or_else(|p| p.into_inner())
 }
 

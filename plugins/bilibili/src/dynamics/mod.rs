@@ -59,12 +59,9 @@ async fn scheduled_task(bot: std::sync::Arc<RuntimeBot>) {
 }
 
 async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
-    let page = kovi::tokio::time::timeout(
-        Duration::from_secs(20),
-        fetch_user_dynamics(uid, None),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("fetch 超时"))??;
+    let page = kovi::tokio::time::timeout(Duration::from_secs(20), fetch_user_dynamics(uid, None))
+        .await
+        .map_err(|_| anyhow::anyhow!("fetch 超时"))??;
 
     let cfg = crate::config::read_config();
     let groups: Vec<i64> = cfg
@@ -328,12 +325,10 @@ async fn fetch_image(url: &str) -> anyhow::Result<Bytes> {
     utils::validate_image_url_async(url, ALLOWED_BILI_HOSTS).await?;
 
     use crate::CLIENT;
-    let resp = kovi::tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        CLIENT.get(url).send(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("图片下载超时"))??;
+    let resp =
+        kovi::tokio::time::timeout(std::time::Duration::from_secs(15), CLIENT.get(url).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("图片下载超时"))??;
     Ok(resp.bytes().await?)
 }
 
@@ -390,7 +385,12 @@ pub fn format_summary(item: &DynamicItem) -> String {
             }
             format!("（共 {} 张图片）", pics.len())
         }
-        DynamicItem::Opus { title, summary, pics, .. } => {
+        DynamicItem::Opus {
+            title,
+            summary,
+            pics,
+            ..
+        } => {
             let text = summary.as_ref().map(|s| s.text.as_str()).unwrap_or("");
             match (title.is_empty(), text.is_empty()) {
                 (false, false) => format!("{}\n{}", title, text),
@@ -400,10 +400,12 @@ pub fn format_summary(item: &DynamicItem) -> String {
             }
         }
         DynamicItem::Word { text, .. } => text.clone(),
-        DynamicItem::Article { title, summary, label, .. } => match (
-            title.is_empty(),
-            summary.text.is_empty(),
-        ) {
+        DynamicItem::Article {
+            title,
+            summary,
+            label,
+            ..
+        } => match (title.is_empty(), summary.text.is_empty()) {
             (false, false) => format!("{}\n{}", title, summary.text),
             (false, true) => title.clone(),
             (true, false) => summary.text.clone(),

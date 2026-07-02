@@ -7,10 +7,7 @@ use std::{
 use anyhow::Result;
 use araea_wordcloud::{WordCloudBuilder, WordInput};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use kovi::{
-    Message, PluginBuilder as plugin, RuntimeBot,
-    tokio,
-};
+use kovi::{Message, PluginBuilder as plugin, RuntimeBot, tokio};
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
 use tracing::{self, info};
 
@@ -28,8 +25,8 @@ const MAX_WORDS: usize = 150;
 
 /// 接近 Python wordcloud 默认 viridis 风格的配色。
 const WORDCLOUD_COLORS: [&str; 10] = [
-    "#440154", "#472878", "#3e4a89", "#31688e", "#26828e",
-    "#21918c", "#35b779", "#90d743", "#fde725", "#5c2686",
+    "#440154", "#472878", "#3e4a89", "#31688e", "#26828e", "#21918c", "#35b779", "#90d743",
+    "#fde725", "#5c2686",
 ];
 
 pub(crate) async fn init() -> Result<()> {
@@ -166,7 +163,11 @@ async fn send_word_cloud(
         }
         Err(e) => {
             tracing::error!("make word cloud failed: {}, group_id: {}", e, group_id);
-            if let Some(admin_id) = bot.get_main_admin().ok().and_then(|admin| admin.try_as_i64()) {
+            if let Some(admin_id) = bot
+                .get_main_admin()
+                .ok()
+                .and_then(|admin| admin.try_as_i64())
+            {
                 bot.send_private_msg(
                     admin_id,
                     format!("make word cloud failed: {}, group_id: {}", e, group_id),
@@ -239,13 +240,15 @@ fn generate_word_cloud_image(
         .size(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .colors(WORDCLOUD_COLORS)
         .padding(2)
-        .angles(vec![0.0]);
+        // 同时允许横排（0°）和侧躺（±90°）。
+        // 不开启 vertical_writing，因此 90° 的词是整体旋转侧躺，而非字符直立竖排。
+        .angles(vec![0.0, -90.0, 90.0]);
 
     // 加载自定义字体（如果 data 目录下存在 font.otf）。
     let font_path = path.join("font.otf");
     if font_path.exists() {
-        let font_bytes = std::fs::read(&font_path)
-            .map_err(|e| anyhow::anyhow!("读取字体失败: {e}"))?;
+        let font_bytes =
+            std::fs::read(&font_path).map_err(|e| anyhow::anyhow!("读取字体失败: {e}"))?;
         builder = builder.font(font_bytes);
     }
 
@@ -324,8 +327,7 @@ async fn load_stop_words(path: &Path) -> Vec<String> {
 }
 
 fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> {
-    let stop_set: std::collections::HashSet<&str> =
-        stop_words.iter().map(|s| s.as_str()).collect();
+    let stop_set: std::collections::HashSet<&str> = stop_words.iter().map(|s| s.as_str()).collect();
     let mut counts: HashMap<String, u32> = HashMap::new();
     for w in words {
         let w = w.trim().to_string();
@@ -401,6 +403,8 @@ mod tests {
         let items = count_words(raw_words, &[]);
         let png = generate_word_cloud_image(Path::new("/nonexistent"), items, "white").unwrap();
         assert!(!png.is_empty());
-        tokio::fs::write("/tmp/wordcloud_test.png", &png).await.unwrap();
+        tokio::fs::write("/tmp/wordcloud_test.png", &png)
+            .await
+            .unwrap();
     }
 }

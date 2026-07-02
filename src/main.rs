@@ -53,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver_config = load_local_conf()?;
     let driver = OneBotDriver::new(driver_config);
 
-    let bot = kovi::build_bot!(driver; kovi_plugin_cmd, msg_rank, help_msg, markdown, yu_gi_oh, bilibili);
+    let bot =
+        kovi::build_bot!(driver; kovi_plugin_cmd, msg_rank, help_msg, markdown, yu_gi_oh, bilibili);
 
     bot.run().await;
     Ok(())

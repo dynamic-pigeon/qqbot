@@ -104,7 +104,8 @@ pub async fn fetch_user_dynamics(
     offset: Option<&str>,
 ) -> Result<crate::dynamics::types::DynamicsPage, DynamicsError> {
     let url = build_space_url(uid, offset);
-    let mut req = CLIENT.get(url)
+    let mut req = CLIENT
+        .get(url)
         .header(reqwest::header::USER_AGENT, USER_AGENT.as_str())
         .header(reqwest::header::REFERER, "https://www.bilibili.com/");
     if let Some(c) = COOKIE.as_deref() {
@@ -124,7 +125,7 @@ pub async fn fetch_user_dynamics(
     } else {
         Some(data.offset)
     };
-        Ok(DynamicsPage {
+    Ok(DynamicsPage {
         items: data
             .items
             .into_iter()
@@ -157,21 +158,38 @@ fn convert_item(raw: ItemRaw) -> DynamicItem {
     let id = raw.id_str.clone();
 
     match raw.r#type.as_str() {
-        "DYNAMIC_TYPE_AV" => convert_video(&id, &author, &raw.modules.module_dynamic)
-            .unwrap_or(DynamicItem::Other { id: id.clone(), author: author.clone() }),
+        "DYNAMIC_TYPE_AV" => {
+            convert_video(&id, &author, &raw.modules.module_dynamic).unwrap_or(DynamicItem::Other {
+                id: id.clone(),
+                author: author.clone(),
+            })
+        }
         "DYNAMIC_TYPE_DRAW" => {
             // 当前 B 站返回的图文动态用 MAJOR_TYPE_OPUS 承载；旧的 major.draw 已不再出现。
             convert_opus(&id, &author, &raw.modules.module_dynamic)
                 .or_else(|| convert_draw(&id, &author, &raw.modules.module_dynamic))
-                .unwrap_or(DynamicItem::Other { id: id.clone(), author: author.clone() })
+                .unwrap_or(DynamicItem::Other {
+                    id: id.clone(),
+                    author: author.clone(),
+                })
         }
         "DYNAMIC_TYPE_WORD" => convert_opus(&id, &author, &raw.modules.module_dynamic)
             .or_else(|| convert_word(&id, &author, &raw.modules.module_dynamic))
-            .unwrap_or(DynamicItem::Other { id: id.clone(), author: author.clone() }),
+            .unwrap_or(DynamicItem::Other {
+                id: id.clone(),
+                author: author.clone(),
+            }),
         "DYNAMIC_TYPE_ARTICLE" => convert_article(&id, &author, &raw.modules.module_dynamic)
-            .unwrap_or(DynamicItem::Other { id: id.clone(), author: author.clone() }),
-        "DYNAMIC_TYPE_LIVE" | "DYNAMIC_TYPE_LIVE_RCMD" => convert_live(&id, &author, &raw.modules.module_dynamic)
-            .unwrap_or(DynamicItem::Other { id: id.clone(), author: author.clone() }),
+            .unwrap_or(DynamicItem::Other {
+                id: id.clone(),
+                author: author.clone(),
+            }),
+        "DYNAMIC_TYPE_LIVE" | "DYNAMIC_TYPE_LIVE_RCMD" => {
+            convert_live(&id, &author, &raw.modules.module_dynamic).unwrap_or(DynamicItem::Other {
+                id: id.clone(),
+                author: author.clone(),
+            })
+        }
         // 转发动态不再递归解析 orig，统一归为 Other，避免异常嵌套导致栈溢出或重复推送。
         "DYNAMIC_TYPE_FORWARD" => DynamicItem::Other { id, author },
         _ => DynamicItem::Other { id, author },
@@ -394,7 +412,10 @@ mod url_tests {
 
     #[test]
     fn room_id_parses_basic_url() {
-        assert_eq!(room_id_from_jump_url("https://live.bilibili.com/12345"), 12345);
+        assert_eq!(
+            room_id_from_jump_url("https://live.bilibili.com/12345"),
+            12345
+        );
     }
 
     #[test]
@@ -407,7 +428,10 @@ mod url_tests {
 
     #[test]
     fn room_id_parses_url_with_trailing_slash() {
-        assert_eq!(room_id_from_jump_url("https://live.bilibili.com/12345/"), 12345);
+        assert_eq!(
+            room_id_from_jump_url("https://live.bilibili.com/12345/"),
+            12345
+        );
     }
 
     #[test]

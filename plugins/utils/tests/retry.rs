@@ -145,11 +145,7 @@ async fn retry_async_with_backoff_eventually_succeeds() {
     let result: Result<i32, &'static str> = retry_async_with_backoff(
         || async {
             let n = calls.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
-                Err("transient")
-            } else {
-                Ok(42)
-            }
+            if n < 2 { Err("transient") } else { Ok(42) }
         },
         3,
         Duration::from_millis(1),

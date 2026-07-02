@@ -7,12 +7,9 @@ use std::path::PathBuf;
 /// 渲染为缺失字形。构建时把 woff2 字体 base64 进 CSS，使字体自包含，只依赖
 /// `font-src 'self' data:`。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_dir = PathBuf::from(
-        std::env::var_os("OUT_DIR").ok_or("OUT_DIR must be set")?,
-    );
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR must be set")?);
     let manifest_dir = PathBuf::from(
-        std::env::var_os("CARGO_MANIFEST_DIR")
-            .ok_or("CARGO_MANIFEST_DIR must be set")?,
+        std::env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR must be set")?,
     );
 
     let assets_dir = manifest_dir.join("src/markdown/assets");
@@ -40,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let data = std::fs::read(&path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let data =
+            std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let b64 = base64_encode(&data);
         let placeholder = format!("url(fonts/{name})");
         let data_url = format!("url(data:font/woff2;base64,{b64})");
