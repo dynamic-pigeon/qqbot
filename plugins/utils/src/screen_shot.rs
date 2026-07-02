@@ -1,14 +1,8 @@
-use std::{
-    borrow::Cow,
-    sync::LazyLock,
-    time::Duration,
-};
+use std::{borrow::Cow, sync::LazyLock, time::Duration};
 
 use anyhow::Result;
 use kovi::tokio::sync::OnceCell;
-use playwright_rs::protocol::{
-    BrowserContext, BrowserContextOptions, ScreenshotOptions, Viewport,
-};
+use playwright_rs::protocol::{BrowserContext, BrowserContextOptions, ScreenshotOptions, Viewport};
 use playwright_rs::{Browser, LaunchOptions, Playwright};
 use tracing::{debug, info};
 

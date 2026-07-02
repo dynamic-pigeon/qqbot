@@ -1,6 +1,6 @@
 use bilibili::dynamics::{
-    author_of, collect_pics, count_pics_total, format_body, push_url, DynamicAuthor, DynamicItem,
-    Pic, RichText,
+    DynamicAuthor, DynamicItem, Pic, RichText, author_of, collect_pics, count_pics_total,
+    format_body, push_url,
 };
 
 fn word_with_pics(n: usize) -> DynamicItem {
@@ -8,7 +8,9 @@ fn word_with_pics(n: usize) -> DynamicItem {
         id: "1".into(),
         text: "x".into(),
         pics: (0..n)
-            .map(|i| Pic { src: format!("u{i}") })
+            .map(|i| Pic {
+                src: format!("u{i}"),
+            })
             .collect(),
         author: DynamicAuthor::default(),
     }
@@ -48,7 +50,9 @@ fn push_url_routes_by_type() {
         push_url(&DynamicItem::Article {
             id: 999,
             title: String::new(),
-            summary: RichText { text: String::new() },
+            summary: RichText {
+                text: String::new()
+            },
             covers: vec![],
             label: String::new(),
             author: DynamicAuthor::default(),
@@ -158,7 +162,10 @@ fn format_body_for_video_with_all_empty_author_and_title_returns_only_url() {
         author: author.clone(),
     };
     // 全空时不应出现 leading blank line / 裸冒号
-    assert_eq!(format_body(&author, &item), "https://www.bilibili.com/video/BV1abc");
+    assert_eq!(
+        format_body(&author, &item),
+        "https://www.bilibili.com/video/BV1abc"
+    );
 }
 
 #[test]
@@ -237,15 +244,18 @@ fn format_body_for_non_video_keeps_legacy_header_summary_url() {
         author: author.clone(),
     };
     let body = format_body(&author, &item);
-    assert_eq!(body, "小明 发布了文字动态\n纯文字内容\nhttps://t.bilibili.com/111");
+    assert_eq!(
+        body,
+        "小明 发布了文字动态\n纯文字内容\nhttps://t.bilibili.com/111"
+    );
 }
 
 #[test]
 fn author_of_returns_per_item_author_for_all_variants() {
     let video_author = DynamicAuthor {
         name: "UP主A".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let video = DynamicItem::Video {
         id: "1".into(),
         bvid: String::new(),
@@ -258,8 +268,8 @@ fn author_of_returns_per_item_author_for_all_variants() {
 
     let word_author = DynamicAuthor {
         name: "UP主B".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let word = DynamicItem::Word {
         id: "2".into(),
         text: "hi".into(),
@@ -270,8 +280,8 @@ fn author_of_returns_per_item_author_for_all_variants() {
 
     let article_author = DynamicAuthor {
         name: "UP主C".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let article = DynamicItem::Article {
         id: 3,
         title: String::new(),
@@ -286,8 +296,8 @@ fn author_of_returns_per_item_author_for_all_variants() {
 
     let draw_author = DynamicAuthor {
         name: "UP主D".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let draw = DynamicItem::Draw {
         id: "4".into(),
         pics: vec![],
@@ -298,8 +308,8 @@ fn author_of_returns_per_item_author_for_all_variants() {
 
     let live_author = DynamicAuthor {
         name: "UP主E".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let live = DynamicItem::Live {
         id: 5,
         title: String::new(),
@@ -335,7 +345,9 @@ fn count_pics_total_reports_full_count_for_all_variants() {
         id: "3".into(),
         title: String::new(),
         summary: None,
-        pics: (0..9).map(|i| format!("https://i0.hdslb.com/pic{i}.jpg")).collect(),
+        pics: (0..9)
+            .map(|i| format!("https://i0.hdslb.com/pic{i}.jpg"))
+            .collect(),
         jump_url: String::new(),
         author: DynamicAuthor::default(),
     };
@@ -348,8 +360,8 @@ fn count_pics_total_reports_full_count_for_all_variants() {
 fn push_dynamic_body_appends_hint_when_pics_exceed_limit() {
     let author = DynamicAuthor {
         name: "小明".into(),
-            pub_action: String::new(),
-        };
+        pub_action: String::new(),
+    };
     let item = DynamicItem::Opus {
         id: "555".into(),
         title: "九图动态".into(),

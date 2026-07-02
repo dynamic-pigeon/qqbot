@@ -48,10 +48,7 @@ pub enum DynamicItem {
     },
     /// B 站返回了不在已知类型表里的 major_type / dynamic_type（含转发动态）；
     /// 保留动态 id + 作者供排查，不再递归解析内部内容。
-    Other {
-        id: String,
-        author: DynamicAuthor,
-    },
+    Other { id: String, author: DynamicAuthor },
 }
 
 #[derive(Debug, Default, Clone)]

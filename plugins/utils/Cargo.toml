@@ -11,7 +11,6 @@ askama.workspace = true
 playwright-rs.workspace = true
 tracing.workspace = true
 crossbeam-epoch.workspace = true
-regex.workspace = true
 reqwest.workspace = true
 ammonia = "4"
 

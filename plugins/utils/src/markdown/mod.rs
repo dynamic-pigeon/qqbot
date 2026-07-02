@@ -86,24 +86,70 @@ pub fn md_to_html(md: &str) -> String {
 fn sanitize_html(input: &str) -> String {
     let allowed_tags: HashSet<&str> = [
         // 基础结构
-        "p", "br", "hr", "div", "span",
+        "p",
+        "br",
+        "hr",
+        "div",
+        "span",
         // 标题
-        "h1", "h2", "h3", "h4", "h5", "h6",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
         // 文本格式
-        "strong", "em", "b", "i", "u", "s", "del", "ins", "mark", "sub", "sup",
-        "code", "pre", "kbd", "samp", "var",
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+        "s",
+        "del",
+        "ins",
+        "mark",
+        "sub",
+        "sup",
+        "code",
+        "pre",
+        "kbd",
+        "samp",
+        "var",
         // 列表
-        "ul", "ol", "li", "dl", "dt", "dd",
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
         // 表格
-        "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption", "col", "colgroup",
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "caption",
+        "col",
+        "colgroup",
         // 引用
-        "blockquote", "q", "cite",
+        "blockquote",
+        "q",
+        "cite",
         // 细节
-        "details", "summary",
+        "details",
+        "summary",
         // 链接（仅保留文本，href 会被 scheme 过滤）
         "a",
         // 其他语义标签
-        "abbr", "bdi", "bdo", "dfn", "small", "time", "wbr",
+        "abbr",
+        "bdi",
+        "bdo",
+        "dfn",
+        "small",
+        "time",
+        "wbr",
     ]
     .iter()
     .copied()
@@ -118,10 +164,7 @@ fn sanitize_html(input: &str) -> String {
     let a_attrs: HashSet<&str> = ["href"].iter().copied().collect();
     tag_attributes.insert("a", a_attrs);
 
-    let url_schemes: HashSet<&str> = ["http", "https", "mailto"]
-        .iter()
-        .copied()
-        .collect();
+    let url_schemes: HashSet<&str> = ["http", "https", "mailto"].iter().copied().collect();
 
     ammonia::Builder::default()
         .tags(allowed_tags)
@@ -171,7 +214,10 @@ mod tests {
     #[test]
     fn sanitize_strips_link_meta_base_style() {
         assert!(!sanitize_html("<link rel='stylesheet' href='http://evil/x'>").contains("<link"));
-        assert!(!sanitize_html("<meta http-equiv='refresh' content='0;url=http://evil'>").contains("<meta"));
+        assert!(
+            !sanitize_html("<meta http-equiv='refresh' content='0;url=http://evil'>")
+                .contains("<meta")
+        );
         assert!(!sanitize_html("<base href='http://evil/'>").contains("<base"));
         assert!(!sanitize_html("<style>body{display:none}</style>").contains("<style"));
     }
@@ -238,7 +284,9 @@ mod tests {
         let out6 = sanitize_html(r#"<a href=data:text/html,<script>alert(1)</script>>x</a>"#);
         assert!(!out6.to_ascii_lowercase().contains("data:"));
 
-        let out7 = sanitize_html(r#"<a href=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>x</a>"#);
+        let out7 = sanitize_html(
+            r#"<a href=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>x</a>"#,
+        );
         assert!(!out7.to_ascii_lowercase().contains("data:"));
 
         // 正常 bareword URL 不应被误伤
@@ -250,7 +298,9 @@ mod tests {
 
     #[test]
     fn sanitize_preserves_safe_links() {
-        assert!(sanitize_html(r#"<a href="https://example.com">x</a>"#).contains("https://example.com"));
+        assert!(
+            sanitize_html(r#"<a href="https://example.com">x</a>"#).contains("https://example.com")
+        );
         assert!(sanitize_html(r#"<a href="mailto:a@b.com">x</a>"#).contains("mailto:a@b.com"));
     }
 
@@ -264,7 +314,10 @@ mod tests {
     #[test]
     fn sanitize_removes_remote_resource_tags() {
         // img 不在白名单中，可防止 SSRF
-        assert!(!sanitize_html(r#"<img src="http://169.254.169.254/latest/meta-data/">"#).contains("<img"));
+        assert!(
+            !sanitize_html(r#"<img src="http://169.254.169.254/latest/meta-data/">"#)
+                .contains("<img")
+        );
         assert!(!sanitize_html(r#"<video src="http://evil"></video>"#).contains("<video"));
         assert!(!sanitize_html(r#"<audio src="http://evil"></audio>"#).contains("<audio"));
         assert!(!sanitize_html(r#"<source src="http://evil">"#).contains("<source"));

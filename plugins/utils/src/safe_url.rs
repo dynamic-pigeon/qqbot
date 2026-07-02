@@ -27,8 +27,8 @@ const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// 注意：仅校验 URL 字符串层；对抗 DNS rebinding 还需要 [`validate_image_url_async`]
 /// 在调用 HTTP 之前多一次 DNS 预解析检查。
 pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| anyhow::anyhow!("image url 解析失败: {e}"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("image url 解析失败: {e}"))?;
 
     if parsed.scheme() != "https" {
         return Err(anyhow::anyhow!(
@@ -168,18 +168,18 @@ fn is_public_v4(ip: &Ipv4Addr) -> bool {
     }
     let oct = ip.octets();
     match oct[0] {
-        0 => false,                                          // 0.0.0.0/8
-        10 => false,                                         // 10.0.0.0/8
-        100 if oct[1] >= 64 && oct[1] <= 127 => false,       // 100.64.0.0/10 CGNAT
-        127 => false,                                        // 127.0.0.0/8 loopback
-        169 if oct[1] == 254 => false,                       // 169.254.0.0/16 link-local
-        172 if (16..=31).contains(&oct[1]) => false,         // 172.16.0.0/12 private
-        192 if oct[1] == 0 && oct[2] == 0 => false,          // 192.0.0.0/24 IETF
-        192 if oct[1] == 0 && oct[2] == 2 => false,          // 192.0.2.0/24 TEST-NET-1
-        192 if oct[1] == 168 => false,                       // 192.168.0.0/16 private
-        198 if oct[1] == 18 && oct[2] <= 1 => false,         // 198.18.0.0/15 benchmark
-        198 if oct[1] == 51 && oct[2] == 100 => false,       // 198.51.100.0/24 TEST-NET-2
-        203 if oct[1] == 0 && oct[2] == 113 => false,        // 203.0.113.0/24 TEST-NET-3
+        0 => false,                                    // 0.0.0.0/8
+        10 => false,                                   // 10.0.0.0/8
+        100 if oct[1] >= 64 && oct[1] <= 127 => false, // 100.64.0.0/10 CGNAT
+        127 => false,                                  // 127.0.0.0/8 loopback
+        169 if oct[1] == 254 => false,                 // 169.254.0.0/16 link-local
+        172 if (16..=31).contains(&oct[1]) => false,   // 172.16.0.0/12 private
+        192 if oct[1] == 0 && oct[2] == 0 => false,    // 192.0.0.0/24 IETF
+        192 if oct[1] == 0 && oct[2] == 2 => false,    // 192.0.2.0/24 TEST-NET-1
+        192 if oct[1] == 168 => false,                 // 192.168.0.0/16 private
+        198 if oct[1] == 18 && oct[2] <= 1 => false,   // 198.18.0.0/15 benchmark
+        198 if oct[1] == 51 && oct[2] == 100 => false, // 198.51.100.0/24 TEST-NET-2
+        203 if oct[1] == 0 && oct[2] == 113 => false,  // 203.0.113.0/24 TEST-NET-3
         // 224..=239 multicast, 240..=255 reserved: 上面的 is_multicast / broadcast 已涵盖，
         // 这里保留兜底
         224..=255 => false,

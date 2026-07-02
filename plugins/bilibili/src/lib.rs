@@ -210,7 +210,9 @@ async fn dynamic_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
     }
     let parts: Vec<&str> = text.split_whitespace().collect();
     if parts.len() < 2 {
-        event.reply("用法: /dynamic add <uid> | /dynamic rm <uid> | /dynamic list | /dynamic fetch <uid>");
+        event.reply(
+            "用法: /dynamic add <uid> | /dynamic rm <uid> | /dynamic list | /dynamic fetch <uid>",
+        );
         return;
     }
     let group = event.group_id;
@@ -303,10 +305,7 @@ async fn dynamic_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
                 match parts[3].parse::<usize>() {
                     Ok(n) if (1..=dynamics::MAX_FETCH_COUNT).contains(&n) => n,
                     _ => {
-                        event.reply(format!(
-                            "count 必须是 1..={}",
-                            dynamics::MAX_FETCH_COUNT
-                        ));
+                        event.reply(format!("count 必须是 1..={}", dynamics::MAX_FETCH_COUNT));
                         return;
                     }
                 }

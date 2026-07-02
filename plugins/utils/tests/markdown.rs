@@ -191,8 +191,7 @@ fn finding1_csp_allows_inlined_katex_fonts() {
     );
 
     // 4. 仓库 assets/ 目录下存在 fonts/ 子目录（构建脚本用其生成内联 CSS）
-    let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/markdown/assets");
+    let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/markdown/assets");
     assert!(
         assets_dir.join("fonts").exists(),
         "assets/fonts/ 必须存在，供 build.rs 把字体 base64 进 CSS。"
