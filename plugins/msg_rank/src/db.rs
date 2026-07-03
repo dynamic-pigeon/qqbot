@@ -1,21 +1,54 @@
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
-use kovi::tokio::sync::{OnceCell, mpsc};
+use kovi::tokio::sync::{OnceCell, mpsc, oneshot};
+use kovi::tokio::time::timeout;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
 static SQLITE_POOL: OnceCell<SqlitePool> = OnceCell::const_new();
-static MSG_SENDER: OnceCell<mpsc::UnboundedSender<MsgRecord>> = OnceCell::const_new();
+static MSG_SENDER: OnceCell<mpsc::Sender<MsgRecord>> = OnceCell::const_new();
+static SHUTDOWN_TX: OnceCell<Mutex<Option<oneshot::Sender<()>>>> = OnceCell::const_new();
+static FLUSH_DONE_RX: OnceCell<Mutex<Option<oneshot::Receiver<()>>>> = OnceCell::const_new();
 
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 100;
+const BUFFER_CAPACITY: usize = 10_000;
+const MAX_FLUSH_RETRIES: u8 = 3;
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct MsgRecord {
     group_id: i64,
     user_id: i64,
     msg: String,
     timestamp: i64,
+}
+
+struct BufferState {
+    records: Vec<MsgRecord>,
+    retry_count: u8,
+}
+
+impl BufferState {
+    fn new() -> Self {
+        Self {
+            records: Vec::with_capacity(FLUSH_BATCH_SIZE),
+            retry_count: 0,
+        }
+    }
+
+    fn push(&mut self, record: MsgRecord) {
+        self.records.push(record);
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
 }
 
 pub(crate) async fn init_db(path: &Path) -> Result<()> {
@@ -58,37 +91,72 @@ fn build_pool(path: &Path) -> Result<SqlitePool> {
 }
 
 fn init_buffer() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<MsgRecord>();
-    MSG_SENDER.set(tx).expect("消息缓冲区只能初始化一次");
+    let (tx, mut rx) = mpsc::channel(BUFFER_CAPACITY);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    if MSG_SENDER.set(tx).is_err() {
+        return;
+    }
+    let _ = SHUTDOWN_TX.set(Mutex::new(Some(shutdown_tx)));
+    let _ = FLUSH_DONE_RX.set(Mutex::new(Some(done_rx)));
 
     kovi::tokio::spawn(async move {
-        let mut batch: Vec<MsgRecord> = Vec::with_capacity(FLUSH_BATCH_SIZE);
+        let mut state = BufferState::new();
         let mut interval = kovi::tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
 
         loop {
             kovi::tokio::select! {
                 Some(record) = rx.recv() => {
-                    batch.push(record);
-                    if batch.len() >= FLUSH_BATCH_SIZE {
-                        flush_batch(&mut batch).await;
+                    state.push(record);
+                    if state.len() >= FLUSH_BATCH_SIZE {
+                        flush_batch(&mut state).await;
                     }
                 }
                 _ = interval.tick() => {
-                    if !batch.is_empty() {
-                        flush_batch(&mut batch).await;
+                    if !state.is_empty() {
+                        flush_batch(&mut state).await;
                     }
+                }
+                _ = &mut shutdown_rx => {
+                    while let Ok(record) = rx.try_recv() {
+                        state.push(record);
+                    }
+                    if !state.is_empty() {
+                        flush_batch(&mut state).await;
+                    }
+                    let _ = done_tx.send(());
+                    break;
                 }
             }
         }
     });
 }
 
-async fn flush_batch(batch: &mut Vec<MsgRecord>) {
-    if batch.is_empty() {
+async fn flush_batch(state: &mut BufferState) {
+    if state.is_empty() {
         return;
     }
 
-    let placeholders: Vec<String> = (0..batch.len())
+    let pool = match get_pool() {
+        Ok(pool) => pool,
+        Err(e) => {
+            tracing::error!("批量写入失败，无法获取数据库连接: {}", e);
+            state.retry_count = state.retry_count.saturating_add(1);
+            if state.retry_count >= MAX_FLUSH_RETRIES {
+                tracing::error!(
+                    "批量写入在 {} 次重试后仍失败，丢弃 {} 条消息",
+                    MAX_FLUSH_RETRIES,
+                    state.len()
+                );
+                state.records.clear();
+                state.retry_count = 0;
+            }
+            return;
+        }
+    };
+
+    let placeholders: Vec<String> = (0..state.len())
         .map(|_| "(?, ?, ?, ?)".to_string())
         .collect();
     let sql = format!(
@@ -97,7 +165,7 @@ async fn flush_batch(batch: &mut Vec<MsgRecord>) {
     );
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    for record in batch.iter() {
+    for record in &state.records {
         query = query
             .bind(record.group_id)
             .bind(record.user_id)
@@ -105,22 +173,58 @@ async fn flush_batch(batch: &mut Vec<MsgRecord>) {
             .bind(record.timestamp);
     }
 
-    match query.execute(get_pool().unwrap()).await {
-        Ok(_) => {}
+    match query.execute(pool).await {
+        Ok(_) => {
+            state.records.clear();
+            state.retry_count = 0;
+        }
         Err(e) => {
             tracing::error!("批量写入消息失败: {}", e);
+            state.retry_count = state.retry_count.saturating_add(1);
+            if state.retry_count >= MAX_FLUSH_RETRIES {
+                tracing::error!(
+                    "批量写入消息在 {} 次重试后仍然失败，丢弃 {} 条消息",
+                    MAX_FLUSH_RETRIES,
+                    state.len()
+                );
+                state.records.clear();
+                state.retry_count = 0;
+            }
         }
     }
-
-    batch.clear();
 }
 
-pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: &str) -> Result<()> {
+pub(crate) async fn flush_on_shutdown() {
+    let maybe_tx = SHUTDOWN_TX.get().and_then(|m| m.lock().ok()?.take());
+    let maybe_done = FLUSH_DONE_RX.get().and_then(|m| m.lock().ok()?.take());
+
+    let Some(tx) = maybe_tx else {
+        tracing::warn!("消息缓冲区未初始化，无法执行关闭刷新");
+        return;
+    };
+    let Some(done) = maybe_done else {
+        tracing::warn!("消息缓冲区关闭完成通道未初始化");
+        return;
+    };
+
+    if tx.send(()).is_err() {
+        tracing::warn!("消息缓冲区任务已停止，无法触发关闭刷新");
+        return;
+    }
+
+    match timeout(SHUTDOWN_FLUSH_TIMEOUT, done).await {
+        Ok(Ok(())) => tracing::info!("消息缓冲区关闭前刷新完成"),
+        Ok(Err(_)) => tracing::warn!("消息缓冲区关闭通道已关闭"),
+        Err(_) => tracing::warn!("消息缓冲区关闭前刷新超时"),
+    }
+}
+
+pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: String) -> Result<()> {
     let timestamp = chrono::Local::now().timestamp();
     let record = MsgRecord {
         group_id,
         user_id,
-        msg: msg.to_string(),
+        msg,
         timestamp,
     };
     let sender = MSG_SENDER
@@ -128,6 +232,7 @@ pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: &str) -> Result<()
         .ok_or_else(|| anyhow::anyhow!("消息缓冲区未初始化"))?;
     sender
         .send(record)
+        .await
         .map_err(|_| anyhow::anyhow!("消息缓冲区已关闭"))?;
     Ok(())
 }
@@ -224,6 +329,8 @@ fn get_pool() -> Result<&'static SqlitePool> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_build_placeholders_for_batch_insert() {
         let placeholders: Vec<String> = (0..3).map(|_| "(?, ?, ?, ?)".to_string()).collect();
@@ -235,5 +342,41 @@ mod tests {
             sql,
             "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)"
         );
+    }
+
+    #[test]
+    fn test_batch_insert_and_shutdown_flush() {
+        let tmp = std::env::temp_dir().join(format!("msg_rank_test_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::File::create(&tmp).unwrap();
+
+        let rt = kovi::tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            init_db(&tmp).await.unwrap();
+
+            add_msg(1, 100, "hello".into()).await.unwrap();
+            add_msg(1, 101, "world".into()).await.unwrap();
+            add_msg(2, 100, "other".into()).await.unwrap();
+
+            flush_on_shutdown().await;
+
+            let group1 = msg_count_top_with_time_range(1, 0, i64::MAX, 10)
+                .await
+                .unwrap();
+            assert_eq!(group1.len(), 2);
+
+            let group2 = msg_count_top_with_time_range(2, 0, i64::MAX, 10)
+                .await
+                .unwrap();
+            assert_eq!(group2.len(), 1);
+
+            let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM MSG")
+                .fetch_one(get_pool().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(total.0, 3);
+        });
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

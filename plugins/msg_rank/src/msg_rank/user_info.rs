@@ -30,7 +30,8 @@ static USER_INFO_CACHE: std::sync::LazyLock<Cache<(i64, i64), UserInfo>> =
             .build()
     });
 
-const MAX_RETRIES: usize = 2;
+const MAX_ATTEMPTS: usize = 2;
+const RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// 通过 bot API 获取单个群成员的 UserInfo（带缓存与重试）。
 pub(super) async fn get_user_info(
@@ -39,62 +40,74 @@ pub(super) async fn get_user_info(
     user_id: i64,
 ) -> Result<UserInfo> {
     let key = (group_id, user_id);
-    if let Some(cached) = USER_INFO_CACHE.get(&key).await {
-        return Ok(cached);
-    }
+    let bot = bot.clone();
 
-    match fetch_user_info(bot, group_id, user_id).await {
-        Ok(info) => {
-            USER_INFO_CACHE.insert(key, info.clone()).await;
-            Ok(info)
-        }
-        Err(e) => {
-            tracing::warn!("获取用户 {} 信息失败: {}", user_id, e);
-            Err(e)
+    match USER_INFO_CACHE
+        .try_get_with(key, async move {
+            match fetch_user_info(&bot, group_id, user_id).await {
+                Ok(info) => Ok(info),
+                Err(e) => {
+                    if let Some(stale) = USER_INFO_CACHE.get(&key).await {
+                        tracing::warn!("获取用户 {} 信息失败，使用缓存数据: {}", user_id, e);
+                        Ok(stale)
+                    } else {
+                        Err(e.to_string())
+                    }
+                }
+            }
+        })
+        .await
+    {
+        Ok(info) => Ok(info),
+        Err(arc) => {
+            USER_INFO_CACHE.invalidate(&key).await;
+            Err(anyhow::anyhow!("{arc}"))
         }
     }
 }
 
 async fn fetch_user_info(bot: &RuntimeBot, group_id: i64, user_id: i64) -> Result<UserInfo> {
+    let (uid, nickname) = fetch_member_with_retry(bot, group_id, user_id).await?;
+
+    let avatar = fetch_avatar_with_retry(user_id).await.unwrap_or_else(|e| {
+        tracing::warn!("获取头像失败，user_id={}: {}", user_id, e);
+        bytes::Bytes::new()
+    });
+
+    Ok(UserInfo {
+        user_id: uid,
+        nickname,
+        avatar,
+    })
+}
+
+async fn fetch_member_with_retry(
+    bot: &RuntimeBot,
+    group_id: i64,
+    user_id: i64,
+) -> Result<(i64, String)> {
     let mut last_err = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            let delay = match attempt {
-                1 => Duration::from_millis(200),
-                _ => Duration::from_millis(500),
-            };
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(RETRY_DELAY).await;
         }
 
-        let api_fut = async {
-            let resp = bot
-                .get_group_member_info(group_id, user_id, false)
-                .await
-                .map_err(|e| {
-                    tracing::error!("调用 API get_group_member_info 失败: {}", e);
-                    anyhow::anyhow!("获取群成员信息失败")
-                })?;
-            parse_member_info(resp).await
-        };
-        let avatar_fut = get_avatar(user_id);
-
-        let (member, avatar) = tokio::join!(api_fut, avatar_fut);
-
-        match member {
-            Ok((uid, nickname)) => {
-                let avatar = avatar.unwrap_or_else(|e| {
-                    tracing::warn!("获取头像失败，user_id={}: {}", user_id, e);
-                    bytes::Bytes::new()
-                });
-                return Ok(UserInfo {
-                    user_id: uid,
-                    nickname,
-                    avatar,
-                });
-            }
+        match bot.get_group_member_info(group_id, user_id, false).await {
+            Ok(resp) => match parse_member_info(resp).await {
+                Ok(info) => return Ok(info),
+                Err(e) => {
+                    tracing::warn!("解析群成员信息失败 (attempt {}): {}", attempt + 1, e);
+                    last_err = Some(e);
+                }
+            },
             Err(e) => {
-                last_err = Some(e);
+                tracing::error!(
+                    "调用 API get_group_member_info 失败 (attempt {}): {}",
+                    attempt + 1,
+                    e
+                );
+                last_err = Some(anyhow::anyhow!("获取群成员信息失败"));
             }
         }
     }
@@ -117,33 +130,47 @@ async fn parse_member_info(resp: kovi::ApiReturn) -> Result<(i64, String)> {
     Ok((item.user_id, nickname))
 }
 
-async fn get_avatar(user_id: i64) -> Result<bytes::Bytes> {
+async fn fetch_avatar_with_retry(user_id: i64) -> Result<bytes::Bytes> {
     let mut last_err = None;
 
-    for attempt in 0..=MAX_RETRIES {
+    for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            let delay = match attempt {
-                1 => Duration::from_millis(200),
-                _ => Duration::from_millis(500),
-            };
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(RETRY_DELAY).await;
         }
 
         let avatar_url = format!("https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640");
         match HTTP_CLIENT.get(&avatar_url).send().await {
-            Ok(resp) => match resp.error_for_status() {
-                Ok(resp) => match resp.bytes().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_client_error() {
+                    return Err(anyhow::anyhow!("头像请求客户端错误: {status}"));
+                }
+                if status.is_server_error() {
+                    last_err = Some(anyhow::anyhow!("头像请求服务器错误: {status}"));
+                    continue;
+                }
+
+                match resp.bytes().await {
                     Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-                    Ok(_) => last_err = Some(anyhow::anyhow!("头像为空")),
-                    Err(e) => last_err = Some(e.into()),
-                },
-                Err(e) => last_err = Some(e.into()),
-            },
-            Err(e) => last_err = Some(e.into()),
+                    Ok(_) => return Err(anyhow::anyhow!("头像为空")),
+                    Err(e) if is_avatar_retryable(&e) => {
+                        last_err = Some(e.into());
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) if is_avatar_retryable(&e) => {
+                last_err = Some(e.into());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("获取头像失败: user_id={}", user_id)))
+}
+
+fn is_avatar_retryable(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
 }
 
 #[cfg(test)]

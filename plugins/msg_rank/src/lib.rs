@@ -57,6 +57,7 @@ async fn main() {
     }
 
     db::init_db(&db_path).await.unwrap();
+    plugin::drop(|| async move { db::flush_on_shutdown().await });
 
     plugin::on_group_msg(add_msg);
     word_cloud::init().await.unwrap();
@@ -74,13 +75,13 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
         let msg = event.message.clone();
         kovi::spawn(async move {
             let text = get_text(&msg).await;
-            if let Err(e) = db::add_msg(group, user, &text).await {
+            if let Err(e) = db::add_msg(group, user, text).await {
                 tracing::error!("添加消息失败: {}", e);
             }
         });
     } else {
         let text = event.borrow_text().unwrap_or_default().to_string();
-        if let Err(e) = db::add_msg(group, user, &text).await {
+        if let Err(e) = db::add_msg(group, user, text).await {
             tracing::error!("添加消息失败: {}", e);
         }
     }
