@@ -128,6 +128,7 @@ pub async fn gen_rank_html_with_time_range(
                         user_id,
                         nickname: user_id.to_string(),
                         avatar: bytes::Bytes::new(),
+                        fetched_at: std::time::Instant::now(),
                     },
                     cnt,
                 ));

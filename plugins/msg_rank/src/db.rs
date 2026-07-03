@@ -15,7 +15,6 @@ static FLUSH_DONE_RX: OnceCell<Mutex<Option<oneshot::Receiver<()>>>> = OnceCell:
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 100;
 const BUFFER_CAPACITY: usize = 10_000;
-const MAX_FLUSH_RETRIES: u8 = 3;
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct MsgRecord {
@@ -27,14 +26,12 @@ struct MsgRecord {
 
 struct BufferState {
     records: Vec<MsgRecord>,
-    retry_count: u8,
 }
 
 impl BufferState {
     fn new() -> Self {
         Self {
             records: Vec::with_capacity(FLUSH_BATCH_SIZE),
-            retry_count: 0,
         }
     }
 
@@ -145,17 +142,12 @@ async fn flush_batch(state: &mut BufferState) {
     let pool = match get_pool() {
         Ok(pool) => pool,
         Err(e) => {
-            tracing::error!("批量写入失败，无法获取数据库连接: {}", e);
-            state.retry_count = state.retry_count.saturating_add(1);
-            if state.retry_count >= MAX_FLUSH_RETRIES {
-                tracing::error!(
-                    "批量写入在 {} 次重试后仍失败，丢弃 {} 条消息",
-                    MAX_FLUSH_RETRIES,
-                    chunk_size
-                );
-                state.records.drain(..chunk_size);
-                state.retry_count = 0;
-            }
+            // 保留批次，下次周期或新消息到达时自动重试。
+            tracing::error!(
+                "批量写入失败，无法获取数据库连接，保留 {} 条消息: {}",
+                chunk_size,
+                e
+            );
             return;
         }
     };
@@ -180,20 +172,10 @@ async fn flush_batch(state: &mut BufferState) {
     match query.execute(pool).await {
         Ok(_) => {
             state.records.drain(..chunk_size);
-            state.retry_count = 0;
         }
         Err(e) => {
-            tracing::error!("批量写入消息失败: {}", e);
-            state.retry_count = state.retry_count.saturating_add(1);
-            if state.retry_count >= MAX_FLUSH_RETRIES {
-                tracing::error!(
-                    "批量写入消息在 {} 次重试后仍然失败，丢弃 {} 条消息",
-                    MAX_FLUSH_RETRIES,
-                    chunk_size
-                );
-                state.records.drain(..chunk_size);
-                state.retry_count = 0;
-            }
+            // 保留批次，避免消息丢失；下次 flush 自动重试。
+            tracing::error!("批量写入消息失败，保留 {} 条消息: {}", chunk_size, e);
         }
     }
 }

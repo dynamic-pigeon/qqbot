@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use kovi::{RuntimeBot, serde_json, tokio};
@@ -13,6 +13,8 @@ pub(crate) struct UserInfo {
     pub user_id: i64,
     pub nickname: String,
     pub avatar: bytes::Bytes,
+    /// 条目被缓存的时间，用于区分 fresh / stale。
+    pub fetched_at: Instant,
 }
 
 #[derive(serde::Deserialize)]
@@ -26,11 +28,16 @@ static USER_INFO_CACHE: std::sync::LazyLock<Cache<(i64, i64), UserInfo>> =
     std::sync::LazyLock::new(|| {
         Cache::builder()
             .max_capacity(2048)
-            .time_to_live(Duration::from_secs(60 * 60))
+            // moka 缓存保留 24 小时，用于 stale fallback； freshness 由 fetched_at 控制。
+            .time_to_live(Duration::from_secs(60 * 60 * 24))
             .build()
     });
 
-const MAX_ATTEMPTS: usize = 2;
+/// 1 小时内视为 fresh，超过则触发后台刷新，失败时仍可回落到 stale 缓存。
+const FRESH_DURATION: Duration = Duration::from_secs(60 * 60);
+
+/// 含初始请求最多 3 次尝试：初始、200ms 后、500ms 后。
+const MAX_ATTEMPTS: usize = 3;
 const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(500)];
 
 fn retry_delay(attempt: usize) -> Duration {
@@ -40,15 +47,22 @@ fn retry_delay(attempt: usize) -> Duration {
         .unwrap_or(RETRY_DELAYS[RETRY_DELAYS.len() - 1])
 }
 
-/// 通过 bot API 获取单个群成员的 UserInfo（带缓存与重试）。
+/// 通过 bot API 获取单个群成员的 UserInfo（带缓存、stale fallback 与重试）。
 pub(super) async fn get_user_info(
     bot: &RuntimeBot,
     group_id: i64,
     user_id: i64,
 ) -> Result<UserInfo> {
     let key = (group_id, user_id);
-    let bot = bot.clone();
 
+    // fresh 缓存直接返回，不走 API。
+    if let Some(info) = USER_INFO_CACHE.get(&key).await
+        && info.fetched_at.elapsed() < FRESH_DURATION
+    {
+        return Ok(info);
+    }
+
+    let bot = bot.clone();
     match USER_INFO_CACHE
         .try_get_with(key, async move {
             fetch_user_info(&bot, group_id, user_id)
@@ -59,11 +73,11 @@ pub(super) async fn get_user_info(
     {
         Ok(info) => Ok(info),
         Err(arc) => {
+            // 刷新失败时，只要 moka 里还有条目（24 小时内），就作为 stale fallback 返回。
             if let Some(stale) = USER_INFO_CACHE.get(&key).await {
                 tracing::warn!("获取用户 {} 信息失败，使用缓存数据: {}", user_id, arc);
                 Ok(stale)
             } else {
-                USER_INFO_CACHE.invalidate(&key).await;
                 Err(anyhow::anyhow!("{arc}"))
             }
         }
@@ -84,6 +98,7 @@ async fn fetch_user_info(bot: &RuntimeBot, group_id: i64, user_id: i64) -> Resul
         user_id: uid,
         nickname,
         avatar,
+        fetched_at: Instant::now(),
     })
 }
 
@@ -189,6 +204,7 @@ mod tests {
             user_id: 123456,
             nickname: "test".to_string(),
             avatar: bytes::Bytes::from_static(b"avatar"),
+            fetched_at: Instant::now(),
         };
         USER_INFO_CACHE.insert((1, 123456), info.clone()).await;
 
