@@ -16,7 +16,7 @@ const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 100;
 const BUFFER_CAPACITY: usize = 10_000;
 const MAX_FLUSH_RETRIES: u8 = 3;
-const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct MsgRecord {
     group_id: i64,
@@ -121,8 +121,11 @@ fn init_buffer() {
                 _ = &mut shutdown_rx => {
                     while let Ok(record) = rx.try_recv() {
                         state.push(record);
+                        if state.len() >= FLUSH_BATCH_SIZE {
+                            flush_batch(&mut state).await;
+                        }
                     }
-                    if !state.is_empty() {
+                    while !state.is_empty() {
                         flush_batch(&mut state).await;
                     }
                     let _ = done_tx.send(());
@@ -138,6 +141,7 @@ async fn flush_batch(state: &mut BufferState) {
         return;
     }
 
+    let chunk_size = state.len().min(FLUSH_BATCH_SIZE);
     let pool = match get_pool() {
         Ok(pool) => pool,
         Err(e) => {
@@ -147,16 +151,16 @@ async fn flush_batch(state: &mut BufferState) {
                 tracing::error!(
                     "批量写入在 {} 次重试后仍失败，丢弃 {} 条消息",
                     MAX_FLUSH_RETRIES,
-                    state.len()
+                    chunk_size
                 );
-                state.records.clear();
+                state.records.drain(..chunk_size);
                 state.retry_count = 0;
             }
             return;
         }
     };
 
-    let placeholders: Vec<String> = (0..state.len())
+    let placeholders: Vec<String> = (0..chunk_size)
         .map(|_| "(?, ?, ?, ?)".to_string())
         .collect();
     let sql = format!(
@@ -165,7 +169,7 @@ async fn flush_batch(state: &mut BufferState) {
     );
 
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    for record in &state.records {
+    for record in &state.records[..chunk_size] {
         query = query
             .bind(record.group_id)
             .bind(record.user_id)
@@ -175,7 +179,7 @@ async fn flush_batch(state: &mut BufferState) {
 
     match query.execute(pool).await {
         Ok(_) => {
-            state.records.clear();
+            state.records.drain(..chunk_size);
             state.retry_count = 0;
         }
         Err(e) => {
@@ -185,9 +189,9 @@ async fn flush_batch(state: &mut BufferState) {
                 tracing::error!(
                     "批量写入消息在 {} 次重试后仍然失败，丢弃 {} 条消息",
                     MAX_FLUSH_RETRIES,
-                    state.len()
+                    chunk_size
                 );
-                state.records.clear();
+                state.records.drain(..chunk_size);
                 state.retry_count = 0;
             }
         }

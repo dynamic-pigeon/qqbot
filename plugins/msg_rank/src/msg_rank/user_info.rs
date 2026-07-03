@@ -31,7 +31,14 @@ static USER_INFO_CACHE: std::sync::LazyLock<Cache<(i64, i64), UserInfo>> =
     });
 
 const MAX_ATTEMPTS: usize = 2;
-const RETRY_DELAY: Duration = Duration::from_millis(200);
+const RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(200), Duration::from_millis(500)];
+
+fn retry_delay(attempt: usize) -> Duration {
+    RETRY_DELAYS
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .unwrap_or(RETRY_DELAYS[RETRY_DELAYS.len() - 1])
+}
 
 /// 通过 bot API 获取单个群成员的 UserInfo（带缓存与重试）。
 pub(super) async fn get_user_info(
@@ -44,36 +51,35 @@ pub(super) async fn get_user_info(
 
     match USER_INFO_CACHE
         .try_get_with(key, async move {
-            match fetch_user_info(&bot, group_id, user_id).await {
-                Ok(info) => Ok(info),
-                Err(e) => {
-                    if let Some(stale) = USER_INFO_CACHE.get(&key).await {
-                        tracing::warn!("获取用户 {} 信息失败，使用缓存数据: {}", user_id, e);
-                        Ok(stale)
-                    } else {
-                        Err(e.to_string())
-                    }
-                }
-            }
+            fetch_user_info(&bot, group_id, user_id)
+                .await
+                .map_err(|e| e.to_string())
         })
         .await
     {
         Ok(info) => Ok(info),
         Err(arc) => {
-            USER_INFO_CACHE.invalidate(&key).await;
-            Err(anyhow::anyhow!("{arc}"))
+            if let Some(stale) = USER_INFO_CACHE.get(&key).await {
+                tracing::warn!("获取用户 {} 信息失败，使用缓存数据: {}", user_id, arc);
+                Ok(stale)
+            } else {
+                USER_INFO_CACHE.invalidate(&key).await;
+                Err(anyhow::anyhow!("{arc}"))
+            }
         }
     }
 }
 
 async fn fetch_user_info(bot: &RuntimeBot, group_id: i64, user_id: i64) -> Result<UserInfo> {
-    let (uid, nickname) = fetch_member_with_retry(bot, group_id, user_id).await?;
+    let (member_result, avatar) =
+        tokio::join!(fetch_member_with_retry(bot, group_id, user_id), async {
+            fetch_avatar_with_retry(user_id).await.unwrap_or_else(|e| {
+                tracing::warn!("获取头像失败，user_id={}: {}", user_id, e);
+                bytes::Bytes::new()
+            })
+        });
 
-    let avatar = fetch_avatar_with_retry(user_id).await.unwrap_or_else(|e| {
-        tracing::warn!("获取头像失败，user_id={}: {}", user_id, e);
-        bytes::Bytes::new()
-    });
-
+    let (uid, nickname) = member_result?;
     Ok(UserInfo {
         user_id: uid,
         nickname,
@@ -90,7 +96,7 @@ async fn fetch_member_with_retry(
 
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
+            tokio::time::sleep(retry_delay(attempt)).await;
         }
 
         match bot.get_group_member_info(group_id, user_id, false).await {
@@ -135,7 +141,7 @@ async fn fetch_avatar_with_retry(user_id: i64) -> Result<bytes::Bytes> {
 
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(RETRY_DELAY).await;
+            tokio::time::sleep(retry_delay(attempt)).await;
         }
 
         let avatar_url = format!("https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640");
