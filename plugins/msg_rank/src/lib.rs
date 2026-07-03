@@ -65,14 +65,24 @@ async fn main() {
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
     let group = event.group_id;
+    let user = event.user_id;
 
-    let text = if config::read_config().notify_group.contains(&group) {
-        &get_text(&event.message).await
+    let needs_ocr = config::read_config().notify_group.contains(&group)
+        && event.message.iter().any(|seg| seg.kind == "image");
+
+    if needs_ocr {
+        let msg = event.message.clone();
+        kovi::spawn(async move {
+            let text = get_text(&msg).await;
+            if let Err(e) = db::add_msg(group, user, &text).await {
+                tracing::error!("添加消息失败: {}", e);
+            }
+        });
     } else {
-        event.borrow_text().unwrap_or_default()
-    };
-    if let Err(e) = db::add_msg(event.group_id, event.user_id, text).await {
-        tracing::error!("添加消息失败: {}", e);
+        let text = event.borrow_text().unwrap_or_default().to_string();
+        if let Err(e) = db::add_msg(group, user, &text).await {
+            tracing::error!("添加消息失败: {}", e);
+        }
     }
 }
 
