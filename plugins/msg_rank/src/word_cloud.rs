@@ -34,8 +34,8 @@ const WORDCLOUD_ANGLES: [f32; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 pub(crate) async fn init() -> Result<()> {
     help_msg::register_help(
         "wordcloud",
-        "启用或禁用词云功能（管理员专用命令）",
-        "/wordcloud enable - 启用词云功能\n/wordcloud disable - 禁用词云功能",
+        "启用、禁用或临时生成词云（管理员专用命令）",
+        "/wordcloud enable - 启用词云功能\n/wordcloud disable - 禁用词云功能\n/wordcloud once - 立即生成一次今日词云",
     )
     .await;
     let bot = plugin::get_runtime_bot();
@@ -86,7 +86,7 @@ pub(crate) async fn init() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<RuntimeBot>) {
+async fn cmd_handler(event: Arc<GroupMsgEvent>, path: Arc<PathBuf>, bot: Arc<RuntimeBot>) {
     let group_id = event.group_id;
 
     let text = event.borrow_text().unwrap_or_default();
@@ -103,6 +103,16 @@ async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<Ru
         .any(|id| id.try_as_i64() == Some(event.user_id))
     {
         event.reply("❌ 管理员专用命令，普通用户无法使用");
+        return;
+    }
+
+    let cmd = msg.trim();
+
+    if cmd == "once" {
+        event.reply("⏳ 正在生成词云...");
+        kovi::spawn(async move {
+            send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "临时词云").await;
+        });
         return;
     }
 
@@ -138,7 +148,6 @@ async fn cmd_handler(event: Arc<GroupMsgEvent>, _path: Arc<PathBuf>, bot: Arc<Ru
         }
     };
 
-    let cmd = msg.trim();
     match exe_cmd(cmd, group_id).await {
         Ok(res) => {
             event.reply(res);
