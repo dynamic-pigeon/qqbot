@@ -250,8 +250,8 @@ fn generate_word_cloud_image(
     let mut builder = WordCloudBuilder::new()
         .size(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .colors(WORDCLOUD_COLORS)
-        // Python wordcloud 默认 margin=2。
-        .padding(2)
+        // 词间距调小，让布局更紧凑。
+        .padding(1)
         // Python wordcloud 默认 prefer_horizontal=0.9。
         .angles(WORDCLOUD_ANGLES.to_vec())
         // Python wordcloud 默认 min_font_size=4，让高频词与长尾词差距更明显。
