@@ -2,10 +2,21 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use kovi::tokio::sync::OnceCell;
+use kovi::tokio::sync::{OnceCell, mpsc};
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
 static SQLITE_POOL: OnceCell<SqlitePool> = OnceCell::const_new();
+static MSG_SENDER: OnceCell<mpsc::UnboundedSender<MsgRecord>> = OnceCell::const_new();
+
+const FLUSH_INTERVAL_SECS: u64 = 5;
+const FLUSH_BATCH_SIZE: usize = 100;
+
+struct MsgRecord {
+    group_id: i64,
+    user_id: i64,
+    msg: String,
+    timestamp: i64,
+}
 
 pub(crate) async fn init_db(path: &Path) -> Result<()> {
     SQLITE_POOL
@@ -13,6 +24,7 @@ pub(crate) async fn init_db(path: &Path) -> Result<()> {
         .await?;
 
     init_table().await?;
+    init_buffer();
     Ok(())
 }
 
@@ -45,16 +57,78 @@ fn build_pool(path: &Path) -> Result<SqlitePool> {
         .connect_lazy(url)?)
 }
 
+fn init_buffer() {
+    let (tx, mut rx) = mpsc::unbounded_channel::<MsgRecord>();
+    MSG_SENDER.set(tx).expect("消息缓冲区只能初始化一次");
+
+    kovi::tokio::spawn(async move {
+        let mut batch: Vec<MsgRecord> = Vec::with_capacity(FLUSH_BATCH_SIZE);
+        let mut interval = kovi::tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
+
+        loop {
+            kovi::tokio::select! {
+                Some(record) = rx.recv() => {
+                    batch.push(record);
+                    if batch.len() >= FLUSH_BATCH_SIZE {
+                        flush_batch(&mut batch).await;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !batch.is_empty() {
+                        flush_batch(&mut batch).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn flush_batch(batch: &mut Vec<MsgRecord>) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let placeholders: Vec<String> = (0..batch.len())
+        .map(|_| "(?, ?, ?, ?)".to_string())
+        .collect();
+    let sql = format!(
+        "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES {}",
+        placeholders.join(", ")
+    );
+
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+    for record in batch.iter() {
+        query = query
+            .bind(record.group_id)
+            .bind(record.user_id)
+            .bind(&record.msg)
+            .bind(record.timestamp);
+    }
+
+    match query.execute(get_pool().unwrap()).await {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("批量写入消息失败: {}", e);
+        }
+    }
+
+    batch.clear();
+}
+
 pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: &str) -> Result<()> {
     let timestamp = chrono::Local::now().timestamp();
-    let conn = get_pool()?;
-    sqlx::query("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?)")
-        .bind(group_id)
-        .bind(user_id)
-        .bind(msg)
-        .bind(timestamp)
-        .execute(conn)
-        .await?;
+    let record = MsgRecord {
+        group_id,
+        user_id,
+        msg: msg.to_string(),
+        timestamp,
+    };
+    let sender = MSG_SENDER
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("消息缓冲区未初始化"))?;
+    sender
+        .send(record)
+        .map_err(|_| anyhow::anyhow!("消息缓冲区已关闭"))?;
     Ok(())
 }
 
@@ -95,7 +169,7 @@ pub(crate) async fn select_from_time_range(
     let conn = get_pool()?;
     let rows: Vec<(String,)> = sqlx::query_as(
         "
-SELECT msg FROM MSG 
+SELECT msg FROM MSG
     WHERE group_id = ? AND timestamp BETWEEN ? AND ?
 ",
     )
@@ -134,7 +208,6 @@ ON MSG (group_id, timestamp, user_id);
     .execute(conn)
     .await?;
 
-    // 清理旧版冗余索引：新索引已覆盖该索引的查询场景。
     sqlx::query("DROP INDEX IF EXISTS idx_msg_group_time;")
         .execute(conn)
         .await?;
@@ -147,4 +220,22 @@ fn get_pool() -> Result<&'static SqlitePool> {
     SQLITE_POOL
         .get()
         .ok_or_else(|| anyhow::anyhow!("数据库未初始化"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_placeholders_for_batch_insert() {
+        let placeholders: Vec<String> = (0..3).map(|_| "(?, ?, ?, ?)".to_string()).collect();
+        let sql = format!(
+            "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES {}",
+            placeholders.join(", ")
+        );
+        assert_eq!(
+            sql,
+            "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)"
+        );
+    }
 }
