@@ -224,8 +224,6 @@ fn get_pool() -> Result<&'static SqlitePool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_build_placeholders_for_batch_insert() {
         let placeholders: Vec<String> = (0..3).map(|_| "(?, ?, ?, ?)".to_string()).collect();
