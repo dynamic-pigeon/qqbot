@@ -15,19 +15,21 @@ use crate::config::{modify_config, read_config};
 
 static JIEBA: LazyLock<jieba_rs::Jieba> = LazyLock::new(jieba_rs::Jieba::new);
 
-/// 输出词云布局尺寸。实际 PNG 通过 `to_png(2.0)` 渲染成 800×800，
-/// 既保持 400×400 布局的紧凑填充，又获得高清晰度。
+/// 输出词云布局尺寸。实际 PNG 通过 `to_png(2.0)` 渲染成 800×800。
 const WORDCLOUD_WIDTH: u32 = 400;
 const WORDCLOUD_HEIGHT: u32 = 400;
 
-/// 最大词数。
-const MAX_WORDS: usize = 150;
+/// 最大词数，与 Python wordcloud 默认值对齐。
+const MAX_WORDS: usize = 200;
 
-/// 接近 Python wordcloud 默认 viridis 风格的配色。
+/// Python wordcloud 默认 viridis 配色。
 const WORDCLOUD_COLORS: [&str; 10] = [
     "#440154", "#472878", "#3e4a89", "#31688e", "#26828e", "#21918c", "#35b779", "#90d743",
     "#fde725", "#5c2686",
 ];
+
+/// Python wordcloud 默认 `prefer_horizontal=0.9`，这里用 9 个 0° 配 1 个 90° 近似。
+const WORDCLOUD_ANGLES: [f32; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 90.0];
 
 pub(crate) async fn init() -> Result<()> {
     help_msg::register_help(
@@ -239,10 +241,12 @@ fn generate_word_cloud_image(
     let mut builder = WordCloudBuilder::new()
         .size(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .colors(WORDCLOUD_COLORS)
+        // Python wordcloud 默认 margin=2。
         .padding(2)
-        // 同时允许横排（0°）和侧躺（±90°）。
-        // 不开启 vertical_writing，因此 90° 的词是整体旋转侧躺，而非字符直立竖排。
-        .angles(vec![0.0, -90.0, 90.0]);
+        // Python wordcloud 默认 prefer_horizontal=0.9。
+        .angles(WORDCLOUD_ANGLES.to_vec())
+        // Python wordcloud 默认 min_font_size=4，让高频词与长尾词差距更明显。
+        .font_size_range(4.0, 120.0);
 
     // 加载自定义字体（如果 data 目录下存在 font.otf）。
     let font_path = path.join("font.otf");
