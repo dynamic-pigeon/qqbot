@@ -81,9 +81,11 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
         });
     } else {
         let text = event.borrow_text().unwrap_or_default().to_string();
-        if let Err(e) = db::add_msg(group, user, text).await {
-            tracing::error!("添加消息失败: {}", e);
-        }
+        kovi::spawn(async move {
+            if let Err(e) = db::add_msg(group, user, text).await {
+                tracing::error!("添加消息失败: {}", e);
+            }
+        });
     }
 }
 
