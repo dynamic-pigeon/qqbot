@@ -1,5 +1,6 @@
 /target
 kovi.conf.toml
+AGENTS.md
 kovi.plugin.toml
 data/
 .*

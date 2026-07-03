@@ -201,7 +201,7 @@ async fn make_word_cloud(
     .join(" ");
 
     let raw_words: Vec<String> = JIEBA
-        .cut(&messages, true)
+        .cut_all(&messages)
         .into_iter()
         .map(|t| t.word.to_string())
         .filter(|s| s.chars().count() > 1)
