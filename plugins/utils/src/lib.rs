@@ -14,4 +14,4 @@ pub use safe_url::{
     is_public_ip, validate_image_url, validate_image_url_async,
     validate_image_url_async_with_options,
 };
-pub use screen_shot::{ContextGuard, get_context, screenshot};
+pub use screen_shot::{ScreenshotManager, screenshot};
