@@ -53,7 +53,7 @@ pub async fn init() -> Result<()> {
             }
             let reply = async {
                 let html = gen_daily_rank_html(&bot, event.group_id).await?;
-                let image = utils::screenshot(html.into(), None).await?;
+                let image = utils::screenshot(&html, None).await?;
                 Result::<Vec<u8>>::Ok(image)
             }
             .await;
