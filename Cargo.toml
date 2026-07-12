@@ -29,10 +29,6 @@ members = [
 ]
 
 [workspace.dependencies]
-playwright-rs = { version = "0.14", default-features = false, features = [
-    "rustls-tls-webpki-roots",
-    "macros",
-] }
 help_msg = { path = "plugins/help_msg" }
 kovi = "0.13.4"
 kovi-onebot = "0.13.1"
