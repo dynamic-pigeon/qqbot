@@ -14,9 +14,6 @@ pub struct Config {
     /// 词云背景色，araea-wordcloud 接收十六进制字符串。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
-    /// 是否对 OCR 图片 URL 做 DNS 预解析校验。默认关闭，避免本地 DNS 劫持导致误杀。
-    #[serde(default)]
-    pub validate_image_url_dns: bool,
     #[serde(skip)]
     pub path: PathBuf,
 }
@@ -39,7 +36,6 @@ impl Default for Config {
             notify_group: vec![],
             tencent: None,
             wordcloud_background: default_wordcloud_background(),
-            validate_image_url_dns: false,
             path: PathBuf::new(),
         }
     }
@@ -51,11 +47,28 @@ pub async fn init_config(path: PathBuf) -> Result<()> {
     let mut config: Config = kovi::utils::load_json_data(Default::default(), &path)
         .map_err(|e| anyhow::anyhow!("加载配置文件失败: {e}"))?;
     config.path = path;
+    if !config.path.exists() {
+        write_config(&config)?;
+    }
+    restrict_config_permissions(&config.path)?;
     let rcu = RcuCell::new(config);
 
     CONFIG
         .set(rcu)
         .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_config_permissions(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_config_permissions(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 

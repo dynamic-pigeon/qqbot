@@ -3,6 +3,22 @@ use kovi_onebot::{OneBotDriver, load_local_conf};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+#[cfg(unix)]
+fn restrict_sensitive_file(path: impl AsRef<std::path::Path>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let path = path.as_ref();
+    if !path.exists() {
+        return;
+    }
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = %path.display(), "无法收紧敏感文件权限: {error}");
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_sensitive_file(_path: impl AsRef<std::path::Path>) {}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 加载 .env 文件（如存在）；系统环境变量优先级高于 .env。
@@ -49,6 +65,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_thread_ids(true),
         )
         .init();
+
+    restrict_sensitive_file(".env");
+    restrict_sensitive_file("kovi.conf.toml");
 
     let driver_config = load_local_conf()?;
     let driver = OneBotDriver::new(driver_config);

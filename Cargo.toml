@@ -17,6 +17,7 @@ yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 dotenvy.workspace = true
+tracing.workspace = true
 
 [workspace]
 members = [
@@ -54,7 +55,6 @@ arc-swap = "1"
 thiserror = "2"
 dotenvy = "0.15"
 pulldown-cmark = "0.13"
-crossbeam-epoch = "0.9"
 regex = "1"
 urlencoding = "2"
 libc = "0.2"

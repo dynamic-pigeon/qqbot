@@ -14,23 +14,16 @@ pub fn warm_up() {
     let _ = fetch::SPACE_FEED_URL_PARSED.deref();
 }
 
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
-use moka::future::Cache;
 
 use crate::config;
 
-static LAST_SEEN: LazyLock<Cache<u64, i64>> = LazyLock::new(|| {
-    Cache::builder()
-        .max_capacity(1024)
-        .time_to_live(Duration::from_secs(86400))
-        .build()
-});
+static POLL_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
 pub async fn init() {
     let bot = plugin::get_runtime_bot();
@@ -42,6 +35,10 @@ pub async fn init() {
 }
 
 async fn scheduled_task(bot: std::sync::Arc<RuntimeBot>) {
+    let Ok(_poll_guard) = POLL_LOCK.try_lock() else {
+        tracing::warn!("上一轮动态轮询尚未结束，跳过本轮");
+        return;
+    };
     let cfg = crate::config::read_config();
     let uids: Vec<u64> = cfg
         .dynamic_subscribe
@@ -75,43 +72,77 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let last_seen = LAST_SEEN.get(&uid).await;
     let items = page.items;
+    let Some(latest_id) = items.iter().filter_map(dynamic_id_numeric).max() else {
+        return Ok(());
+    };
+    let mut updates = Vec::new();
 
-    if let Some(first) = items.first()
-        && let Some(id) = dynamic_id_numeric(first)
-        && last_seen.is_none()
-    {
-        LAST_SEEN.insert(uid, id).await;
-        return Ok(()); // 首次不推送历史
-    }
+    for group in groups {
+        let last_seen = cfg
+            .dynamic_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == group)
+            .map(|checkpoint| checkpoint.last_seen);
+        let Some(last_seen) = last_seen else {
+            updates.push((group, latest_id));
+            continue;
+        };
 
-    let mut new_items: Vec<&DynamicItem> = items
-        .iter()
-        .filter(|it| {
-            last_seen
-                .map(|last| dynamic_id_numeric(it).map(|id| id > last).unwrap_or(false))
-                .unwrap_or(false)
-        })
-        .collect();
-    // 旧→新 顺序推送
-    new_items.reverse();
+        let new_items = pending_items_after(&items, last_seen);
 
-    if let Some(first) = items.first()
-        && let Some(id) = dynamic_id_numeric(first)
-    {
-        LAST_SEEN.insert(uid, id).await;
-    }
-
-    for item in new_items {
-        let author = author_of(item);
-        for &group in &groups {
+        let mut delivered_through = last_seen;
+        for (id, item) in new_items {
+            let author = author_of(item);
             if let Err(e) = push_dynamic(bot, group, &author, item).await {
                 tracing::warn!("推送失败 uid={} group={}: {e}", uid, group);
+                break;
             }
+            delivered_through = id;
+        }
+        if delivered_through != last_seen {
+            updates.push((group, delivered_through));
         }
     }
+
+    if !updates.is_empty() {
+        config::modify_config(|cfg| {
+            for &(group, last_seen) in &updates {
+                let still_subscribed = cfg.dynamic_subscribe.iter().any(|subscription| {
+                    subscription.uid == uid && subscription.groups.contains(&group)
+                });
+                if !still_subscribed {
+                    continue;
+                }
+                if let Some(checkpoint) = cfg
+                    .dynamic_checkpoints
+                    .iter_mut()
+                    .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == group)
+                {
+                    checkpoint.last_seen = checkpoint.last_seen.max(last_seen);
+                } else {
+                    cfg.dynamic_checkpoints
+                        .push(crate::config::DynamicCheckpoint {
+                            uid,
+                            group,
+                            last_seen,
+                        });
+                }
+            }
+        })
+        .await?;
+    }
     Ok(())
+}
+
+fn pending_items_after(items: &[DynamicItem], last_seen: i64) -> Vec<(i64, &DynamicItem)> {
+    let mut pending: Vec<(i64, &DynamicItem)> = items
+        .iter()
+        .filter_map(|item| dynamic_id_numeric(item).map(|id| (id, item)))
+        .filter(|(id, _)| *id > last_seen)
+        .collect();
+    pending.sort_by_key(|(id, _)| *id);
+    pending
 }
 
 fn dynamic_id_numeric(item: &DynamicItem) -> Option<i64> {
@@ -204,6 +235,8 @@ pub async fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
                 cfg.dynamic_subscribe.remove(idx);
             }
         }
+        cfg.dynamic_checkpoints
+            .retain(|checkpoint| checkpoint.uid != uid || checkpoint.group != group);
     })
     .await
 }
@@ -322,14 +355,16 @@ fn format_author_header(author: &DynamicAuthor) -> String {
 }
 
 async fn fetch_image(url: &str) -> anyhow::Result<Bytes> {
-    utils::validate_image_url_async(url, ALLOWED_BILI_HOSTS).await?;
-
-    use crate::CLIENT;
-    let resp =
-        kovi::tokio::time::timeout(std::time::Duration::from_secs(15), CLIENT.get(url).send())
-            .await
-            .map_err(|_| anyhow::anyhow!("图片下载超时"))??;
-    Ok(resp.bytes().await?)
+    const MAX_DYNAMIC_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    let bytes = utils::download_image_limited(
+        url,
+        ALLOWED_BILI_HOSTS,
+        true,
+        MAX_DYNAMIC_IMAGE_BYTES,
+        Duration::from_secs(15),
+    )
+    .await?;
+    Ok(Bytes::from(bytes))
 }
 
 const MAX_PICS_PER_PUSH: usize = 3;
@@ -449,5 +484,19 @@ mod tests {
             author: DynamicAuthor::default(),
         };
         assert_eq!(dynamic_id_numeric(&a), Some(678));
+    }
+
+    #[test]
+    fn pending_items_are_filtered_and_sorted_oldest_first() {
+        let make_item = |id: &str| DynamicItem::Other {
+            id: id.to_string(),
+            author: DynamicAuthor::default(),
+        };
+        let items = vec![make_item("300"), make_item("100"), make_item("200")];
+        let ids: Vec<i64> = pending_items_after(&items, 100)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![200, 300]);
     }
 }

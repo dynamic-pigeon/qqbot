@@ -21,6 +21,8 @@ const WORDCLOUD_HEIGHT: u32 = 400;
 
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
+const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
+static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(2));
 
 /// Python wordcloud 默认 viridis 配色。
 const WORDCLOUD_COLORS: [&str; 10] = [
@@ -200,40 +202,44 @@ async fn make_word_cloud(
     notify_group: i64,
     duration: chrono::Duration,
 ) -> Result<Vec<u8>> {
+    let _permit = WORDCLOUD_POOL
+        .acquire(std::time::Duration::from_secs(10))
+        .await?;
     let end_time = chrono::Local::now();
     let start_time = end_time - duration;
 
-    let messages = crate::db::select_from_time_range(
+    let messages = crate::db::select_text_from_time_range(
         notify_group,
         start_time.timestamp(),
         end_time.timestamp(),
+        MAX_WORDCLOUD_INPUT_BYTES,
     )
-    .await?
-    .join(" ");
-
-    let raw_words: Vec<String> = JIEBA
-        .cut_all(&messages)
-        .into_iter()
-        .map(|t| t.word.to_string())
-        .filter(|s| s.chars().count() > 1)
-        .collect();
-
-    if raw_words.is_empty() {
+    .await?;
+    if messages.is_empty() {
         return Ok(Vec::new());
     }
 
     let stop_words = load_stop_words(path).await;
-    let items = count_words(raw_words, &stop_words);
-    if items.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let background = {
         let config = read_config();
         config.wordcloud_background.clone()
     };
-
-    generate_word_cloud_image(path, items, &background)
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let raw_words: Vec<String> = JIEBA
+            .cut_all(&messages)
+            .into_iter()
+            .map(|t| t.word.to_string())
+            .filter(|s| s.chars().count() > 1)
+            .collect();
+        let items = count_words(raw_words, &stop_words);
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        generate_word_cloud_image(&path, items, &background)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("词云后台任务失败: {e}"))?
 }
 
 /// 使用 araea-wordcloud 直接生成 PNG 词云图。

@@ -1,7 +1,18 @@
-use std::fmt::Display;
+use std::{fmt::Display, sync::LazyLock, time::Duration};
 
 use anyhow::Result;
 use bytes::Bytes;
+
+const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("hardcoded reqwest client configuration must be valid")
+});
 
 #[derive(serde::Deserialize)]
 struct ApiRes {
@@ -43,7 +54,9 @@ pub async fn fetch_card(name: &str) -> Result<Card> {
         "https://ygocdb.com/api/v0/?search={}",
         urlencoding::encode(name)
     );
-    let resp: ApiRes = reqwest::get(&url).await?.json().await?;
+    let response = HTTP_CLIENT.get(&url).send().await?;
+    let body = utils::read_response_limited(response, MAX_API_RESPONSE_BYTES).await?;
+    let resp: ApiRes = serde_json::from_slice(&body)?;
     let ret = resp
         .result
         .into_iter()
@@ -54,7 +67,13 @@ pub async fn fetch_card(name: &str) -> Result<Card> {
 
 async fn fetch_img(card_id: u64) -> Result<Bytes> {
     let url = format!("https://cdn.233.momobako.com/ygopro/pics/{}.jpg", card_id);
-    let resp = reqwest::get(&url).await?;
-    let bytes = resp.bytes().await?;
-    Ok(bytes)
+    let bytes = utils::download_image_limited(
+        &url,
+        &["cdn.233.momobako.com"],
+        true,
+        MAX_CARD_IMAGE_BYTES,
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(Bytes::from(bytes))
 }
