@@ -72,8 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver_config = load_local_conf()?;
     let driver = OneBotDriver::new(driver_config);
 
-    let bot =
-        kovi::build_bot!(driver; kovi_plugin_cmd, msg_rank, help_msg, markdown, yu_gi_oh, bilibili);
+    // 由应用统一安装 tracing subscriber，Kovi 不再重复注册全局 logger。
+    let kovi_config = kovi::load_local_conf()?;
+    let mut bot = kovi::Bot::build(kovi_config, driver);
+    let plugin_set = kovi::plugins!(
+        kovi_plugin_cmd,
+        msg_rank,
+        help_msg,
+        markdown,
+        yu_gi_oh,
+        bilibili
+    );
+    bot.mount_plugin_set(plugin_set);
+    bot.set_plugin_startup_use_file_ref();
 
     bot.run().await;
     Ok(())

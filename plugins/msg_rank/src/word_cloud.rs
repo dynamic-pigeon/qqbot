@@ -1,23 +1,26 @@
 use std::{
     collections::HashMap,
+    io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
 
 use anyhow::Result;
-use araea_wordcloud::{WordCloudBuilder, WordInput};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, Pixel as _, Rgba, imageops::FilterType};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, tokio};
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
 use tracing::{self, info};
+use wordcloud::{Mask, WordCloud};
 
 use crate::config::{modify_config, read_config};
 
 static JIEBA: LazyLock<jieba_rs::Jieba> = LazyLock::new(jieba_rs::Jieba::new);
 
-/// 输出词云布局尺寸。实际 PNG 通过 `to_png(2.0)` 渲染成 800×800。
+/// 输出词云布局尺寸。实际 PNG 通过 2 倍 scale 渲染成 800×800。
 const WORDCLOUD_WIDTH: u32 = 400;
 const WORDCLOUD_HEIGHT: u32 = 400;
+const WORDCLOUD_SCALE: u32 = 2;
 
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
@@ -25,13 +28,18 @@ const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
 static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(2));
 
 /// Python wordcloud 默认 viridis 配色。
-const WORDCLOUD_COLORS: [&str; 10] = [
-    "#440154", "#472878", "#3e4a89", "#31688e", "#26828e", "#21918c", "#35b779", "#90d743",
-    "#fde725", "#5c2686",
+const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
+    Rgba([68, 1, 84, 255]),
+    Rgba([71, 40, 120, 255]),
+    Rgba([62, 74, 137, 255]),
+    Rgba([49, 104, 142, 255]),
+    Rgba([38, 130, 142, 255]),
+    Rgba([33, 145, 140, 255]),
+    Rgba([53, 183, 121, 255]),
+    Rgba([144, 215, 67, 255]),
+    Rgba([253, 231, 37, 255]),
+    Rgba([92, 38, 134, 255]),
 ];
-
-/// Python wordcloud 默认 `prefer_horizontal=0.9`，这里用 9 个 0° 配 1 个 90° 近似。
-const WORDCLOUD_ANGLES: [f32; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 90.0];
 
 pub(crate) async fn init() -> Result<()> {
     help_msg::register_help(
@@ -242,73 +250,87 @@ async fn make_word_cloud(
     .map_err(|e| anyhow::anyhow!("词云后台任务失败: {e}"))?
 }
 
-/// 使用 araea-wordcloud 直接生成 PNG 词云图。
+/// 使用 wordcloud-rs 直接生成 PNG 词云图。
 fn generate_word_cloud_image(
     path: &Path,
     items: Vec<WordCloudItem>,
     background: &str,
 ) -> Result<Vec<u8>> {
-    let words: Vec<WordInput> = items
-        .into_iter()
-        .map(|item| WordInput::new(item.word, item.weight as f32))
-        .collect();
+    let frequencies = items.into_iter().map(|item| (item.word, item.weight));
 
-    let mut builder = WordCloudBuilder::new()
-        .size(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
-        .colors(WORDCLOUD_COLORS)
+    let mut builder = WordCloud::builder()
+        .dimensions(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
+        .scale(WORDCLOUD_SCALE)
+        .max_words(MAX_WORDS)
         // 词间距调小，让布局更紧凑。
-        .padding(1)
+        .margin(1)
         // Python wordcloud 默认 prefer_horizontal=0.9。
-        .angles(WORDCLOUD_ANGLES.to_vec())
+        .prefer_horizontal(0.9)
         // Python wordcloud 默认 min_font_size=4，让高频词与长尾词差距更明显。
-        .font_size_range(4.0, 120.0);
+        .min_font_size(4.0)
+        .max_font_size(120.0)
+        .palette(WORDCLOUD_COLORS)
+        .background_color(parse_background_color(background));
 
-    // 加载自定义字体（如果 data 目录下存在 font.otf）。
+    // 中文渲染需要 data 目录下的 font.otf 覆盖相应字形。
     let font_path = path.join("font.otf");
     if font_path.exists() {
-        let font_bytes =
-            std::fs::read(&font_path).map_err(|e| anyhow::anyhow!("读取字体失败: {e}"))?;
-        builder = builder.font(font_bytes);
+        builder = builder.font_path(font_path);
     }
 
     // 加载自定义遮罩（如果 data 目录下存在 mask.png / mask.jpg）。
-    if let Some(mask_bytes) = load_mask(path) {
-        let mask_bytes = mask_bytes.map_err(|e| anyhow::anyhow!("读取遮罩失败: {e}"))?;
-        builder = builder.mask(mask_bytes);
+    if let Some(mask) = load_mask(path)? {
+        builder = builder.mask(mask);
     }
 
-    // 设置背景色，araea-wordcloud 要求十六进制字符串。
-    let background_hex = normalize_background_color(background);
-    builder = builder.background(&background_hex);
-
     let wordcloud = builder
-        .build(&words)
+        .build()
+        .map_err(|e| anyhow::anyhow!("初始化词云生成器失败: {e}"))?;
+    let image = wordcloud
+        .generate_from_frequencies(frequencies)
         .map_err(|e| anyhow::anyhow!("生成词云失败: {e}"))?;
 
-    wordcloud
-        .to_png(2.0)
-        .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}"))
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut png, ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}"))?;
+    Ok(png.into_inner())
 }
 
 /// 尝试读取 data/mask.png 或 data/mask.jpg 作为词云遮罩。
 ///
-/// 注意：araea-wordcloud 把**深色区域**视为可放置文字的区域，
-/// **浅色/白色/透明区域**视为被遮挡的区域。因此遮罩图片应让目标形状为深色，
-/// 背景为浅色，这与 Python wordcloud 的遮罩约定一致。
-fn load_mask(path: &Path) -> Option<Result<Vec<u8>, std::io::Error>> {
+/// 纯白和透明区域禁止放置文字，其他区域允许放置，与 Python wordcloud 的约定一致。
+fn load_mask(path: &Path) -> Result<Option<Mask>> {
     for name in ["mask.png", "mask.jpg", "mask.jpeg"] {
         let mask_path = path.join(name);
         if mask_path.exists() {
-            return Some(std::fs::read(&mask_path));
+            let bytes = std::fs::read(&mask_path)
+                .map_err(|e| anyhow::anyhow!("读取遮罩失败 {}: {e}", mask_path.display()))?;
+            let image = image::load_from_memory(&bytes)
+                .map_err(|e| anyhow::anyhow!("解析遮罩失败 {}: {e}", mask_path.display()))?
+                .resize_exact(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT, FilterType::Nearest)
+                .to_rgba8();
+            let grayscale = GrayImage::from_fn(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT, |x, y| {
+                let pixel = image.get_pixel(x, y);
+                if pixel[3] < 128 {
+                    Luma([255])
+                } else {
+                    pixel.to_luma()
+                }
+            });
+            return Ok(Some(Mask::from_luma8(grayscale)));
         }
     }
-    None
+    Ok(None)
 }
 
 /// 将常见颜色名或十六进制字符串统一为 #RRGGBB。
 fn normalize_background_color(color: &str) -> String {
     let color = color.trim();
-    if color.starts_with('#') && color.len() == 7 {
+    if color.starts_with('#')
+        && color.len() == 7
+        && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return color.to_string();
     }
 
@@ -325,6 +347,12 @@ fn normalize_background_color(color: &str) -> String {
             "#FFFFFF".to_string()
         }
     }
+}
+
+fn parse_background_color(color: &str) -> Rgba<u8> {
+    let color = normalize_background_color(color);
+    let parse = |range| u8::from_str_radix(&color[range], 16).unwrap_or(255);
+    Rgba([parse(1..3), parse(3..5), parse(5..7), 255])
 }
 
 async fn load_stop_words(path: &Path) -> Vec<String> {
@@ -364,7 +392,6 @@ fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> 
     items
 }
 
-#[derive(serde::Serialize)]
 struct WordCloudItem {
     word: String,
     weight: u32,
@@ -405,25 +432,36 @@ mod tests {
         assert_eq!(normalize_background_color("white"), "#FFFFFF");
         assert_eq!(normalize_background_color("black"), "#000000");
         assert_eq!(normalize_background_color("unknown"), "#FFFFFF");
+        assert_eq!(normalize_background_color("#zzzzzz"), "#FFFFFF");
+        assert_eq!(parse_background_color("#161628"), Rgba([22, 22, 40, 255]));
     }
 
-    /// 直接生成词云 PNG 验证 araea-wordcloud 集成。默认忽略，需手动运行。
-    /// cargo test -p msg_rank test_wordcloud_generate_direct -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn test_wordcloud_generate_direct() {
-        let text = std::fs::read_to_string("/tmp/article.txt").unwrap();
-        let raw_words: Vec<String> = JIEBA
-            .cut(&text, true)
-            .into_iter()
-            .map(|t| t.word.to_string())
-            .filter(|s| s.chars().count() > 1)
-            .collect();
-        let items = count_words(raw_words, &[]);
+    #[test]
+    fn test_wordcloud_generate_direct() {
+        let items = vec![
+            WordCloudItem {
+                word: "rust".to_string(),
+                weight: 10,
+            },
+            WordCloudItem {
+                word: "wordcloud".to_string(),
+                weight: 8,
+            },
+            WordCloudItem {
+                word: "layout".to_string(),
+                weight: 6,
+            },
+        ];
+
         let png = generate_word_cloud_image(Path::new("/nonexistent"), items, "white").unwrap();
-        assert!(!png.is_empty());
-        tokio::fs::write("/tmp/wordcloud_test.png", &png)
-            .await
-            .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (800, 800));
+        assert!(
+            image
+                .pixels()
+                .any(|pixel| *pixel != Rgba([255, 255, 255, 255]))
+        );
     }
 }
