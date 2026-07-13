@@ -58,3 +58,15 @@ pulldown-cmark = "0.13"
 regex = "1"
 urlencoding = "2"
 libc = "0.2"
+
+ammonia = "4"
+chrono = "0.4"
+chromiumoxide = "0.9"
+hmac = "0.13"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+jieba-rs = "0.10"
+rand = "0.10"
+serde_json = "1.0"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "rt"] }
+wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs" }

@@ -18,6 +18,7 @@ OneBot 连接配置位于本地 `kovi.conf.toml`，插件启用和访问控制�
 - 只有机器人管理员执行 `/wordcloud enable` 后，该群消息才会进入排行数据库。
 - 单条入库文本最多 4 KiB，最多保留 8 天；图片 OCR 每条消息最多处理 3 张。
 - `/wordcloud disable` 会停止继续采集。已有数据将在保留期到期后自动清理。
+- 中文词云需在 `data/msg_rank/font.otf` 放置覆盖中文字符的字体；未提供时使用 `wordcloud-rs` 内嵌的英文字体。
 - Markdown、OCR、截图和外部图片下载均有输入、并发、超时和响应体大小限制。
 - 公网部署前应在 `kovi.plugin.toml` 中启用插件访问控制并配置允许的好友或群组。
 

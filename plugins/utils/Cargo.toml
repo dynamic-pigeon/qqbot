@@ -8,12 +8,12 @@ pulldown-cmark.workspace = true
 kovi.workspace = true
 anyhow.workspace = true
 askama.workspace = true
-chromiumoxide = "0.9"
+chromiumoxide.workspace = true
 futures.workspace = true
 tracing.workspace = true
 arc-swap.workspace = true
 reqwest.workspace = true
-ammonia = "4"
+ammonia.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio.workspace = true

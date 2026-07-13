@@ -11,7 +11,7 @@ static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mute
 pub struct Config {
     pub notify_group: Vec<i64>,
     pub tencent: Option<TencentCloudConfig>,
-    /// 词云背景色，araea-wordcloud 接收十六进制字符串。
+    /// 词云背景色，支持 #RRGGBB 和常见颜色名。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
     #[serde(skip)]
