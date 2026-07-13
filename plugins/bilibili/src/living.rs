@@ -151,10 +151,16 @@ async fn notify(
     }
 }
 
-async fn fetch_img(url: &str) -> Result<Bytes, reqwest::Error> {
-    let resp = CLIENT.get(url).send().await?;
-    let bytes = resp.bytes().await?;
-    Ok(bytes)
+async fn fetch_img(url: &str) -> anyhow::Result<Bytes> {
+    let bytes = utils::download_image_limited(
+        url,
+        crate::dynamics::ALLOWED_BILI_HOSTS,
+        true,
+        10 * 1024 * 1024,
+        std::time::Duration::from_secs(10),
+    )
+    .await?;
+    Ok(Bytes::from(bytes))
 }
 
 pub async fn check_uid(uid: u64) -> bool {

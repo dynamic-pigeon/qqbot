@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures::TryStreamExt as _;
 use kovi::tokio::sync::{OnceCell, mpsc, oneshot};
 use kovi::tokio::time::timeout;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -16,6 +17,7 @@ const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 100;
 const BUFFER_CAPACITY: usize = 10_000;
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
+const MESSAGE_RETENTION_SECS: i64 = 8 * 24 * 60 * 60;
 
 struct MsgRecord {
     group_id: i64,
@@ -49,12 +51,38 @@ impl BufferState {
 }
 
 pub(crate) async fn init_db(path: &Path) -> Result<()> {
+    restrict_database_permissions(path).await?;
     SQLITE_POOL
         .get_or_try_init(async || build_pool(path))
         .await?;
 
     init_table().await?;
+    restrict_database_permissions(path).await?;
     init_buffer();
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn restrict_database_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut paths = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        paths.push(sidecar.into());
+    }
+    for candidate in paths {
+        if candidate.exists() {
+            kovi::tokio::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn restrict_database_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -101,6 +129,7 @@ fn init_buffer() {
     kovi::tokio::spawn(async move {
         let mut state = BufferState::new();
         let mut interval = kovi::tokio::time::interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
+        let mut cleanup_interval = kovi::tokio::time::interval(Duration::from_secs(24 * 60 * 60));
 
         loop {
             kovi::tokio::select! {
@@ -113,6 +142,11 @@ fn init_buffer() {
                 _ = interval.tick() => {
                     if !state.is_empty() {
                         flush_batch(&mut state).await;
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    if let Err(e) = delete_expired_messages().await {
+                        tracing::error!("清理过期消息失败: {e}");
                     }
                 }
                 _ = &mut shutdown_rx => {
@@ -252,25 +286,59 @@ SELECT user_id, COUNT(*) as count FROM MSG
         .collect())
 }
 
-pub(crate) async fn select_from_time_range(
+pub(crate) async fn select_text_from_time_range(
     group_id: i64,
     start_time: i64,
     end_time: i64,
-) -> Result<Vec<String>> {
+    max_bytes: usize,
+) -> Result<String> {
     let conn = get_pool()?;
-    let rows: Vec<(String,)> = sqlx::query_as(
+    let mut rows = sqlx::query_as::<_, (String,)>(
         "
 SELECT msg FROM MSG
     WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+    ORDER BY timestamp DESC
 ",
     )
     .bind(group_id)
     .bind(start_time)
     .bind(end_time)
-    .fetch_all(conn)
-    .await?;
+    .fetch(conn);
 
-    Ok(rows.into_iter().map(|row| row.0).collect())
+    let mut text = String::with_capacity(max_bytes.min(64 * 1024));
+    while let Some((message,)) = rows.try_next().await? {
+        let separator_len = usize::from(!text.is_empty());
+        let remaining = max_bytes.saturating_sub(text.len() + separator_len);
+        if remaining == 0 {
+            break;
+        }
+        if separator_len != 0 {
+            text.push(' ');
+        }
+        if message.len() <= remaining {
+            text.push_str(&message);
+            continue;
+        }
+        let mut boundary = remaining;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.push_str(&message[..boundary]);
+        break;
+    }
+    Ok(text)
+}
+
+async fn delete_expired_messages() -> Result<u64> {
+    let cutoff = chrono::Local::now().timestamp() - MESSAGE_RETENTION_SECS;
+    let result = sqlx::query("DELETE FROM MSG WHERE timestamp < ?")
+        .bind(cutoff)
+        .execute(get_pool()?)
+        .await?;
+    if result.rows_affected() > 0 {
+        tracing::info!("已清理 {} 条过期消息", result.rows_affected());
+    }
+    Ok(result.rows_affected())
 }
 
 async fn init_table() -> Result<()> {
@@ -361,6 +429,22 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(total.0, 3);
+
+            let text = select_text_from_time_range(1, 0, i64::MAX, 7)
+                .await
+                .unwrap();
+            assert!(text.len() <= 7);
+            assert!(text.is_char_boundary(text.len()));
+
+            sqlx::query("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?)")
+                .bind(1_i64)
+                .bind(100_i64)
+                .bind("expired")
+                .bind(chrono::Local::now().timestamp() - MESSAGE_RETENTION_SECS - 1)
+                .execute(get_pool().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(delete_expired_messages().await.unwrap(), 1);
         });
 
         let _ = std::fs::remove_file(&tmp);

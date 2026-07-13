@@ -139,9 +139,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "araea-wordcloud"
@@ -410,7 +410,6 @@ dependencies = [
  "help_msg",
  "kovi",
  "kovi-onebot",
- "moka",
  "regex",
  "reqwest",
  "serde",
@@ -479,6 +478,7 @@ dependencies = [
  "kovi-plugin-cmd",
  "markdown",
  "msg_rank",
+ "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "yu_gi_oh",
@@ -824,9 +824,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2238,6 +2238,7 @@ dependencies = [
  "help_msg",
  "kovi",
  "kovi-onebot",
+ "tracing",
  "utils",
 ]
 
@@ -4508,9 +4509,9 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "anyhow",
+ "arc-swap",
  "askama",
  "chromiumoxide",
- "crossbeam-epoch",
  "futures",
  "kovi",
  "pulldown-cmark",
@@ -5119,8 +5120,10 @@ dependencies = [
  "kovi-onebot",
  "reqwest",
  "serde",
+ "serde_json",
  "tracing",
  "urlencoding",
+ "utils",
 ]
 
 [[package]]

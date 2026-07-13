@@ -5,8 +5,6 @@ use kovi::{RuntimeBot, serde_json, tokio};
 use kovi_onebot::OnebotTrait as _;
 use moka::future::Cache;
 
-use crate::HTTP_CLIENT;
-
 #[derive(Clone)]
 pub(crate) struct UserInfo {
     #[allow(dead_code)]
@@ -160,38 +158,22 @@ async fn fetch_avatar_with_retry(user_id: i64) -> Result<bytes::Bytes> {
         }
 
         let avatar_url = format!("https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640");
-        match HTTP_CLIENT.get(&avatar_url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_client_error() {
-                    return Err(anyhow::anyhow!("头像请求客户端错误: {status}"));
-                }
-                if status.is_server_error() {
-                    last_err = Some(anyhow::anyhow!("头像请求服务器错误: {status}"));
-                    continue;
-                }
-
-                match resp.bytes().await {
-                    Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
-                    Ok(_) => return Err(anyhow::anyhow!("头像为空")),
-                    Err(e) if is_avatar_retryable(&e) => {
-                        last_err = Some(e.into());
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(e) if is_avatar_retryable(&e) => {
-                last_err = Some(e.into());
-            }
-            Err(e) => return Err(e.into()),
+        match utils::download_image_limited(
+            &avatar_url,
+            &["qlogo.cn"],
+            true,
+            2 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            Ok(bytes) if !bytes.is_empty() => return Ok(bytes::Bytes::from(bytes)),
+            Ok(_) => return Err(anyhow::anyhow!("头像为空")),
+            Err(e) => last_err = Some(e),
         }
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("获取头像失败: user_id={}", user_id)))
-}
-
-fn is_avatar_retryable(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect()
 }
 
 #[cfg(test)]

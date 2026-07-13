@@ -7,7 +7,7 @@
 //!   broadcast、multicast；IPv6 loopback、unique-local、link-local、IPv4-mapped IPv6）
 //!   应该被拒绝，防止攻击者用公网域名解析到内网 IP 后访问内部服务。
 
-use utils::safe_url::validate_image_url;
+use utils::safe_url::{is_public_ip, validate_image_url};
 
 /// 测试用 host 白名单。`utils` 只暴露校验机制（mechanism），
 /// 不再持有具体 host 列表（policy 在调用方）；
@@ -35,6 +35,7 @@ fn rejects_http_scheme() {
 #[test]
 fn rejects_non_whitelisted_hosts() {
     assert!(validate_image_url("https://evil.com/x", TEST_HOSTS).is_err());
+    assert!(validate_image_url("https://8.8.8.8/x", TEST_HOSTS).is_err());
     // 子域名后缀混淆攻击：evil.com 不能通过 .qq.com 后缀检查
     assert!(validate_image_url("https://qq.com.evil.com/x", TEST_HOSTS).is_err());
 }
@@ -71,6 +72,8 @@ fn rejects_ipv6_attack_addresses() {
     assert!(validate_image_url("https://[::ffff:127.0.0.1]/x", TEST_HOSTS).is_err());
     // ::ffff:10.0.0.1 应被当作 10.0.0.1 拒绝
     assert!(validate_image_url("https://[::ffff:10.0.0.1]/x", TEST_HOSTS).is_err());
+    assert!(!is_public_ip(&"2001:db8::1".parse().unwrap()));
+    assert!(is_public_ip(&"2606:4700:4700::1111".parse().unwrap()));
 }
 
 #[test]

@@ -11,7 +11,7 @@ pub use markdown::md_to_html;
 pub use markdown::md_to_img;
 pub use rcu::{RcuCell, RcuReadGuard};
 pub use safe_url::{
-    is_public_ip, validate_image_url, validate_image_url_async,
-    validate_image_url_async_with_options,
+    download_image_limited, is_public_ip, read_response_limited, validate_image_url,
+    validate_image_url_async, validate_image_url_async_with_options,
 };
 pub use screen_shot::{ScreenshotManager, screenshot};

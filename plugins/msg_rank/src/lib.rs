@@ -14,6 +14,9 @@ mod msg_rank;
 pub mod ocr;
 mod word_cloud;
 
+const MAX_OCR_IMAGES_PER_MESSAGE: usize = 3;
+const MAX_STORED_MESSAGE_BYTES: usize = 4 * 1024;
+
 /// 小写的十六进制编码。`hex::encode` 的极简内联实现，避免引入 hex crate。
 #[inline]
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
@@ -68,21 +71,36 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
     let group = event.group_id;
     let user = event.user_id;
 
-    let text = if config::read_config().notify_group.contains(&group) {
-        get_text(&event.message).await
-    } else {
-        event.borrow_text().unwrap_or_default().to_string()
-    };
+    if !config::read_config().notify_group.contains(&group) {
+        return;
+    }
+
+    let text = truncate_utf8(get_text(&event.message).await, MAX_STORED_MESSAGE_BYTES);
+    if text.trim().is_empty() {
+        return;
+    }
 
     if let Err(e) = db::add_msg(group, user, text).await {
         tracing::error!("添加消息失败: {}", e);
     }
 }
 
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
+
 async fn get_text(msg: &Message) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut ocr_tasks = Vec::new();
-    let check_dns = config::read_config().validate_image_url_dns;
+    let mut image_count = 0usize;
 
     for seg in msg.iter() {
         match seg.kind.as_str() {
@@ -97,11 +115,15 @@ async fn get_text(msg: &Message) -> String {
                 }
             }
             "image" => {
+                if image_count >= MAX_OCR_IMAGES_PER_MESSAGE {
+                    continue;
+                }
                 if let Some(url) = seg.data.get("url").and_then(|v| v.as_str()) {
+                    image_count += 1;
                     let url = url.to_string();
                     let idx = parts.len();
                     parts.push(String::new()); // OCR 完成后回填
-                    let task = kovi::spawn(async move { ocr::ocr(&url, check_dns).await });
+                    let task = kovi::spawn(async move { ocr::ocr(&url).await });
                     ocr_tasks.push((idx, task));
                 }
             }
@@ -136,4 +158,15 @@ async fn get_text(msg: &Message) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn truncate_utf8_never_splits_a_character() {
+        assert_eq!(truncate_utf8("ab中文".to_string(), 5), "ab中");
+        assert_eq!(truncate_utf8("short".to_string(), 10), "short");
+    }
 }

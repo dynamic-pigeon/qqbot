@@ -73,7 +73,16 @@ impl ApiRes {
         let data = self
             .data
             .ok_or_else(|| BvError::RequestBodyError("API返回缺少data字段".to_string()))?;
-        let pic = CLIENT.get(&data.pic).send().await?.bytes().await?;
+        let pic = utils::download_image_limited(
+            &data.pic,
+            crate::dynamics::ALLOWED_BILI_HOSTS,
+            true,
+            10 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .await
+        .map(bytes::Bytes::from)
+        .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
 
         Ok(BvInfo {
             title: data.title,
@@ -209,6 +218,7 @@ mod tests {
     const GROUP_V_TEXT: i64 = i64::MAX - 102;
 
     #[tokio::test]
+    #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
     async fn test_long() {
         let url = "https://www.bilibili.com/video/BV198XLBaEYp";
         let info = parse_url(url, GROUP_LONG).await.unwrap();
@@ -228,6 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
     async fn test_v_text() {
         let txt = "【Fate/strange Fake】第13话（完结）[图片]UP主：花园字幕组
 点赞：130 投币：47

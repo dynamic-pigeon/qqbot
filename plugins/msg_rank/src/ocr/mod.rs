@@ -13,8 +13,6 @@ mod tencent;
 
 use tencent::get_ocr;
 
-use crate::HTTP_CLIENT;
-
 /// OCR 输入图片的 QQ CDN 域名白名单，用于 `validate_image_url_async` 的 SSRF 防御。
 pub const ALLOWED_QQ_HOSTS: &[&str] = &[
     "multimedia.nt.qq.com.cn",
@@ -28,6 +26,10 @@ pub const ALLOWED_QQ_HOSTS: &[&str] = &[
 ];
 
 static OCR_MEMORY: LazyLock<OcrMemory> = LazyLock::new(OcrMemory::new);
+static OCR_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(4));
+
+// 腾讯云请求体上限为 10 MiB，Base64 编码会把原始图片放大到约 4/3。
+const MAX_OCR_IMAGE_BYTES: usize = 10 * 1024 * 1024 * 3 / 4;
 
 struct OcrMemory {
     cache: Cache<String, Arc<String>>,
@@ -79,8 +81,8 @@ impl OcrMemory {
 ///
 /// # 返回
 /// * `Result<Arc<String>>` - OCR识别的文本结果
-pub async fn ocr(img_url: &str, check_dns: bool) -> Result<Arc<String>> {
-    utils::validate_image_url_async_with_options(img_url, ALLOWED_QQ_HOSTS, check_dns).await?;
+pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
+    let _permit = OCR_POOL.acquire(Duration::from_secs(2)).await?;
     let img = get_img_bytes_from_url(img_url).await?;
     let result = OCR_MEMORY.get_or_insert(img).await?;
 
@@ -89,21 +91,15 @@ pub async fn ocr(img_url: &str, check_dns: bool) -> Result<Arc<String>> {
 
 /// 从URL获取图片
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
-    // redirect 策略已在 HTTP_CLIENT builder 上设为 none，
-    // 即便 host 是公网域名，attacker 也无法用 redirect 跳到内网 IP。
-    let req = HTTP_CLIENT.get(img_url).send().await?;
-    if let Some(length) = req.content_length() {
-        // 腾讯云OCR接口限制请求体大小不超过10MB，按照base64编码后大小约为原图的4/3
-        if length * 4 / 3 > 10485760 {
-            return Err(anyhow::anyhow!("Image size exceeds 10MB limit"));
-        }
-    }
-
-    if !req.status().is_success() {
-        return Err(anyhow::anyhow!("Failed to get image from URL"));
-    }
-    let bytes = req.bytes().await?;
-    Ok(bytes)
+    let bytes = utils::download_image_limited(
+        img_url,
+        ALLOWED_QQ_HOSTS,
+        true,
+        MAX_OCR_IMAGE_BYTES,
+        Duration::from_secs(10),
+    )
+    .await?;
+    Ok(bytes::Bytes::from(bytes))
 }
 
 /// SHA256哈希并转换为十六进制字符串

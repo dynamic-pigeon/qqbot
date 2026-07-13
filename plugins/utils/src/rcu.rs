@@ -1,78 +1,63 @@
-use std::{marker::PhantomData, sync::atomic::Ordering};
+use std::{marker::PhantomData, ops::Deref, sync::Arc};
 
-use crossbeam_epoch::{Atomic, Owned};
+use arc_swap::{ArcSwap, Guard};
 
-/// A lightweight RCU container with lock-free reads and copy-on-write updates.
+/// 适合读多写少场景的无锁快照容器。
 pub struct RcuCell<T> {
-    inner: Atomic<T>,
+    inner: ArcSwap<T>,
 }
 
 impl<T> RcuCell<T> {
     pub fn new(value: T) -> Self {
         Self {
-            inner: Atomic::new(value),
+            inner: ArcSwap::from_pointee(value),
         }
     }
 
     #[inline(always)]
     pub fn read(&self) -> RcuReadGuard<'_, T> {
-        RcuReadGuard::new(&self.inner)
+        RcuReadGuard {
+            guard: self.inner.load(),
+            _marker: PhantomData,
+        }
     }
 
     pub fn replace(&self, next: T) {
-        let guard = &crossbeam_epoch::pin();
-        // Release: 保证新值在指针发布前对所有读者可见。
-        let prev = self.inner.swap(Owned::new(next), Ordering::Release, guard);
-        // Safety: the old value stays valid until all active readers leave their epoch.
-        unsafe {
-            guard.defer_destroy(prev);
-        }
+        self.inner.store(Arc::new(next));
     }
 
     pub fn snapshot(&self) -> T
     where
         T: Clone,
     {
-        let guard = &crossbeam_epoch::pin();
-        // Acquire: 与 writer 的 Release swap 配对，确保读到完整初始化的新值。
-        let current = self.inner.load(Ordering::Acquire, guard);
-        // Safety: pointer remains valid while the guard is pinned.
-        unsafe { current.deref().clone() }
+        self.inner.load().as_ref().clone()
     }
 }
 
-/// Guarded read handle for a value stored in [`RcuCell`].
-///
-/// NOTE: this is `!Send`; do not move it across threads.
+/// 持有底层 `Arc` 的一致性读取快照。
 pub struct RcuReadGuard<'a, T> {
-    #[allow(dead_code)]
-    guard: crossbeam_epoch::Guard,
-    ptr: *const T,
-    _marker: PhantomData<&'a ()>,
+    guard: Guard<Arc<T>>,
+    _marker: PhantomData<&'a RcuCell<T>>,
 }
 
-impl<'a, T> RcuReadGuard<'a, T> {
-    fn new(value: &'a Atomic<T>) -> Self {
-        let guard = crossbeam_epoch::pin();
-        let ptr = value.load(Ordering::Relaxed, &guard).as_raw();
-        Self {
-            guard,
-            ptr,
-            _marker: PhantomData,
-        }
-    }
-
-    fn load(&self) -> &T {
-        debug_assert!(!self.ptr.is_null(), "RcuReadGuard::ptr not initialized");
-        // Safety: pointer stays valid during the lifetime of this guard.
-        unsafe { &*self.ptr }
-    }
-}
-
-impl<T> std::ops::Deref for RcuReadGuard<'_, T> {
+impl<T> Deref for RcuReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.load()
+        self.guard.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RcuCell;
+
+    #[test]
+    fn existing_guard_keeps_its_snapshot_after_replace() {
+        let cell = RcuCell::new(String::from("old"));
+        let old = cell.read();
+        cell.replace(String::from("new"));
+        assert_eq!(old.as_str(), "old");
+        assert_eq!(cell.read().as_str(), "new");
     }
 }

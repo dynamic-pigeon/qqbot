@@ -11,7 +11,7 @@ askama.workspace = true
 chromiumoxide = "0.9"
 futures.workspace = true
 tracing.workspace = true
-crossbeam-epoch.workspace = true
+arc-swap.workspace = true
 reqwest.workspace = true
 ammonia = "4"
 

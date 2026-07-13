@@ -19,7 +19,7 @@ use anyhow::Result;
 
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 校验图片 URL：仅允许 https + 白名单域名；host 是 IP 时拒绝所有非公网单播地址。
+/// 校验图片 URL：仅允许 https + 白名单 host；host 是 IP 时还必须是公网单播地址。
 ///
 /// 这是 SSRF 防护的第一道墙：禁止 `127.0.0.1` / `10.*` / `192.168.*` / `169.254.*` /
 /// `0.0.0.0` / IPv6 loopback & private 等任何内网/loopback/link-local 地址。
@@ -41,20 +41,21 @@ pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("image url 缺少 host"))?;
 
-    // host 是字面 IP（v4/v6）时按地址族判断；是域名时按白名单匹配
+    let host_lower = host.to_ascii_lowercase();
+    let allowed = allowed_hosts.iter().any(|allowed| {
+        let allowed = allowed.to_ascii_lowercase();
+        host_lower == allowed || host_lower.ends_with(&format!(".{allowed}"))
+    });
+    if !allowed {
+        return Err(anyhow::anyhow!("image url host 不在白名单: {}", host));
+    }
+
+    // 字面 IP 只有被显式列入白名单并且是公网地址时才允许。
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !is_public_ip(&ip) {
             return Err(anyhow::anyhow!("image url host 命中非公网地址: {}", ip));
         }
         return Ok(());
-    }
-
-    let host_lower = host.to_ascii_lowercase();
-    let allowed = allowed_hosts
-        .iter()
-        .any(|allowed| host_lower == *allowed || host_lower.ends_with(&format!(".{allowed}")));
-    if !allowed {
-        return Err(anyhow::anyhow!("image url host 不在白名单: {}", host));
     }
 
     Ok(())
@@ -84,52 +85,128 @@ pub async fn validate_image_url_async_with_options(
         return Ok(());
     }
 
+    resolve_public_addrs(url).await?;
+
+    Ok(())
+}
+
+/// 下载经过白名单校验的图片，并对实际响应体实施硬字节上限。
+///
+/// 启用 DNS 校验时，请求客户端会固定使用本次校验通过的地址，避免校验与连接之间
+/// 再次解析域名造成 DNS rebinding。
+pub async fn download_image_limited(
+    url: &str,
+    allowed_hosts: &[&str],
+    check_dns: bool,
+    max_bytes: usize,
+    request_timeout: Duration,
+) -> Result<Vec<u8>> {
+    validate_image_url(url, allowed_hosts)?;
+    if max_bytes == 0 {
+        return Err(anyhow::anyhow!("图片大小上限必须大于 0"));
+    }
+
+    let parsed = reqwest::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("image url 缺少 host"))?
+        .to_string();
+
+    let mut client_builder = reqwest::Client::builder()
+        .timeout(request_timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if check_dns {
+        let addrs = resolve_public_addrs(url).await?;
+        client_builder = client_builder.resolve_to_addrs(&host, &addrs);
+    }
+    let client = client_builder.build()?;
+    let response = client.get(parsed).send().await?.error_for_status()?;
+    if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        let content_type = content_type.to_str().unwrap_or_default();
+        if !content_type.to_ascii_lowercase().starts_with("image/") {
+            return Err(anyhow::anyhow!("响应不是图片: {content_type}"));
+        }
+    }
+
+    read_response_limited(response, max_bytes).await
+}
+
+/// 流式读取 HTTP 响应，并在响应体超过 `max_bytes` 时立即中止。
+pub async fn read_response_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    response.error_for_status_ref()?;
+    if max_bytes == 0 {
+        return Err(anyhow::anyhow!("响应大小上限必须大于 0"));
+    }
+    if let Some(length) = response.content_length()
+        && length > max_bytes as u64
+    {
+        return Err(anyhow::anyhow!(
+            "响应超过大小上限: {length} > {max_bytes} bytes"
+        ));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response.chunk().await? {
+        append_limited(&mut body, &chunk, max_bytes)?;
+    }
+    Ok(body)
+}
+
+fn append_limited(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<()> {
+    let next_len = body
+        .len()
+        .checked_add(chunk.len())
+        .ok_or_else(|| anyhow::anyhow!("响应大小溢出"))?;
+    if next_len > max_bytes {
+        return Err(anyhow::anyhow!("响应超过大小上限: > {max_bytes} bytes"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn resolve_public_addrs(url: &str) -> Result<Vec<SocketAddr>> {
     let parsed = reqwest::Url::parse(url)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("image url 缺少 host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("image url 缺少端口"))?;
 
-    // 字面 IP 已经过白名单验证，跳过 DNS 预解析。
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_public_ip(&ip) {
+            return Err(anyhow::anyhow!("image url host 命中非公网地址: {ip}"));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    // 对域名做 DNS 预解析：必须每条 A/AAAA 都是公网地址。
-    let lookup_target = format!("{}:443", host);
-    let mut public_addrs: Vec<IpAddr> = Vec::new();
-    let mut all_addrs: Vec<IpAddr> = Vec::new();
     let lookup = kovi::tokio::time::timeout(
         DNS_LOOKUP_TIMEOUT,
-        kovi::tokio::net::lookup_host(&lookup_target),
+        kovi::tokio::net::lookup_host((host, port)),
     )
     .await
     .map_err(|_| anyhow::anyhow!("DNS 解析超时 ({}s)", DNS_LOOKUP_TIMEOUT.as_secs()))?
     .map_err(|e| anyhow::anyhow!("DNS 解析失败: {e}"))?;
-    for sa in lookup {
-        let ip = sa.ip();
-        all_addrs.push(ip);
-        if is_public_ip(&ip) {
-            public_addrs.push(ip);
-        }
+    let addrs: Vec<SocketAddr> = lookup.collect();
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("DNS 解析返回空: {host}"));
     }
-    tracing::debug!(
-        "validate_image_url_async: {} -> all: {:?}, public: {:?}",
-        host,
-        all_addrs,
-        public_addrs
-    );
-    if all_addrs.is_empty() {
-        return Err(anyhow::anyhow!("DNS 解析返回空: {}", host));
-    }
-    if public_addrs.is_empty() {
+    if let Some(private) = addrs.iter().find(|addr| !is_public_ip(&addr.ip())) {
         return Err(anyhow::anyhow!(
-            "image url 域名 {} 解析到的所有地址都是非公网: {:?}",
-            host,
-            all_addrs
+            "image url 域名 {host} 包含非公网解析地址: {}",
+            private.ip()
         ));
     }
-
-    Ok(())
+    tracing::debug!("validated and pinned image host {host} to {addrs:?}");
+    Ok(addrs)
 }
 
 /// 异步校验图片 URL，默认启用 DNS 预解析。
@@ -188,7 +265,7 @@ fn is_public_v4(ip: &Ipv4Addr) -> bool {
 }
 
 fn is_public_v6(ip: &Ipv6Addr) -> bool {
-    // 拒绝 unspecified / loopback / unique-local / link-local / multicast
+    // 只接受 2000::/3 全球单播，并额外拒绝其中的文档和特殊用途网段。
     if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
         return false;
     }
@@ -205,6 +282,21 @@ fn is_public_v6(ip: &Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_public_v4(&v4);
     }
+    if (seg[0] & 0xe000) != 0x2000 {
+        return false;
+    }
+    // 2001:db8::/32 documentation
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return false;
+    }
+    // 2001:2::/48 benchmarking
+    if seg[0] == 0x2001 && seg[1] == 0x0002 && seg[2] == 0 {
+        return false;
+    }
+    // 3fff::/20 documentation
+    if seg[0] == 0x3fff && (seg[1] & 0xf000) == 0 {
+        return false;
+    }
     true
 }
 
@@ -219,4 +311,25 @@ pub fn filter_public_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
         .copied()
         .filter(|sa| is_public_ip(&sa.ip()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_limited;
+
+    #[test]
+    fn chunked_body_cannot_exceed_limit() {
+        let mut body = Vec::new();
+        append_limited(&mut body, b"hello", 8).unwrap();
+        assert!(append_limited(&mut body, b" world", 8).is_err());
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn chunks_up_to_exact_limit_are_accepted() {
+        let mut body = Vec::new();
+        append_limited(&mut body, b"hel", 5).unwrap();
+        append_limited(&mut body, b"lo", 5).unwrap();
+        assert_eq!(body, b"hello");
+    }
 }
