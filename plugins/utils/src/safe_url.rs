@@ -1,9 +1,10 @@
-//! 共享的 SSRF 防御：图片 URL 必须 https + host 在白名单 + host 是 IP 时拒绝非公网。
+//! 共享的 SSRF 防御：图片 URL 必须使用 https 且 host 位于白名单。
 //!
 //! 设计要点：
-//! - 同步路径：scheme 校验 + host 解析 + 字面 IP 黑名单（一次性 O(1)，可在热路径调用）。
-//! - 异步路径：域名场景额外做 DNS 预解析，每条 A/AAAA 都必须是公网单播地址，
-//!   防止 attacker 用公网域名 → 内网 IP 的 DNS rebinding 绕过 URL 字符串层校验。
+//! - 基础校验始终检查 scheme 和 host 白名单。
+//! - 开启私网保护后，字面 IP 和域名解析结果都必须是公网单播地址，域名连接会固定到
+//!   本次校验通过的地址，防止 DNS rebinding 绕过 URL 字符串层校验。
+//! - 私网保护默认关闭，以兼容 DNS 或流量被转发到本地地址的部署环境。
 //!
 //! 调用方约定：
 //! - 调用 `validate_image_url` 前必须有合法 `allowed_hosts` 列表；运行时不应接收 user 输入的 host。
@@ -11,22 +12,59 @@
 //!   仍会绕过白名单（与 DNS 预解析无关，是另一道墙）。
 
 use std::{
+    env,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::LazyLock,
     time::Duration,
 };
 
 use anyhow::Result;
 
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PRIVATE_NETWORK_PROTECTION_ENV: &str = "PRIVATE_NETWORK_PROTECTION";
 
-/// 校验图片 URL：仅允许 https + 白名单 host；host 是 IP 时还必须是公网单播地址。
-///
-/// 这是 SSRF 防护的第一道墙：禁止 `127.0.0.1` / `10.*` / `192.168.*` / `169.254.*` /
-/// `0.0.0.0` / IPv6 loopback & private 等任何内网/loopback/link-local 地址。
-///
-/// 注意：仅校验 URL 字符串层；对抗 DNS rebinding 还需要 [`validate_image_url_async`]
-/// 在调用 HTTP 之前多一次 DNS 预解析检查。
+static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
+    let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) else {
+        return false;
+    };
+
+    match parse_env_bool(&value) {
+        Some(enabled) => enabled,
+        None => {
+            tracing::warn!(
+                "{PRIVATE_NETWORK_PROTECTION_ENV}={value:?} 无效，私网保护保持关闭；可用值: true/false, 1/0, yes/no, on/off"
+            );
+            false
+        }
+    }
+});
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 是否启用私网保护。默认关闭，可通过 `PRIVATE_NETWORK_PROTECTION=true` 启用。
+pub fn private_network_protection_enabled() -> bool {
+    *PRIVATE_NETWORK_PROTECTION
+}
+
+/// 校验图片 URL：仅允许 https + 白名单 host；启用私网保护时，字面 IP 还必须是公网单播地址。
 pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
+    validate_image_url_with_options(url, allowed_hosts, private_network_protection_enabled())
+}
+
+/// 使用指定的私网保护策略校验图片 URL。
+///
+/// `protect_private_network` 启用时，禁止 loopback、private、link-local 等非公网地址。
+pub fn validate_image_url_with_options(
+    url: &str,
+    allowed_hosts: &[&str],
+    protect_private_network: bool,
+) -> Result<()> {
     let parsed =
         reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("image url 解析失败: {e}"))?;
 
@@ -50,18 +88,28 @@ pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
         return Err(anyhow::anyhow!("image url host 不在白名单: {}", host));
     }
 
-    // 字面 IP 只有被显式列入白名单并且是公网地址时才允许。
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if !is_public_ip(&ip) {
-            return Err(anyhow::anyhow!("image url host 命中非公网地址: {}", ip));
-        }
-        return Ok(());
+    // 开启私网保护后，即使字面 IP 已列入白名单，也只允许公网单播地址。
+    if protect_private_network
+        && let Some(ip) = literal_ip_from_url(&parsed)
+        && !is_public_ip(&ip)
+    {
+        return Err(anyhow::anyhow!("image url host 命中非公网地址: {}", ip));
     }
 
     Ok(())
 }
 
-/// 异步校验图片 URL：在 [`validate_image_url`] 基础上可选对域名做 DNS 预解析，
+/// URL 的 host 是否是字面 IP。IPv6 字面 host（`host_str()` 返回值带方括号）也会被识别。
+fn literal_ip_from_url(parsed: &reqwest::Url) -> Option<IpAddr> {
+    let host = parsed.host_str()?;
+    let stripped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    stripped.parse::<IpAddr>().ok()
+}
+
+/// 异步校验图片 URL：在基础 URL 校验上可选对域名做 DNS 预解析，
 /// 确保所有 A/AAAA 记录都是公网单播地址。
 ///
 /// 防 DNS rebinding 的关键：attacker 控制权威 DNS 时，可在 URL 字符串校验阶段
@@ -73,15 +121,15 @@ pub fn validate_image_url(url: &str, allowed_hosts: &[&str]) -> Result<()> {
 /// 仍存在极小的 TOCTOU 窗口（attacker 在校验通过后、reqwest 实际 connect 前切 DNS），
 /// 配合 HTTP 客户端的 redirect = none + 短超时足够覆盖绝大多数攻击面。
 ///
-/// `check_dns` 控制是否执行 DNS 预解析；本地存在 DNS 劫持等场景时可关闭。
+/// `protect_private_network` 控制是否拒绝非公网地址并执行 DNS pinning。
 pub async fn validate_image_url_async_with_options(
     url: &str,
     allowed_hosts: &[&str],
-    check_dns: bool,
+    protect_private_network: bool,
 ) -> Result<()> {
-    validate_image_url(url, allowed_hosts)?;
+    validate_image_url_with_options(url, allowed_hosts, protect_private_network)?;
 
-    if !check_dns {
+    if !protect_private_network {
         return Ok(());
     }
 
@@ -92,16 +140,16 @@ pub async fn validate_image_url_async_with_options(
 
 /// 下载经过白名单校验的图片，并对实际响应体实施硬字节上限。
 ///
-/// 启用 DNS 校验时，请求客户端会固定使用本次校验通过的地址，避免校验与连接之间
+/// 启用私网保护时，请求客户端会固定使用本次校验通过的地址，避免校验与连接之间
 /// 再次解析域名造成 DNS rebinding。
 pub async fn download_image_limited(
     url: &str,
     allowed_hosts: &[&str],
-    check_dns: bool,
     max_bytes: usize,
     request_timeout: Duration,
 ) -> Result<Vec<u8>> {
-    validate_image_url(url, allowed_hosts)?;
+    let protect_private_network = private_network_protection_enabled();
+    validate_image_url_with_options(url, allowed_hosts, protect_private_network)?;
     if max_bytes == 0 {
         return Err(anyhow::anyhow!("图片大小上限必须大于 0"));
     }
@@ -115,7 +163,7 @@ pub async fn download_image_limited(
     let mut client_builder = reqwest::Client::builder()
         .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none());
-    if check_dns {
+    if protect_private_network {
         let addrs = resolve_public_addrs(url).await?;
         client_builder = client_builder.resolve_to_addrs(&host, &addrs);
     }
@@ -181,7 +229,7 @@ async fn resolve_public_addrs(url: &str) -> Result<Vec<SocketAddr>> {
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("image url 缺少端口"))?;
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    if let Some(ip) = literal_ip_from_url(&parsed) {
         if !is_public_ip(&ip) {
             return Err(anyhow::anyhow!("image url host 命中非公网地址: {ip}"));
         }
@@ -209,11 +257,12 @@ async fn resolve_public_addrs(url: &str) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-/// 异步校验图片 URL，默认启用 DNS 预解析。
+/// 异步校验图片 URL，私网保护策略由 `PRIVATE_NETWORK_PROTECTION` 决定。
 ///
-/// 等价于 `validate_image_url_async_with_options(url, allowed_hosts, true)`。
+/// 环境变量未设置时默认关闭私网地址校验和 DNS pinning。
 pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Result<()> {
-    validate_image_url_async_with_options(url, allowed_hosts, true).await
+    validate_image_url_async_with_options(url, allowed_hosts, private_network_protection_enabled())
+        .await
 }
 
 /// IP 是否是公网单播地址（可路由）。
@@ -315,7 +364,17 @@ pub fn filter_public_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::append_limited;
+    use super::{append_limited, parse_env_bool};
+
+    #[test]
+    fn parses_private_network_protection_values() {
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool(" ON "), Some(true));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("no"), Some(false));
+        assert_eq!(parse_env_bool(""), None);
+        assert_eq!(parse_env_bool("invalid"), None);
+    }
 
     #[test]
     fn chunked_body_cannot_exceed_limit() {

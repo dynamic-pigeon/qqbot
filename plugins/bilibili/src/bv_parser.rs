@@ -76,7 +76,6 @@ impl ApiRes {
         let pic = utils::download_image_limited(
             &data.pic,
             crate::dynamics::ALLOWED_BILI_HOSTS,
-            true,
             10 * 1024 * 1024,
             Duration::from_secs(10),
         )

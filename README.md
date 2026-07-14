@@ -11,6 +11,8 @@ cargo run --release
 
 OneBot 连接配置位于本地 `kovi.conf.toml`，插件启用和访问控制位于 `kovi.plugin.toml`。这两个文件包含部署相关信息，不提交到 Git。B 站动态订阅需要在 `.env` 中配置 `BILIBILI_COOKIE`。
 
+图片下载的私网保护默认关闭，以兼容所有流量经本地代理地址转发的环境。在 DNS 能直接返回目标公网地址的部署中，可设置 `PRIVATE_NETWORK_PROTECTION=true`，启用非公网地址拦截和 DNS pinning。无论该开关是否启用，HTTPS、Host 白名单、重定向禁用、超时和响应体大小限制都会保留。
+
 生产环境应保持 OneBot 服务只监听回环地址或受控内网，并为 `access_token` 使用随机长值。程序在 Unix 上启动时会把 `.env`、`kovi.conf.toml`、插件配置和消息数据库权限收紧为 `0600`。
 
 ## 数据与访问控制
