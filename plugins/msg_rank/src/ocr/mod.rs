@@ -77,7 +77,6 @@ impl OcrMemory {
 ///
 /// # 参数
 /// * `img_url` - 图片的URL地址（必须通过 [`utils::validate_image_url_async`] 校验）
-/// * `check_dns` - 是否做 DNS 预解析校验；关闭可避免本地 DNS 劫持导致误杀
 ///
 /// # 返回
 /// * `Result<Arc<String>>` - OCR识别的文本结果
@@ -94,7 +93,6 @@ async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
     let bytes = utils::download_image_limited(
         img_url,
         ALLOWED_QQ_HOSTS,
-        true,
         MAX_OCR_IMAGE_BYTES,
         Duration::from_secs(10),
     )

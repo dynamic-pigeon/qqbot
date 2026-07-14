@@ -70,7 +70,6 @@ async fn fetch_img(card_id: u64) -> Result<Bytes> {
     let bytes = utils::download_image_limited(
         &url,
         &["cdn.233.momobako.com"],
-        true,
         MAX_CARD_IMAGE_BYTES,
         Duration::from_secs(10),
     )

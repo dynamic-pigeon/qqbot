@@ -161,7 +161,6 @@ async fn fetch_avatar_with_retry(user_id: i64) -> Result<bytes::Bytes> {
         match utils::download_image_limited(
             &avatar_url,
             &["qlogo.cn"],
-            true,
             2 * 1024 * 1024,
             Duration::from_secs(10),
         )

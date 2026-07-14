@@ -359,7 +359,6 @@ async fn fetch_image(url: &str) -> anyhow::Result<Bytes> {
     let bytes = utils::download_image_limited(
         url,
         ALLOWED_BILI_HOSTS,
-        true,
         MAX_DYNAMIC_IMAGE_BYTES,
         Duration::from_secs(15),
     )
