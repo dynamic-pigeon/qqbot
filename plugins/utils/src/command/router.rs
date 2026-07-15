@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use kovi::{PluginBuilder as plugin, RuntimeBot};
-use kovi_onebot::EventRegistrar as _;
+use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
+use kovi_onebot::{EventRegistrar as _, MsgEvent};
 
 use super::{
     AccessError, Command, CommandCatalog, CommandContext, CommandError, CommandRegistrationError,
@@ -37,12 +37,18 @@ impl CommandRouter {
             let tree = Arc::clone(&tree);
             let bot = Arc::clone(&bot);
             async move {
-                let Some(text) = event.text.as_deref() else {
+                let Some(text) = extract_command_text(&event.message) else {
                     return;
                 };
-                let resolved = match tree.resolve(text) {
+                let resolved = match tree.resolve(&text) {
                     ResolveOutcome::Ignored => return,
                     ResolveOutcome::Error(error) => {
+                        if let Err(access_error) =
+                            check_event_access(&event, &bot, error.scope(), error.permission())
+                        {
+                            reply_access_error(&event, access_error);
+                            return;
+                        }
                         event.reply(error.to_string());
                         return;
                     }
@@ -51,18 +57,7 @@ impl CommandRouter {
 
                 let (path, arguments, usage, permission, scope, handler) =
                     resolved.into_dispatch_parts();
-                let source = if event.group_id.is_some() {
-                    MessageSource::Group
-                } else {
-                    MessageSource::Private
-                };
-                let is_admin = permission == Permission::Everyone
-                    || bot
-                        .get_all_admin()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|id| id.try_as_i64() == Some(event.user_id));
-                if let Err(error) = check_access(scope, permission, source, is_admin) {
+                if let Err(error) = check_event_access(&event, &bot, scope, permission) {
                     reply_access_error(&event, error);
                     return;
                 }
@@ -91,6 +86,37 @@ impl CommandRouter {
     }
 }
 
-fn reply_access_error(event: &kovi_onebot::MsgEvent, error: AccessError) {
+pub fn extract_command_text(message: &Message) -> Option<String> {
+    let parts = message
+        .iter()
+        .filter(|segment| segment.kind == "text")
+        .filter_map(|segment| segment.data.get("text").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn check_event_access(
+    event: &MsgEvent,
+    bot: &RuntimeBot,
+    scope: super::MessageScope,
+    permission: Permission,
+) -> Result<(), AccessError> {
+    let source = if event.group_id.is_some() {
+        MessageSource::Group
+    } else {
+        MessageSource::Private
+    };
+    check_access(scope, Permission::Everyone, source, false)?;
+
+    let is_admin = permission == Permission::Everyone
+        || bot
+            .get_all_admin()
+            .unwrap_or_default()
+            .iter()
+            .any(|id| id.try_as_i64() == Some(event.user_id));
+    check_access(super::MessageScope::Any, permission, source, is_admin)
+}
+
+fn reply_access_error(event: &MsgEvent, error: AccessError) {
     event.reply(error.to_string());
 }

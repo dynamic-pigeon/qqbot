@@ -1,6 +1,6 @@
 # Unified Command Router Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build the `utils::command` command tree and migrate every first-party bot command to its registration, permission, error, and help system.
 
@@ -37,7 +37,7 @@
 - Modify: `plugins/utils/src/lib.rs`
 - Modify: `plugins/utils/Cargo.toml`
 
-- [ ] **Step 1: Write failing public API tests for exact roots, deep paths, aliases, Unicode whitespace, and raw rest**
+- [x] **Step 1: Write failing public API tests for exact roots, deep paths, aliases, Unicode whitespace, and raw rest**
 
 Add tests that build executable nodes with a no-op async handler and assert the desired owned resolution:
 
@@ -87,13 +87,13 @@ fn requires_an_exact_root_and_accepts_aliases() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `cargo test -p utils --test command --locked`
 
 Expected: compilation fails because `utils::command` and its types do not exist.
 
-- [ ] **Step 3: Implement the minimal public model and Unicode span tokenizer**
+- [x] **Step 3: Implement the minimal public model and Unicode span tokenizer**
 
 Define the final public signatures, not test-only shims:
 
@@ -133,13 +133,13 @@ impl Command {
 
 `CommandTree::new` recursively computes inherited permission and scope, validates siblings, and stores immutable nodes. `CommandTree::resolve` scans `char_indices`, records each non-whitespace byte range, matches canonical names or aliases, and clones only the final handler and invocation strings into `ResolvedCommand`.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run: `cargo test -p utils --test command --locked`
 
 Expected: the exact-root, alias, deep-path, Unicode whitespace, arguments, and rest tests pass.
 
-- [ ] **Step 5: Add failing registration and resolution-error tests**
+- [x] **Step 5: Add failing registration and resolution-error tests**
 
 Add separate tests for duplicate sibling names, name/alias collisions, empty leaves, permission relaxation, missing subcommands, and unknown subcommands:
 
@@ -175,7 +175,7 @@ fn reports_unknown_subcommand_at_the_deepest_node() {
 }
 ```
 
-- [ ] **Step 6: Verify RED, implement validation and route errors, then verify GREEN**
+- [x] **Step 6: Verify RED, implement validation and route errors, then verify GREEN**
 
 Run before implementation: `cargo test -p utils --test command --locked`
 
@@ -183,7 +183,7 @@ Expected before implementation: the new tests fail on missing validation or the 
 
 Implement `CommandRegistrationError`, `RouteError`, usage rendering, and recursive validation. Run the same command again and expect all command tests to pass.
 
-- [ ] **Step 7: Format and commit the pure core**
+- [x] **Step 7: Format and commit the pure core**
 
 Run: `cargo fmt --all`
 
@@ -206,7 +206,7 @@ git commit -m "feat(utils): add command tree core"
 - Modify: `plugins/utils/src/command/tree.rs`
 - Modify: `plugins/utils/tests/command.rs`
 
-- [ ] **Step 1: Write failing tests for access checks, safe errors, and catalog replacement**
+- [x] **Step 1: Write failing tests for access checks, safe errors, and catalog replacement**
 
 Add tests with these exact expectations:
 
@@ -245,13 +245,13 @@ fn internal_errors_are_not_exposed() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `cargo test -p utils --test command --locked`
 
 Expected: compilation fails because access, catalog, and error-rendering APIs are missing.
 
-- [ ] **Step 3: Implement the catalog and pure access/error functions**
+- [x] **Step 3: Implement the catalog and pure access/error functions**
 
 Implement these public entry points:
 
@@ -273,13 +273,13 @@ pub fn render_command_error(error: &CommandError, usage: &str) -> String;
 
 Use a `LazyLock<RwLock<CatalogStore>>` for the process-wide catalog. `CatalogStore::register` rejects roots already owned by a different plugin and atomically replaces all entries for the same `owner + root`.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run: `cargo test -p utils --test command --locked`
 
 Expected: all pure access, catalog, and safe-rendering tests pass.
 
-- [ ] **Step 5: Write a failing async dispatch-order test**
+- [x] **Step 5: Write a failing async dispatch-order test**
 
 Factor dispatch gating so it accepts an invocation callback independent of Kovi, then assert the callback is not called after scope or permission rejection:
 
@@ -306,19 +306,21 @@ async fn rejected_access_does_not_invoke_the_handler() {
 }
 ```
 
-- [ ] **Step 6: Verify RED, implement `CommandRouter::install`, then verify GREEN**
+Also build a real `kovi::Message` with multiple text segments and assert that the adapter's text extraction preserves leading and trailing whitespace around Markdown content.
+
+- [x] **Step 6: Verify RED, implement `CommandRouter::install`, then verify GREEN**
 
 Run before implementation: `cargo test -p utils --test command --locked`
 
 Expected before implementation: compilation fails on `dispatch_if_allowed`.
 
-Implement `CommandContext`, `CommandArguments`, and `CommandRouter`. `install()` must validate the tree and catalog before calling `PluginBuilder::on_msg`; the listener must resolve, check `MsgEvent::group_id`, query `RuntimeBot::get_all_admin()`, build the context, await the cloned handler, log internal errors with command/user/group fields, and reply through `RepliableEvent`.
+Implement `CommandContext`, `CommandArguments`, and `CommandRouter`. `install()` must validate the tree and catalog before calling `PluginBuilder::on_msg`; the listener must rebuild untrimmed command text from `MsgEvent::message`, resolve the command tree, check scope and permission before both route-error and handler replies, query `RuntimeBot::get_all_admin()`, build the context, await the cloned handler, log internal errors with command/user/group fields, and reply through `RepliableEvent`.
 
 Run after implementation: `cargo test -p utils --test command --locked`
 
 Expected: all tests pass, including proof that rejected access does not invoke a callback.
 
-- [ ] **Step 7: Format, check the utils crate, and commit**
+- [x] **Step 7: Format, check the utils crate, and commit**
 
 Run:
 
@@ -342,7 +344,7 @@ git commit -m "feat(utils): add command routing and catalog"
 - Modify: `plugins/help_msg/src/lib.rs`
 - Modify: `plugins/utils/tests/command.rs`
 
-- [ ] **Step 1: Write failing catalog help-rendering tests**
+- [x] **Step 1: Write failing catalog help-rendering tests**
 
 Add tests for the exact root list, parent help, leaf help, leading slash normalization, alias lookup, and missing paths:
 
@@ -358,7 +360,7 @@ fn renders_root_parent_and_leaf_help() {
 }
 ```
 
-- [ ] **Step 2: Verify RED, implement help rendering, and verify GREEN**
+- [x] **Step 2: Verify RED, implement help rendering, and verify GREEN**
 
 Run before implementation: `cargo test -p utils --test command --locked`
 
@@ -366,7 +368,7 @@ Expected before implementation: tests fail because `render_help` is missing.
 
 Implement deterministic `BTreeMap` ordering and render only command metadata. Run the focused test again and expect it to pass.
 
-- [ ] **Step 3: Replace `help_msg`'s manual registry with a routed `/help` handler**
+- [x] **Step 3: Replace `help_msg`'s manual registry with a routed `/help` handler**
 
 The plugin should register one root command and pass whitespace arguments to the catalog:
 
@@ -392,7 +394,7 @@ async fn main() {
 
 Delete `HelpItem`, `HELP_REGISTRY`, `register_help`, `get_all_help`, and `get_help`. Add the `utils` workspace dependency.
 
-- [ ] **Step 4: Format, test, and commit**
+- [x] **Step 4: Format, test, and commit**
 
 Run:
 
@@ -417,7 +419,7 @@ git commit -m "refactor(help): generate help from command catalog"
 - Modify: `plugins/yu_gi_oh/src/lib.rs`
 - Modify: `plugins/yu_gi_oh/Cargo.toml`
 
-- [ ] **Step 1: Add failing command-definition tests inside both plugin crates**
+- [x] **Step 1: Add failing command-definition tests inside both plugin crates**
 
 Extract `markdown_command()` and `card_query_command()` builders. Test their public resolution through `CommandTree`: `!md` without content resolves the registered root, `!md   # title` preserves two leading spaces in `rest`, `/查卡` resolves with no arguments, and `/查卡 青眼 白龙` produces `trimmed_rest() == "青眼 白龙"`.
 
@@ -425,15 +427,15 @@ Run: `cargo test -p markdown -p yu_gi_oh --lib --locked`
 
 Expected: compilation fails because the builder functions and router registrations do not exist.
 
-- [ ] **Step 2: Migrate `!md` with unified input and internal errors**
+- [x] **Step 2: Migrate `!md` with unified input and internal errors**
 
 Register `!md` with description `根据 Markdown 生成图片` and usage `!md <Markdown 内容>`. The handler must return `MissingArgument { name: "Markdown 内容" }` for empty `rest()`, preserve the existing 32 KiB limit and cooldown as `CommandError::User`, return rendering failures as `CommandError::Internal`, and send the generated image with `reply_and_quote`.
 
-- [ ] **Step 3: Migrate `/查卡` with trimmed raw input**
+- [x] **Step 3: Migrate `/查卡` with trimmed raw input**
 
 Register `/查卡` with description `查询游戏王卡片信息` and usage `/查卡 <卡片名称>`. The handler must use `trimmed_rest()`, return a missing argument for empty input, preserve the 128-byte limit and cooldown, convert fetch failures to internal errors, and preserve the text fallback when only image fetching fails.
 
-- [ ] **Step 4: Remove direct `help_msg` dependencies and verify GREEN**
+- [x] **Step 4: Remove direct `help_msg` dependencies and verify GREEN**
 
 Run:
 
@@ -445,7 +447,7 @@ cargo check -p markdown -p yu_gi_oh --locked
 
 Expected: definition tests and both crate checks pass.
 
-- [ ] **Step 5: Commit both simple command migrations**
+- [x] **Step 5: Commit both simple command migrations**
 
 ```bash
 git add plugins/markdown plugins/yu_gi_oh Cargo.lock
@@ -460,7 +462,7 @@ git commit -m "refactor(commands): migrate markdown and card query"
 - Modify: `plugins/msg_rank/src/word_cloud.rs`
 - Modify: `plugins/msg_rank/Cargo.toml`
 
-- [ ] **Step 1: Write failing command-tree tests in `word_cloud.rs`**
+- [x] **Step 1: Write failing command-tree tests in `word_cloud.rs`**
 
 Extract a `wordcloud_command(path: Arc<PathBuf>) -> Command` builder and test that `once`, `enable`, `disable`, and `status` resolve under `/wordcloud`, inherit `MessageScope::Group` and `Permission::BotAdmin`, while `/wordcloud` returns the parent usage.
 
@@ -468,7 +470,7 @@ Run: `cargo test -p msg_rank word_cloud::tests::command_tree --lib --locked`
 
 Expected: compilation fails because `wordcloud_command` does not exist.
 
-- [ ] **Step 2: Write a failing daily-rank command test**
+- [x] **Step 2: Write a failing daily-rank command test**
 
 Extract `daily_rank_command() -> Command` and test that `#今日发言排行` resolves as `MessageScope::Group` plus `Permission::Everyone`, while `#今日发言排行榜` is ignored as a different root.
 
@@ -476,15 +478,15 @@ Run: `cargo test -p msg_rank msg_rank::command_tests::daily_rank_is_a_public_gro
 
 Expected: compilation fails because `daily_rank_command` does not exist.
 
-- [ ] **Step 3: Replace `cmd_handler` with four async routed handlers**
+- [x] **Step 3: Replace `cmd_handler` with four async routed handlers**
 
 The `once` closure captures `Arc<PathBuf>`, replies with the progress message, then spawns `send_word_cloud`. The other three handlers use `ctx.event().group_id`, call `modify_config` or `read_config`, and map configuration failures to `CommandError::Internal`. Register the root before cron jobs and delete the repeated `get_all_admin` check and string match.
 
-- [ ] **Step 4: Route the daily rank handler and install one plugin router**
+- [x] **Step 4: Route the daily rank handler and install one plugin router**
 
 Move the existing cooldown, rendering, screenshot, and image reply into a `CommandContext` handler. Install `daily_rank_command()` and `wordcloud_command()` together from `plugins/msg_rank/src/lib.rs`, preserving the message collection listener and word-cloud cron jobs.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run:
 
@@ -507,7 +509,7 @@ git commit -m "refactor(msg-rank): route word cloud commands"
 - Modify: `plugins/bilibili/src/lib.rs`
 - Modify: `plugins/bilibili/Cargo.toml`
 
-- [ ] **Step 1: Write failing tree-definition tests**
+- [x] **Step 1: Write failing tree-definition tests**
 
 Extract `live_command()` and `dynamic_command()` builders. Test that list is `Everyone`, mutating/fetch nodes are `BotAdmin`, every node is `Group`, `remove` resolves to canonical `rm`, `/livefoo` is ignored, and a three-level synthetic command remains covered by the shared utils tests.
 
@@ -515,19 +517,19 @@ Run: `cargo test -p bilibili command_tests --lib --locked`
 
 Expected: compilation fails because the builders do not exist.
 
-- [ ] **Step 2: Migrate `/live` handlers**
+- [x] **Step 2: Migrate `/live` handlers**
 
 Split `exec_cmd` into `live_add`, `live_remove`, and `live_list` handlers taking `CommandContext`. Parse `uid` with `parse_arg::<u64>(0, "uid")`, reject extra arguments, use `ctx.event().group_id.expect("群命令已通过范围校验")`, and preserve existing subscription behavior and user-safe API/configuration errors.
 
-- [ ] **Step 3: Migrate `/dynamic` handlers**
+- [x] **Step 3: Migrate `/dynamic` handlers**
 
 Split `dynamic_cmd` into `dynamic_add`, `dynamic_remove`, `dynamic_list`, and `dynamic_fetch`. Parse and bound `count` exactly as `1..=MAX_FETCH_COUNT`, reject extra arguments, preserve push-result replies, and map unexpected failures to the documented error class.
 
-- [ ] **Step 4: Install one router and preserve non-command listeners**
+- [x] **Step 4: Install one router and preserve non-command listeners**
 
 Register both roots in `CommandRouter::new("bilibili", bot)`, install it once, retain `plugin::on_group_msg(parse_bv)`, `living::init()`, and `dynamics::init()`, and delete `exec_cmd`, `dynamic_cmd`, and `is_admin`.
 
-- [ ] **Step 5: Verify GREEN and commit**
+- [x] **Step 5: Verify GREEN and commit**
 
 Run:
 
@@ -554,7 +556,7 @@ git commit -m "refactor(bilibili): route subscription commands"
 - Modify: `plugins/bilibili/Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] **Step 1: Prove duplicate help registration is gone**
+- [x] **Step 1: Prove duplicate help registration is gone**
 
 Run:
 
@@ -564,7 +566,7 @@ rg -n "help_msg::register_help|help_msg\.workspace" plugins
 
 Expected: no output outside historical documentation. Remove any remaining business-plugin dependency or call before continuing.
 
-- [ ] **Step 2: Prove ad hoc command matching is gone for migrated roots**
+- [x] **Step 2: Prove ad hoc command matching is gone for migrated roots**
 
 Run:
 
@@ -574,7 +576,7 @@ rg -n 'starts_with\("/(live|dynamic|wordcloud)|strip_prefix\("/(查卡|wordcloud
 
 Expected: no output from the migrated command handlers. URL parsing and unrelated text parsing remain unchanged.
 
-- [ ] **Step 3: Run workspace formatting and compilation**
+- [x] **Step 3: Run workspace formatting and compilation**
 
 Run:
 
@@ -586,7 +588,7 @@ git diff --check
 
 Expected: every command exits successfully with no warnings or whitespace errors.
 
-- [ ] **Step 4: Commit cleanup if the previous tasks did not already leave a clean tree**
+- [x] **Step 4: Commit cleanup if the previous tasks did not already leave a clean tree**
 
 ```bash
 git add Cargo.toml Cargo.lock plugins
@@ -601,7 +603,7 @@ Skip this commit only when `git status --short` is already empty.
 - Verify: `docs/superpowers/specs/2026-07-15-command-router-design.md`
 - Verify: all workspace sources and tests
 
-- [ ] **Step 1: Run the complete required checks from a clean build state**
+- [x] **Step 1: Run the complete required checks from a clean build state**
 
 Run:
 
@@ -613,11 +615,11 @@ cargo test --workspace --all-targets --locked
 
 Expected: all three commands exit with status 0; ignored network tests may remain reported as ignored.
 
-- [ ] **Step 2: Audit every design requirement against source and tests**
+- [x] **Step 2: Audit every design requirement against source and tests**
 
 Use `rg` and the test names to confirm arbitrary-depth matching, aliases, raw rest, two permissions, inherited scope, safe internal errors, catalog-backed help, all six first-party roots, and untouched `.kovi` mounting. Any missing evidence requires a new failing test before a fix.
 
-- [ ] **Step 3: Inspect the final branch and commit verification-only changes**
+- [x] **Step 3: Inspect the final branch and commit verification-only changes**
 
 Run:
 
