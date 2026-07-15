@@ -6,10 +6,13 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
-    Message, PluginBuilder as plugin, RuntimeBot,
+    Message, PluginBuilder as plugin,
     serde_json::{self, Value},
 };
 use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, event::GroupMsgEvent};
+use utils::command::{
+    Command, CommandContext, CommandError, CommandResult, CommandRouter, MessageScope, Permission,
+};
 
 use crate::{
     bv_parser::parse_url,
@@ -47,304 +50,232 @@ async fn main() {
     // 启动期强制解析硬编码 SPACE_FEED_URL，让 URL 被未来编辑损坏时立刻 panic，
     // 而不是等到第一次 /dynamic fetch / cron 才暴露。
     dynamics::warm_up();
-    help_msg::register_help(
-        "直播订阅",
-        "管理本群的 B 站直播订阅",
-        "/live add <uid> - 为本群订阅指定 uid 的开播通知（管理员专用）\n/live rm <uid> - 取消本群的订阅（管理员专用）\n/live list - 查看本群订阅列表",
-    )
-    .await;
     let bot = plugin::get_runtime_bot();
-    let bot_for_exec = Arc::clone(&bot);
-    let bot_for_dyn = Arc::clone(&bot);
-    plugin::on_group_msg(move |event| {
-        let bot = Arc::clone(&bot_for_exec);
-        exec_cmd(event, bot)
-    });
+    CommandRouter::new("bilibili", Arc::clone(&bot))
+        .register(live_command())
+        .register(dynamic_command())
+        .install()
+        .expect("注册 Bilibili 命令失败");
+
     plugin::on_group_msg(parse_bv);
-    plugin::on_group_msg(move |event| {
-        let bot = Arc::clone(&bot_for_dyn);
-        dynamic_cmd(event, bot)
-    });
     living::init().await;
     dynamics::init().await;
 }
 
-async fn exec_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
-    let text = event.borrow_text().unwrap_or_default();
-    let text = text.trim();
-
-    // support: /live add <uid>
-    //          /live rm <uid>
-    //          /live status
-    if !text.starts_with("/live") {
-        return;
-    }
-
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.len() < 2 {
-        event.reply("用法: /live add <uid> | /live rm <uid> | /live list");
-        return;
-    }
-
-    match parts[1] {
-        "add" => {
-            if !bot
-                .get_all_admin()
-                .unwrap_or_default()
-                .iter()
-                .any(|id| id.try_as_i64() == Some(event.user_id))
-            {
-                event.reply("❌ 管理员专用命令，普通用户无法使用");
-                return;
-            }
-            if parts.len() < 3 {
-                event.reply("请指定要订阅的 uid，例如: /live add 672328094");
-                return;
-            }
-            let uid = match parts[2].parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    event.reply("uid 格式错误，需为整数");
-                    return;
-                }
-            };
-
-            if !check_uid(uid).await {
-                event.reply("该 uid 没有直播间或者 bot 网络错误");
-                return;
-            }
-
-            let group = event.group_id;
-            match config::modify_config(|cfg| {
-                if let Some(sub) = cfg.subscribe.iter_mut().find(|s| s.uid == uid) {
-                    if !sub.groups.contains(&group) {
-                        sub.groups.push(group);
-                    }
-                } else {
-                    cfg.subscribe.push(crate::config::Subscribe {
-                        uid,
-                        groups: vec![group],
-                    });
-                }
-            })
-            .await
-            {
-                Ok(_) => event.reply(format!("已为本群订阅 uid={}", uid)),
-                Err(e) => event.reply(format!("订阅失败: {}", e)),
-            }
-        }
-        "rm" | "remove" => {
-            if !bot
-                .get_all_admin()
-                .unwrap_or_default()
-                .iter()
-                .any(|id| id.try_as_i64() == Some(event.user_id))
-            {
-                event.reply("❌ 管理员专用命令，普通用户无法使用");
-                return;
-            }
-            if parts.len() < 3 {
-                event.reply("请指定要取消订阅的 uid，例如: /live rm 672328094");
-                return;
-            }
-            let uid = match parts[2].parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    event.reply("uid 格式错误，需为整数");
-                    return;
-                }
-            };
-            let group = event.group_id;
-            match config::modify_config(|cfg| {
-                if let Some(idx) = cfg.subscribe.iter().position(|s| s.uid == uid) {
-                    let sub = &mut cfg.subscribe[idx];
-                    sub.groups.retain(|g| *g != group);
-                    if sub.groups.is_empty() {
-                        cfg.subscribe.remove(idx);
-                    }
-                }
-            })
-            .await
-            {
-                Ok(_) => event.reply(format!("已取消本群对 uid={} 的订阅", uid)),
-                Err(e) => event.reply(format!("取消订阅失败: {}", e)),
-            }
-        }
-        "list" => {
-            let group = event.group_id;
-            let cfg = config::read_config().clone();
-            let uids: Vec<u64> = cfg
-                .subscribe
-                .iter()
-                .filter(|s| s.groups.contains(&group))
-                .map(|s| s.uid)
-                .collect();
-            if uids.is_empty() {
-                event.reply("本群尚未订阅任何直播间");
-            } else {
-                let names = match fetch_uid_names(&uids).await {
-                    Ok(names) => names,
-                    Err(e) => {
-                        event.reply(format!("查询订阅列表失败: {}", e));
-                        return;
-                    }
-                };
-
-                let mut text = String::from("订阅列表：");
-                for (uid, name) in names {
-                    write!(&mut text, "\n{} ({})", name, uid).unwrap();
-                }
-                event.reply(text);
-            }
-        }
-        _ => {
-            event.reply("未知子命令，支持: add | rm | list");
-        }
-    }
+fn live_command() -> Command {
+    Command::new("/live")
+        .description("管理本群的 B 站直播订阅")
+        .usage("/live <add|rm|list>")
+        .scope(MessageScope::Group)
+        .subcommand(
+            Command::new("add")
+                .description("添加直播订阅")
+                .usage("/live add <uid>")
+                .permission(Permission::BotAdmin)
+                .handler(live_add),
+        )
+        .subcommand(
+            Command::new("rm")
+                .alias("remove")
+                .description("移除直播订阅")
+                .usage("/live rm <uid>")
+                .permission(Permission::BotAdmin)
+                .handler(live_remove),
+        )
+        .subcommand(
+            Command::new("list")
+                .description("查看本群直播订阅")
+                .usage("/live list")
+                .handler(live_list),
+        )
 }
 
-async fn dynamic_cmd(event: Arc<GroupMsgEvent>, bot: Arc<RuntimeBot>) {
-    let text = event.borrow_text().unwrap_or_default();
-    let text = text.trim();
-    if !text.starts_with("/dynamic") {
-        return;
-    }
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.len() < 2 {
-        event.reply(
-            "用法: /dynamic add <uid> | /dynamic rm <uid> | /dynamic list | /dynamic fetch <uid>",
-        );
-        return;
-    }
-    let group = event.group_id;
-
-    match parts[1] {
-        "add" => {
-            if !is_admin(&bot, event.user_id) {
-                event.reply("❌ 管理员专用命令");
-                return;
-            }
-            if parts.len() < 3 {
-                event.reply("请指定 uid，例如: /dynamic add 672328094");
-                return;
-            }
-            let uid = match parts[2].parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    event.reply("uid 格式错误");
-                    return;
-                }
-            };
-            match dynamics::add_subscribe(uid, group).await {
-                Ok(true) => event.reply(format!("已为本群订阅动态 uid={}", uid)),
-                Ok(false) => event.reply(format!("本群已订阅 uid={}", uid)),
-                Err(e) => event.reply(format!("订阅失败: {e}")),
-            }
-        }
-        "rm" => {
-            if !is_admin(&bot, event.user_id) {
-                event.reply("❌ 管理员专用命令");
-                return;
-            }
-            if parts.len() < 3 {
-                event.reply("请指定 uid，例如: /dynamic rm 672328094");
-                return;
-            }
-            let uid = match parts[2].parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    event.reply("uid 格式错误");
-                    return;
-                }
-            };
-            match dynamics::remove_subscribe(uid, group).await {
-                Ok(_) => event.reply(format!("已取消本群对 uid={} 的动态订阅", uid)),
-                Err(e) => event.reply(format!("取消失败: {e}")),
-            }
-        }
-        "list" => {
-            let entries = dynamics::list_subscribes(group).await;
-            if entries.is_empty() {
-                event.reply("本群尚未订阅任何动态");
-                return;
-            }
-            let uids: Vec<u64> = entries.iter().map(|(u, _)| *u).collect();
-            let names = match crate::living::fetch_uid_names(&uids).await {
-                Ok(m) => m,
-                Err(e) => {
-                    event.reply(format!("查询 UP 名失败: {e}"));
-                    return;
-                }
-            };
-            let mut out = String::from("动态订阅列表：");
-            for uid in uids {
-                let name = names.get(&uid).cloned().unwrap_or_default();
-                out.push_str(&format!("\n{} ({})", name, uid));
-            }
-            event.reply(out);
-        }
-        "fetch" => {
-            if !is_admin(&bot, event.user_id) {
-                event.reply("❌ 管理员专用命令");
-                return;
-            }
-            if parts.len() < 3 {
-                event.reply(format!(
-                    "用法: /dynamic fetch <uid> [count]，count 默认 1，最大 {}",
-                    dynamics::MAX_FETCH_COUNT
-                ));
-                return;
-            }
-            let uid = match parts[2].parse::<u64>() {
-                Ok(v) => v,
-                Err(_) => {
-                    event.reply("uid 格式错误");
-                    return;
-                }
-            };
-            let count: usize = if parts.len() >= 4 {
-                match parts[3].parse::<usize>() {
-                    Ok(n) if (1..=dynamics::MAX_FETCH_COUNT).contains(&n) => n,
-                    _ => {
-                        event.reply(format!("count 必须是 1..={}", dynamics::MAX_FETCH_COUNT));
-                        return;
-                    }
-                }
-            } else {
-                1
-            };
-            match dynamics::fetch_recent(uid, count).await {
-                Ok(items) if items.is_empty() => {
-                    event.reply(format!("uid={} 无动态", uid));
-                }
-                Ok(items) => {
-                    let mut pushed = 0usize;
-                    for item in &items {
-                        let author = dynamics::author_of(item);
-                        if let Err(e) = dynamics::push_dynamic(&bot, group, &author, item).await {
-                            tracing::warn!("渲染失败 uid={}: {e}", uid);
-                        } else {
-                            pushed += 1;
-                        }
-                    }
-                    event.reply(format!("已推送 {}/{} 条动态", pushed, items.len()));
-                }
-                Err(e) => {
-                    event.reply(format!("拉取失败: {e}"));
-                }
-            }
-        }
-        _ => {
-            event.reply("未知子命令，支持: add | rm | list | fetch");
-        }
-    }
+fn dynamic_command() -> Command {
+    Command::new("/dynamic")
+        .description("管理本群的 B 站动态订阅")
+        .usage("/dynamic <add|rm|list|fetch>")
+        .scope(MessageScope::Group)
+        .subcommand(
+            Command::new("add")
+                .description("添加动态订阅")
+                .usage("/dynamic add <uid>")
+                .permission(Permission::BotAdmin)
+                .handler(dynamic_add),
+        )
+        .subcommand(
+            Command::new("rm")
+                .description("移除动态订阅")
+                .usage("/dynamic rm <uid>")
+                .permission(Permission::BotAdmin)
+                .handler(dynamic_remove),
+        )
+        .subcommand(
+            Command::new("list")
+                .description("查看本群动态订阅")
+                .usage("/dynamic list")
+                .handler(dynamic_list),
+        )
+        .subcommand(
+            Command::new("fetch")
+                .description("立即拉取并推送最近动态")
+                .usage("/dynamic fetch <uid> [count]")
+                .permission(Permission::BotAdmin)
+                .handler(dynamic_fetch),
+        )
 }
 
-fn is_admin(bot: &Arc<RuntimeBot>, user_id: i64) -> bool {
-    bot.get_all_admin()
-        .unwrap_or_default()
+async fn live_add(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    ctx.ensure_no_extra_args(1)?;
+    if !check_uid(uid).await {
+        return Err(CommandError::user("该 uid 没有直播间或者 bot 网络错误"));
+    }
+
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    config::modify_config(|config| {
+        if let Some(subscription) = config.subscribe.iter_mut().find(|item| item.uid == uid) {
+            if !subscription.groups.contains(&group) {
+                subscription.groups.push(group);
+            }
+        } else {
+            config.subscribe.push(crate::config::Subscribe {
+                uid,
+                groups: vec![group],
+            });
+        }
+    })
+    .await
+    .map_err(CommandError::internal)?;
+    ctx.reply(format!("已为本群订阅 uid={uid}"));
+    Ok(())
+}
+
+async fn live_remove(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    ctx.ensure_no_extra_args(1)?;
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    config::modify_config(|config| {
+        if let Some(index) = config.subscribe.iter().position(|item| item.uid == uid) {
+            let subscription = &mut config.subscribe[index];
+            subscription.groups.retain(|item| *item != group);
+            if subscription.groups.is_empty() {
+                config.subscribe.remove(index);
+            }
+        }
+    })
+    .await
+    .map_err(CommandError::internal)?;
+    ctx.reply(format!("已取消本群对 uid={uid} 的订阅"));
+    Ok(())
+}
+
+async fn live_list(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let uids = config::read_config()
+        .subscribe
         .iter()
-        .any(|id| id.try_as_i64() == Some(user_id))
+        .filter(|subscription| subscription.groups.contains(&group))
+        .map(|subscription| subscription.uid)
+        .collect::<Vec<_>>();
+    if uids.is_empty() {
+        ctx.reply("本群尚未订阅任何直播间");
+        return Ok(());
+    }
+
+    let names = fetch_uid_names(&uids)
+        .await
+        .map_err(CommandError::internal)?;
+    let mut output = String::from("订阅列表：");
+    for (uid, name) in names {
+        write!(&mut output, "\n{name} ({uid})").unwrap();
+    }
+    ctx.reply(output);
+    Ok(())
+}
+
+async fn dynamic_add(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    ctx.ensure_no_extra_args(1)?;
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let added = dynamics::add_subscribe(uid, group)
+        .await
+        .map_err(CommandError::internal)?;
+    ctx.reply(if added {
+        format!("已为本群订阅动态 uid={uid}")
+    } else {
+        format!("本群已订阅 uid={uid}")
+    });
+    Ok(())
+}
+
+async fn dynamic_remove(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    ctx.ensure_no_extra_args(1)?;
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    dynamics::remove_subscribe(uid, group)
+        .await
+        .map_err(CommandError::internal)?;
+    ctx.reply(format!("已取消本群对 uid={uid} 的动态订阅"));
+    Ok(())
+}
+
+async fn dynamic_list(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let entries = dynamics::list_subscribes(group).await;
+    if entries.is_empty() {
+        ctx.reply("本群尚未订阅任何动态");
+        return Ok(());
+    }
+
+    let uids = entries.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
+    let names = fetch_uid_names(&uids)
+        .await
+        .map_err(CommandError::internal)?;
+    let mut output = String::from("动态订阅列表：");
+    for uid in uids {
+        let name = names.get(&uid).cloned().unwrap_or_default();
+        write!(&mut output, "\n{name} ({uid})").unwrap();
+    }
+    ctx.reply(output);
+    Ok(())
+}
+
+async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    let count = match ctx.arg(1) {
+        Some(_) => ctx.parse_arg::<usize>(1, "count")?,
+        None => 1,
+    };
+    ctx.ensure_no_extra_args(2)?;
+    if !(1..=dynamics::MAX_FETCH_COUNT).contains(&count) {
+        return Err(CommandError::user(format!(
+            "count 必须是 1..={}",
+            dynamics::MAX_FETCH_COUNT
+        )));
+    }
+
+    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let items = dynamics::fetch_recent(uid, count)
+        .await
+        .map_err(CommandError::internal)?;
+    if items.is_empty() {
+        ctx.reply(format!("uid={uid} 无动态"));
+        return Ok(());
+    }
+
+    let mut pushed = 0;
+    for item in &items {
+        let author = dynamics::author_of(item);
+        if let Err(error) = dynamics::push_dynamic(ctx.bot(), group, &author, item).await {
+            tracing::warn!("渲染失败 uid={uid}: {error}");
+        } else {
+            pushed += 1;
+        }
+    }
+    ctx.reply(format!("已推送 {pushed}/{} 条动态", items.len()));
+    Ok(())
 }
 
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
@@ -406,5 +337,54 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
             ));
 
         event.reply(msg);
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use utils::command::{MessageScope, Permission, ResolveOutcome};
+
+    fn resolved(tree: &utils::command::CommandTree, input: &str) -> (Permission, MessageScope) {
+        let ResolveOutcome::Matched(command) = tree.resolve(input) else {
+            panic!("expected {input} to resolve");
+        };
+        (command.permission(), command.scope())
+    }
+
+    #[test]
+    fn live_tree_has_group_scope_alias_and_mixed_permissions() {
+        let tree = utils::command::CommandTree::new(vec![super::live_command()]).unwrap();
+
+        assert_eq!(
+            resolved(&tree, "/live list"),
+            (Permission::Everyone, MessageScope::Group)
+        );
+        for command in ["/live add 1", "/live rm 1", "/live remove 1"] {
+            assert_eq!(
+                resolved(&tree, command),
+                (Permission::BotAdmin, MessageScope::Group)
+            );
+        }
+        let ResolveOutcome::Matched(alias) = tree.resolve("/live remove 1") else {
+            panic!("expected remove alias to resolve");
+        };
+        assert_eq!(alias.path(), ["/live", "rm"]);
+        assert!(matches!(tree.resolve("/livefoo"), ResolveOutcome::Ignored));
+    }
+
+    #[test]
+    fn dynamic_tree_has_public_list_and_admin_mutations() {
+        let tree = utils::command::CommandTree::new(vec![super::dynamic_command()]).unwrap();
+
+        assert_eq!(
+            resolved(&tree, "/dynamic list"),
+            (Permission::Everyone, MessageScope::Group)
+        );
+        for command in ["/dynamic add 1", "/dynamic rm 1", "/dynamic fetch 1 2"] {
+            assert_eq!(
+                resolved(&tree, command),
+                (Permission::BotAdmin, MessageScope::Group)
+            );
+        }
     }
 }

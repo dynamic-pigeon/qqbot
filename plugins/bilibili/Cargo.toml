@@ -11,7 +11,6 @@ serde.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
-help_msg.workspace = true
 regex.workspace = true
 base64.workspace = true
 tracing.workspace = true
