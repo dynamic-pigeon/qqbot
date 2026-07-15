@@ -6,11 +6,13 @@ edition = "2024"
 [dependencies]
 pulldown-cmark.workspace = true
 kovi.workspace = true
+kovi-onebot.workspace = true
 anyhow.workspace = true
 askama.workspace = true
 chromiumoxide.workspace = true
 futures.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
 arc-swap.workspace = true
 reqwest.workspace = true
 ammonia.workspace = true
