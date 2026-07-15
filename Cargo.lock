@@ -293,7 +293,6 @@ dependencies = [
  "arc-swap",
  "base64",
  "bytes",
- "help_msg",
  "kovi",
  "kovi-onebot",
  "regex",
