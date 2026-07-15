@@ -9,8 +9,11 @@ use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, Pixel as _, Rgba, imageops::FilterType};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, tokio};
-use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, OnebotTrait, event::GroupMsgEvent};
+use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use tracing::{self, info};
+use utils::command::{
+    Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
+};
 use wordcloud::{Mask, WordCloud};
 
 use crate::config::{modify_config, read_config};
@@ -41,22 +44,7 @@ const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
     Rgba([92, 38, 134, 255]),
 ];
 
-pub(crate) async fn init() -> Result<()> {
-    help_msg::register_help(
-        "wordcloud",
-        "启用、禁用或临时生成词云（管理员专用命令）",
-        "/wordcloud enable - 启用词云功能\n/wordcloud disable - 禁用词云功能\n/wordcloud once - 立即生成一次今日词云",
-    )
-    .await;
-    let bot = plugin::get_runtime_bot();
-    let bot_ = Arc::clone(&bot);
-    let path = Arc::new(bot.get_data_path());
-    let path_ = Arc::clone(&path);
-    plugin::on_group_msg(move |event| {
-        let bot = Arc::clone(&bot_);
-        let path = Arc::clone(&path_);
-        cmd_handler(event, path, bot)
-    });
+pub(crate) async fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
     let bot_ = Arc::clone(&bot);
     let path_ = Arc::clone(&path);
     plugin::cron("0 21 * * *", move || {
@@ -96,77 +84,89 @@ pub(crate) async fn init() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_handler(event: Arc<GroupMsgEvent>, path: Arc<PathBuf>, bot: Arc<RuntimeBot>) {
-    let group_id = event.group_id;
+pub(crate) fn wordcloud_command(path: Arc<PathBuf>) -> Command {
+    let once_path = Arc::clone(&path);
+    Command::new("/wordcloud")
+        .description("启用、禁用或临时生成词云")
+        .usage("/wordcloud <once|enable|disable|status>")
+        .scope(MessageScope::Group)
+        .permission(Permission::BotAdmin)
+        .subcommand(
+            Command::new("once")
+                .description("立即生成一次今日词云")
+                .usage("/wordcloud once")
+                .handler(move |ctx| {
+                    let path = Arc::clone(&once_path);
+                    async move { wordcloud_once(ctx, path).await }
+                }),
+        )
+        .subcommand(
+            Command::new("enable")
+                .description("启用本群词云")
+                .usage("/wordcloud enable")
+                .handler(wordcloud_enable),
+        )
+        .subcommand(
+            Command::new("disable")
+                .description("停用本群词云")
+                .usage("/wordcloud disable")
+                .handler(wordcloud_disable),
+        )
+        .subcommand(
+            Command::new("status")
+                .description("查看本群词云状态")
+                .usage("/wordcloud status")
+                .handler(wordcloud_status),
+        )
+}
 
-    let text = event.borrow_text().unwrap_or_default();
-    let msg = text.trim();
+async fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let bot = Arc::clone(ctx.bot());
+    ctx.reply("⏳ 正在生成词云...");
+    kovi::spawn(async move {
+        send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "临时词云").await;
+    });
+    Ok(())
+}
 
-    let Some(msg) = msg.strip_prefix("/wordcloud ") else {
-        return;
-    };
-
-    if !bot
-        .get_all_admin()
-        .unwrap_or_default()
-        .iter()
-        .any(|id| id.try_as_i64() == Some(event.user_id))
-    {
-        event.reply("❌ 管理员专用命令，普通用户无法使用");
-        return;
-    }
-
-    let cmd = msg.trim();
-
-    if cmd == "once" {
-        event.reply("⏳ 正在生成词云...");
-        kovi::spawn(async move {
-            send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "临时词云").await;
-        });
-        return;
-    }
-
-    let exe_cmd = async |cmd: &str, group_id: i64| -> Result<&str> {
-        match cmd {
-            "enable" => {
-                modify_config(|config| {
-                    if !config.notify_group.contains(&group_id) {
-                        config.notify_group.push(group_id);
-                    }
-                })
-                .await?;
-                Ok("启用成功")
-            }
-            "disable" => {
-                modify_config(|config| {
-                    config.notify_group.retain(|&id| id != group_id);
-                })
-                .await?;
-                Ok("停用成功")
-            }
-            "status" => {
-                let config = read_config();
-                if config.notify_group.contains(&group_id) {
-                    Ok("词云功能已启用")
-                } else {
-                    Ok("词云功能未启用")
-                }
-            }
-            _ => {
-                anyhow::bail!("未知命令: {}", cmd);
-            }
+async fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    modify_config(|config| {
+        if !config.notify_group.contains(&group_id) {
+            config.notify_group.push(group_id);
         }
-    };
+    })
+    .await
+    .map_err(CommandError::internal)?;
+    ctx.reply("启用成功");
+    Ok(())
+}
 
-    match exe_cmd(cmd, group_id).await {
-        Ok(res) => {
-            event.reply(res);
-        }
-        Err(e) => {
-            tracing::error!("执行命令失败: {}", e);
-            event.reply(format!("执行命令失败: {}", e));
-        }
-    }
+async fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    modify_config(|config| {
+        config.notify_group.retain(|&id| id != group_id);
+    })
+    .await
+    .map_err(CommandError::internal)?;
+    ctx.reply("停用成功");
+    Ok(())
+}
+
+async fn wordcloud_status(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let enabled = read_config().notify_group.contains(&group_id);
+    ctx.reply(if enabled {
+        "词云功能已启用"
+    } else {
+        "词云功能未启用"
+    });
+    Ok(())
 }
 
 async fn send_word_cloud(
@@ -400,6 +400,29 @@ struct WordCloudItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use utils::command::{Permission, ResolveOutcome, RouteError};
+
+    #[test]
+    fn command_tree_registers_admin_group_subcommands() {
+        let tree = utils::command::CommandTree::new(vec![wordcloud_command(Arc::new(
+            PathBuf::from("/tmp"),
+        ))])
+        .unwrap();
+
+        for name in ["once", "enable", "disable", "status"] {
+            let ResolveOutcome::Matched(command) = tree.resolve(&format!("/wordcloud {name}"))
+            else {
+                panic!("expected /wordcloud {name} to resolve");
+            };
+            assert_eq!(command.permission(), Permission::BotAdmin);
+            assert_eq!(command.scope(), utils::command::MessageScope::Group);
+        }
+
+        assert!(matches!(
+            tree.resolve("/wordcloud"),
+            ResolveOutcome::Error(RouteError::MissingSubcommand { .. })
+        ));
+    }
 
     #[test]
     fn test_count_words_orders_by_weight() {

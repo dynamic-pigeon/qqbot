@@ -6,6 +6,7 @@ use std::{
 use futures::future::join_all;
 use kovi::{Message, PluginBuilder as plugin, tokio};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
+use utils::command::CommandRouter;
 
 #[macro_use]
 mod config;
@@ -62,9 +63,16 @@ async fn main() {
     db::init_db(&db_path).await.unwrap();
     plugin::drop(|| async move { db::flush_on_shutdown().await });
 
+    CommandRouter::new("msg_rank", Arc::clone(&bot))
+        .register(word_cloud::wordcloud_command(Arc::clone(&path)))
+        .register(msg_rank::daily_rank_command())
+        .install()
+        .expect("注册发言排行与词云命令失败");
+
     plugin::on_group_msg(add_msg);
-    word_cloud::init().await.unwrap();
-    msg_rank::init().await.unwrap();
+    word_cloud::init(Arc::clone(&bot), Arc::clone(&path))
+        .await
+        .unwrap();
 }
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
