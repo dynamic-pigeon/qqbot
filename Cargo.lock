@@ -1250,7 +1250,7 @@ name = "help_msg"
 version = "0.1.0"
 dependencies = [
  "kovi",
- "kovi-onebot",
+ "utils",
 ]
 
 [[package]]
