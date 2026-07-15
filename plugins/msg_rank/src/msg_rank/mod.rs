@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -8,9 +8,9 @@ use anyhow::Result;
 use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
-use help_msg::register_help;
-use kovi::{PluginBuilder as plugin, RuntimeBot};
-use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _};
+use kovi::RuntimeBot;
+use kovi_onebot::MessageRegistrar as _;
+use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
 
 mod user_info;
 
@@ -37,40 +37,30 @@ fn check_rank_cooldown(group_id: i64) -> Option<u64> {
     None
 }
 
-pub async fn init() -> Result<()> {
-    register_help("今日发言排行", "今日发言排行", "#今日发言排行").await;
-    let bot = crate::plugin::get_runtime_bot();
-    plugin::on_group_msg(move |event| {
-        let bot = Arc::clone(&bot);
-        async move {
-            let text = event.borrow_text().unwrap_or_default();
-            if text.trim() != "#今日发言排行" {
-                return;
-            }
-            if let Some(remain) = check_rank_cooldown(event.group_id) {
-                event.reply(format!("⏳ 刚跑完，{} 秒后再试一次喵～", remain));
-                return;
-            }
-            let reply = async {
-                let html = gen_daily_rank_html(&bot, event.group_id).await?;
-                let image = utils::screenshot(&html, None).await?;
-                Result::<Vec<u8>>::Ok(image)
-            }
-            .await;
+pub(crate) fn daily_rank_command() -> Command {
+    Command::new("#今日发言排行")
+        .description("生成今日发言排行")
+        .usage("#今日发言排行")
+        .scope(MessageScope::Group)
+        .handler(handle_daily_rank)
+}
 
-            match reply {
-                Ok(image) => {
-                    let base64_image = STANDARD.encode(image);
-                    let msg = kovi::Message::new().add_image(&format!("base64://{}", base64_image));
-                    event.reply(msg);
-                }
-                Err(e) => {
-                    tracing::error!("生成发言排行失败: {}", e);
-                    event.reply(format!("❌ 生成发言排行失败: {}", e));
-                }
-            }
-        }
-    });
+async fn handle_daily_rank(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    if let Some(remain) = check_rank_cooldown(group_id) {
+        return Err(CommandError::user(format!("刚跑完，{remain} 秒后再试一次")));
+    }
+
+    let html = gen_daily_rank_html(ctx.bot(), group_id)
+        .await
+        .map_err(CommandError::internal)?;
+    let image = utils::screenshot(&html, None)
+        .await
+        .map_err(CommandError::internal)?;
+    let base64_image = STANDARD.encode(image);
+    let message = kovi::Message::new().add_image(&format!("base64://{base64_image}"));
+    ctx.reply(message);
     Ok(())
 }
 
@@ -181,7 +171,7 @@ fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> Result<String> {
                     STANDARD.encode(
                         format!(
                             r##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"><circle cx="40" cy="40" r="40" fill="#888"/><text x="50%" y="55%" text-anchor="middle" fill="white" font-size="28" font-family="sans-serif">{}</text></svg>"##,
-                            &info.nickname.chars().next().unwrap_or('?')
+                            info.nickname.chars().next().unwrap_or('?')
                         )
                     )
                 )
@@ -213,4 +203,24 @@ fn render_rank_html(entries: &[(user_info::UserInfo, u32)]) -> Result<String> {
 fn bar_percent(entries: &[(user_info::UserInfo, u32)], cnt: u32) -> u32 {
     let max = entries.first().map(|(_, c)| *c).unwrap_or(1).max(1);
     (cnt as u64 * 100 / max as u64) as u32
+}
+
+#[cfg(test)]
+mod command_tests {
+    use utils::command::{MessageScope, Permission, ResolveOutcome};
+
+    #[test]
+    fn daily_rank_is_a_public_group_command() {
+        let tree = utils::command::CommandTree::new(vec![super::daily_rank_command()]).unwrap();
+        let ResolveOutcome::Matched(command) = tree.resolve("#今日发言排行") else {
+            panic!("expected rank command to resolve");
+        };
+
+        assert_eq!(command.scope(), MessageScope::Group);
+        assert_eq!(command.permission(), Permission::Everyone);
+        assert!(matches!(
+            tree.resolve("#今日发言排行榜"),
+            ResolveOutcome::Ignored
+        ));
+    }
 }

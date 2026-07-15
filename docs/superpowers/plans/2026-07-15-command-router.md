@@ -23,7 +23,7 @@
 - Modify `plugins/help_msg/src/lib.rs` and `plugins/help_msg/Cargo.toml`: replace the manual registry with `/help` backed by the catalog.
 - Modify `plugins/markdown/src/lib.rs` and `plugins/markdown/Cargo.toml`: register and handle `!md` through the router.
 - Modify `plugins/yu_gi_oh/src/lib.rs` and `plugins/yu_gi_oh/Cargo.toml`: register and handle `/查卡` through the router.
-- Modify `plugins/msg_rank/src/word_cloud.rs` and `plugins/msg_rank/Cargo.toml`: register the `/wordcloud` tree.
+- Modify `plugins/msg_rank/src/lib.rs`, `plugins/msg_rank/src/msg_rank/mod.rs`, `plugins/msg_rank/src/word_cloud.rs`, and `plugins/msg_rank/Cargo.toml`: register `#今日发言排行` and the `/wordcloud` tree through one plugin router.
 - Modify `plugins/bilibili/src/lib.rs` and `plugins/bilibili/Cargo.toml`: register the `/live` and `/dynamic` trees.
 - Modify `Cargo.lock`: record workspace dependency graph changes if Cargo rewrites it.
 
@@ -452,9 +452,11 @@ git add plugins/markdown plugins/yu_gi_oh Cargo.lock
 git commit -m "refactor(commands): migrate markdown and card query"
 ```
 
-### Task 5: Word Cloud Command Tree
+### Task 5: Message Rank and Word Cloud Command Trees
 
 **Files:**
+- Modify: `plugins/msg_rank/src/lib.rs`
+- Modify: `plugins/msg_rank/src/msg_rank/mod.rs`
 - Modify: `plugins/msg_rank/src/word_cloud.rs`
 - Modify: `plugins/msg_rank/Cargo.toml`
 
@@ -466,11 +468,23 @@ Run: `cargo test -p msg_rank word_cloud::tests::command_tree --lib --locked`
 
 Expected: compilation fails because `wordcloud_command` does not exist.
 
-- [ ] **Step 2: Replace `cmd_handler` with four async routed handlers**
+- [ ] **Step 2: Write a failing daily-rank command test**
+
+Extract `daily_rank_command() -> Command` and test that `#今日发言排行` resolves as `MessageScope::Group` plus `Permission::Everyone`, while `#今日发言排行榜` is ignored as a different root.
+
+Run: `cargo test -p msg_rank msg_rank::command_tests::daily_rank_is_a_public_group_command --lib --locked`
+
+Expected: compilation fails because `daily_rank_command` does not exist.
+
+- [ ] **Step 3: Replace `cmd_handler` with four async routed handlers**
 
 The `once` closure captures `Arc<PathBuf>`, replies with the progress message, then spawns `send_word_cloud`. The other three handlers use `ctx.event().group_id`, call `modify_config` or `read_config`, and map configuration failures to `CommandError::Internal`. Register the root before cron jobs and delete the repeated `get_all_admin` check and string match.
 
-- [ ] **Step 3: Verify GREEN and commit**
+- [ ] **Step 4: Route the daily rank handler and install one plugin router**
+
+Move the existing cooldown, rendering, screenshot, and image reply into a `CommandContext` handler. Install `daily_rank_command()` and `wordcloud_command()` together from `plugins/msg_rank/src/lib.rs`, preserving the message collection listener and word-cloud cron jobs.
+
+- [ ] **Step 5: Verify GREEN and commit**
 
 Run:
 

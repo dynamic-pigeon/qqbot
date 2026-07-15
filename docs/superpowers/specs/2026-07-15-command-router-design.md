@@ -250,6 +250,7 @@ CommandMetadata {
 | `/help [path...]` | `Any` | `Everyone` |
 | `!md <content>` | `Any` | `Everyone` |
 | `/查卡 <card_name>` | `Any` | `Everyone` |
+| `#今日发言排行` | `Group` | `Everyone` |
 | `/wordcloud once` | `Group` | `BotAdmin` |
 | `/wordcloud enable` | `Group` | `BotAdmin` |
 | `/wordcloud disable` | `Group` | `BotAdmin` |
@@ -305,7 +306,7 @@ cargo test --workspace --all-targets --locked
 2. 实现 Kovi `MsgEvent` 适配和每插件 `CommandRouter::install()`。
 3. 将 `help_msg` 改为读取 `CommandCatalog` 并通过路由器注册 `/help`。
 4. 迁移 `/help`、`!md` 和 `/查卡`。
-5. 迁移 `/wordcloud`。
+5. 迁移 `#今日发言排行` 和 `/wordcloud`。
 6. 迁移 `/live` 和 `/dynamic`。
 7. 删除重复帮助注册和不再需要的依赖。
 8. 格式化并运行工作区全部静态检查与测试。
