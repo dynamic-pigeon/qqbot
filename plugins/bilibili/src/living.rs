@@ -152,9 +152,8 @@ async fn notify(
 }
 
 async fn fetch_img(url: &str) -> anyhow::Result<Bytes> {
-    let bytes = utils::download_image_limited(
+    let bytes = crate::image::download_bili_image(
         url,
-        crate::dynamics::ALLOWED_BILI_HOSTS,
         10 * 1024 * 1024,
         std::time::Duration::from_secs(10),
     )

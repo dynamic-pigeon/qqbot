@@ -73,15 +73,11 @@ impl ApiRes {
         let data = self
             .data
             .ok_or_else(|| BvError::RequestBodyError("API返回缺少data字段".to_string()))?;
-        let pic = utils::download_image_limited(
-            &data.pic,
-            crate::dynamics::ALLOWED_BILI_HOSTS,
-            10 * 1024 * 1024,
-            Duration::from_secs(10),
-        )
-        .await
-        .map(bytes::Bytes::from)
-        .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
+        let pic =
+            crate::image::download_bili_image(&data.pic, 10 * 1024 * 1024, Duration::from_secs(10))
+                .await
+                .map(bytes::Bytes::from)
+                .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
 
         Ok(BvInfo {
             title: data.title,
@@ -215,6 +211,7 @@ mod tests {
     const GROUP_LONG: i64 = i64::MAX - 100;
     const GROUP_INVALID: i64 = i64::MAX - 101;
     const GROUP_V_TEXT: i64 = i64::MAX - 102;
+    const GROUP_HTTP_COVER: i64 = i64::MAX - 103;
 
     #[tokio::test]
     #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
@@ -226,6 +223,16 @@ mod tests {
         println!("观看: {}", info.view);
         println!("评论: {}", info.coin);
         println!("点赞: {}", info.like);
+    }
+
+    #[tokio::test]
+    #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
+    async fn test_http_cover() {
+        let url = "https://www.bilibili.com/video/BV1CVNU6xEom";
+        let info = parse_url(url, GROUP_HTTP_COVER).await.unwrap();
+
+        assert!(!info.pic.is_empty());
+        assert_eq!(info.url, url);
     }
 
     #[tokio::test]

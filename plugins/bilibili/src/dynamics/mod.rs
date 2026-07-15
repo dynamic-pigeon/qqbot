@@ -356,13 +356,9 @@ fn format_author_header(author: &DynamicAuthor) -> String {
 
 async fn fetch_image(url: &str) -> anyhow::Result<Bytes> {
     const MAX_DYNAMIC_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-    let bytes = utils::download_image_limited(
-        url,
-        ALLOWED_BILI_HOSTS,
-        MAX_DYNAMIC_IMAGE_BYTES,
-        Duration::from_secs(15),
-    )
-    .await?;
+    let bytes =
+        crate::image::download_bili_image(url, MAX_DYNAMIC_IMAGE_BYTES, Duration::from_secs(15))
+            .await?;
     Ok(Bytes::from(bytes))
 }
 
