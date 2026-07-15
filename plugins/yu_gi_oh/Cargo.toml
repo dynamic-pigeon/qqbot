@@ -9,7 +9,6 @@ kovi-onebot.workspace = true
 serde.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
-help_msg.workspace = true
 base64.workspace = true
 bytes.workspace = true
 tracing.workspace = true

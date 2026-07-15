@@ -6,7 +6,8 @@ use std::{
 
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
-use kovi_onebot::*;
+use kovi_onebot::MessageRegistrar as _;
+use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
 const MARKDOWN_COOLDOWN: Duration = Duration::from_secs(10);
@@ -31,39 +32,68 @@ fn check_cooldown(user_id: i64) -> Option<u64> {
     None
 }
 
+fn markdown_command() -> Command {
+    Command::new("!md")
+        .description("根据 Markdown 生成图片")
+        .usage("!md <Markdown 内容>")
+        .handler(handle_markdown)
+}
+
+async fn handle_markdown(ctx: CommandContext) -> CommandResult {
+    let md_content = ctx.rest();
+    if ctx.trimmed_rest().is_empty() {
+        return Err(CommandError::MissingArgument {
+            name: "Markdown 内容".to_owned(),
+        });
+    }
+    if md_content.len() > MAX_MARKDOWN_BYTES {
+        return Err(CommandError::user(format!(
+            "Markdown 内容过长，最大允许 {} KiB",
+            MAX_MARKDOWN_BYTES / 1024
+        )));
+    }
+    if let Some(remaining) = check_cooldown(ctx.event().user_id) {
+        return Err(CommandError::user(format!(
+            "请求过于频繁，请在 {remaining} 秒后重试"
+        )));
+    }
+
+    let img = utils::md_to_img(md_content)
+        .await
+        .map_err(CommandError::internal)?;
+    let base64_img = base64::engine::general_purpose::STANDARD.encode(&img);
+    let message = Message::new().add_image(&format!("base64://{base64_img}"));
+    ctx.reply_and_quote(message);
+    Ok(())
+}
+
 #[kovi::plugin]
 async fn main() {
-    help_msg::register_help("md", "根据 md 生成图片", "!md [md context]").await;
+    let bot = plugin::get_runtime_bot();
+    CommandRouter::new("markdown", bot)
+        .register(markdown_command())
+        .install()
+        .expect("注册 !md 命令失败");
+}
 
-    plugin::on_msg(|event| async move {
-        let msg = event.borrow_text().unwrap_or_default();
+#[cfg(test)]
+mod tests {
+    use utils::command::{CommandTree, ResolveOutcome};
 
-        let Some(md_content) = msg.strip_prefix("!md ") else {
-            return;
-        };
-        if md_content.len() > MAX_MARKDOWN_BYTES {
-            event.reply_and_quote(format!(
-                "Markdown 内容过长，最大允许 {} KiB",
-                MAX_MARKDOWN_BYTES / 1024
-            ));
-            return;
-        }
-        if let Some(remaining) = check_cooldown(event.user_id) {
-            event.reply_and_quote(format!("请求过于频繁，请在 {remaining} 秒后重试"));
-            return;
-        }
-
-        let img = match utils::md_to_img(md_content).await {
-            Ok(data) => data,
-            Err(err) => {
-                tracing::warn!(user_id = event.user_id, "生成 Markdown 图片失败: {err}");
-                event.reply_and_quote("生成图片失败，请稍后重试");
-                return;
-            }
+    #[test]
+    fn markdown_command_preserves_raw_content() {
+        let tree = CommandTree::new(vec![super::markdown_command()]).unwrap();
+        let ResolveOutcome::Matched(command) = tree.resolve("!md   # title") else {
+            panic!("expected !md to resolve");
         };
 
-        let base64_img = base64::engine::general_purpose::STANDARD.encode(&img);
-        let msg = Message::new().add_image(&format!("base64://{}", base64_img));
-        event.reply_and_quote(msg);
-    });
+        assert_eq!(command.path(), ["!md"]);
+        assert_eq!(command.rest(), "  # title");
+    }
+
+    #[test]
+    fn markdown_command_resolves_without_content_for_error_handling() {
+        let tree = CommandTree::new(vec![super::markdown_command()]).unwrap();
+        assert!(matches!(tree.resolve("!md"), ResolveOutcome::Matched(_)));
+    }
 }

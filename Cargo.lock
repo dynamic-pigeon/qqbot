@@ -1866,7 +1866,6 @@ name = "markdown"
 version = "0.1.0"
 dependencies = [
  "base64",
- "help_msg",
  "kovi",
  "kovi-onebot",
  "tracing",
@@ -4272,7 +4271,6 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
- "help_msg",
  "kovi",
  "kovi-onebot",
  "reqwest",
