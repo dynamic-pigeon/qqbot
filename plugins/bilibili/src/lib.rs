@@ -19,6 +19,7 @@ use crate::{
 mod bv_parser;
 mod config;
 pub mod dynamics;
+mod image;
 mod living;
 
 static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
