@@ -1,4 +1,5 @@
 mod bounded_pool;
+pub mod command;
 mod markdown;
 mod rcu;
 mod screen_shot;

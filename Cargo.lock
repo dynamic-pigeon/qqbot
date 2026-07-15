@@ -3761,8 +3761,10 @@ dependencies = [
  "chromiumoxide",
  "futures",
  "kovi",
+ "kovi-onebot",
  "pulldown-cmark",
  "reqwest",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
