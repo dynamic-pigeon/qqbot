@@ -242,19 +242,28 @@ async fn dynamic_list(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
-async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
-    let uid = ctx.parse_arg::<u64>(0, "uid")?;
-    let count = match ctx.arg(1) {
-        Some(_) => ctx.parse_arg::<usize>(1, "count")?,
+fn parse_dynamic_fetch_count(value: Option<&str>) -> Result<usize, CommandError> {
+    let count = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| CommandError::InvalidArgument {
+                name: "count".to_owned(),
+            })?,
         None => 1,
     };
-    ctx.ensure_no_extra_args(2)?;
     if !(1..=dynamics::MAX_FETCH_COUNT).contains(&count) {
         return Err(CommandError::user(format!(
             "count 必须是 1..={}",
             dynamics::MAX_FETCH_COUNT
         )));
     }
+    Ok(count)
+}
+
+async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
+    let uid = ctx.parse_arg::<u64>(0, "uid")?;
+    let count = parse_dynamic_fetch_count(ctx.arg(1))?;
+    ctx.ensure_no_extra_args(2)?;
 
     let group = ctx.event().group_id.expect("群命令已通过范围校验");
     let items = dynamics::fetch_recent(uid, count)
@@ -342,7 +351,7 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
 
 #[cfg(test)]
 mod command_tests {
-    use utils::command::{MessageScope, Permission, ResolveOutcome};
+    use utils::command::{CommandError, MessageScope, Permission, ResolveOutcome};
 
     fn resolved(tree: &utils::command::CommandTree, input: &str) -> (Permission, MessageScope) {
         let ResolveOutcome::Matched(command) = tree.resolve(input) else {
@@ -386,5 +395,25 @@ mod command_tests {
                 (Permission::BotAdmin, MessageScope::Group)
             );
         }
+    }
+
+    #[test]
+    fn dynamic_fetch_count_defaults_and_enforces_bounds() {
+        assert_eq!(super::parse_dynamic_fetch_count(None).unwrap(), 1);
+        assert_eq!(
+            super::parse_dynamic_fetch_count(Some(&super::dynamics::MAX_FETCH_COUNT.to_string()))
+                .unwrap(),
+            super::dynamics::MAX_FETCH_COUNT
+        );
+        for value in ["0", "999999"] {
+            assert!(matches!(
+                super::parse_dynamic_fetch_count(Some(value)),
+                Err(CommandError::User(_))
+            ));
+        }
+        assert!(matches!(
+            super::parse_dynamic_fetch_count(Some("not-a-number")),
+            Err(CommandError::InvalidArgument { ref name }) if name == "count"
+        ));
     }
 }

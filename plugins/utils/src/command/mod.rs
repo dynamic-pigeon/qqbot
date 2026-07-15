@@ -10,7 +10,7 @@ pub use model::{
     Command, CommandArguments, CommandContext, CommandError, CommandResult, MessageScope,
     Permission, render_command_error,
 };
-pub use router::CommandRouter;
+pub use router::{CommandRouter, extract_command_text};
 pub use tree::{
     CommandRegistrationError, CommandTree, ResolveOutcome, ResolvedCommand, RouteError,
 };

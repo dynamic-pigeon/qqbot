@@ -217,7 +217,7 @@ fn collect_entries(
 fn root_name_matches(registered: &str, requested: &str) -> bool {
     registered == requested
         || registered
-            .strip_prefix(['/', '!'])
+            .strip_prefix(['/', '!', '#'])
             .is_some_and(|name| name == requested)
 }
 

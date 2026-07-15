@@ -24,12 +24,16 @@ pub enum RouteError {
         path: Vec<String>,
         usage: String,
         available: Vec<String>,
+        permission: Permission,
+        scope: MessageScope,
     },
     UnknownSubcommand {
         path: Vec<String>,
         subcommand: String,
         usage: String,
         available: Vec<String>,
+        permission: Permission,
+        scope: MessageScope,
     },
 }
 
@@ -50,6 +54,21 @@ impl fmt::Display for RouteError {
                 usage,
                 available,
             ),
+        }
+    }
+}
+
+impl RouteError {
+    pub fn permission(&self) -> Permission {
+        match self {
+            Self::MissingSubcommand { permission, .. }
+            | Self::UnknownSubcommand { permission, .. } => *permission,
+        }
+    }
+
+    pub fn scope(&self) -> MessageScope {
+        match self {
+            Self::MissingSubcommand { scope, .. } | Self::UnknownSubcommand { scope, .. } => *scope,
         }
     }
 }
@@ -174,6 +193,8 @@ impl CommandTree {
 
         let Some(handler) = node.handler.clone() else {
             let usage = node.usage.clone();
+            let permission = node.permission.unwrap_or_default();
+            let scope = node.scope.unwrap_or_default();
             let available = node
                 .children
                 .iter()
@@ -185,11 +206,15 @@ impl CommandTree {
                     subcommand: input[span.clone()].to_owned(),
                     usage,
                     available,
+                    permission,
+                    scope,
                 }),
                 None => ResolveOutcome::Error(RouteError::MissingSubcommand {
                     path,
                     usage,
                     available,
+                    permission,
+                    scope,
                 }),
             };
         };

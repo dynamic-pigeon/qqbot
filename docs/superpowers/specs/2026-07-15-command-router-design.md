@@ -144,6 +144,8 @@ ctx.reply_and_quote(message)
 
 `rest()` 返回匹配路径之后、移除一个命令分隔空白后的原始内容，不改变后续缩进和尾部空白。`trimmed_rest()` 在此基础上移除首尾空白。`!md` 使用 `rest()`，`/查卡` 使用 `trimmed_rest()`。
 
+Kovi 适配层直接拼接 `MsgEvent::message` 中的文本段，不使用会裁剪首尾空白的 `MsgEvent::text`，保证 `rest()` 的原文契约在实际消息处理链中成立。
+
 不支持引号和转义。需要空格的参数必须读取剩余原文。
 
 ## 权限与消息范围
@@ -235,6 +237,7 @@ CommandMetadata {
 - `/help` 列出所有根命令及说明。
 - `/help live` 和 `/help /live` 展示 `/live` 说明及直接子命令。
 - `/help live add` 展示具体用法、权限和别名。
+- `/help 今日发言排行` 和 `/help #今日发言排行` 等价。
 - 查询不存在的路径时回复“帮助信息不存在”。
 
 父节点帮助由命令树自动生成，叶子节点使用注册时提供的 `usage`。命令名称、别名、权限和帮助信息只有一个数据来源。
@@ -284,6 +287,7 @@ CommandMetadata {
 - 主名称和别名得到相同匹配节点。
 - Unicode 空白分词。
 - `rest()` 保留 Markdown 缩进，`trimmed_rest()` 去除首尾空白。
+- Kovi 消息文本段适配不裁剪 `rest()` 的首尾内容。
 - 中间节点缺少子命令和未知子命令。
 - `Everyone` 与 `BotAdmin` 权限判定。
 - 权限继承、收紧以及非法放宽的注册错误。

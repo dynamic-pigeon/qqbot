@@ -3,10 +3,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use kovi::Message;
+use kovi_onebot::MessageRegistrar as _;
 use utils::command::{
     AccessError, CatalogStore, Command, CommandArguments, CommandError, CommandRegistrationError,
     CommandTree, MessageScope, MessageSource, Permission, ResolveOutcome, RouteError, check_access,
-    dispatch_if_allowed, render_command_error,
+    dispatch_if_allowed, extract_command_text, render_command_error,
 };
 
 fn endpoint(name: &str) -> Command {
@@ -91,6 +93,31 @@ fn rejects_empty_leaf_and_permission_relaxation() {
 }
 
 #[test]
+fn inherits_scope_and_permission_and_allows_tightening() {
+    let inherited = CommandTree::new(vec![
+        Command::new("/admin")
+            .scope(MessageScope::Group)
+            .permission(Permission::BotAdmin)
+            .subcommand(endpoint("status")),
+    ])
+    .unwrap();
+    let ResolveOutcome::Matched(status) = inherited.resolve("/admin status") else {
+        panic!("expected inherited command to resolve");
+    };
+    assert_eq!(status.scope(), MessageScope::Group);
+    assert_eq!(status.permission(), Permission::BotAdmin);
+
+    let tightened = CommandTree::new(vec![
+        Command::new("/tools").subcommand(endpoint("reload").permission(Permission::BotAdmin)),
+    ])
+    .unwrap();
+    let ResolveOutcome::Matched(reload) = tightened.resolve("/tools reload") else {
+        panic!("expected tightened command to resolve");
+    };
+    assert_eq!(reload.permission(), Permission::BotAdmin);
+}
+
+#[test]
 fn reports_missing_and_unknown_subcommands_at_the_deepest_node() {
     let tree = CommandTree::new(vec![
         Command::new("/live")
@@ -116,7 +143,43 @@ fn reports_missing_and_unknown_subcommands_at_the_deepest_node() {
 }
 
 #[test]
+fn route_errors_retain_the_deepest_nodes_access_rules() {
+    let tree = CommandTree::new(vec![
+        Command::new("/admin")
+            .scope(MessageScope::Group)
+            .permission(Permission::BotAdmin)
+            .usage("/admin <status>")
+            .subcommand(endpoint("status")),
+    ])
+    .unwrap();
+    let ResolveOutcome::Error(error) = tree.resolve("/admin nope") else {
+        panic!("expected a route error");
+    };
+
+    assert_eq!(error.scope(), MessageScope::Group);
+    assert_eq!(error.permission(), Permission::BotAdmin);
+}
+
+#[test]
 fn checks_scope_and_permission() {
+    assert_eq!(
+        check_access(
+            MessageScope::Any,
+            Permission::Everyone,
+            MessageSource::Group,
+            false,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check_access(
+            MessageScope::Any,
+            Permission::Everyone,
+            MessageSource::Private,
+            false,
+        ),
+        Ok(())
+    );
     assert_eq!(
         check_access(
             MessageScope::Group,
@@ -125,6 +188,24 @@ fn checks_scope_and_permission() {
             false,
         ),
         Err(AccessError::GroupOnly)
+    );
+    assert_eq!(
+        check_access(
+            MessageScope::Private,
+            Permission::Everyone,
+            MessageSource::Group,
+            false,
+        ),
+        Err(AccessError::PrivateOnly)
+    );
+    assert_eq!(
+        check_access(
+            MessageScope::Private,
+            Permission::Everyone,
+            MessageSource::Private,
+            false,
+        ),
+        Ok(())
     );
     assert_eq!(
         check_access(
@@ -261,6 +342,30 @@ fn renders_root_parent_leaf_and_missing_help() {
         catalog.render_help(&["missing"]),
         "命令 `missing` 的帮助信息不存在"
     );
+}
+
+#[test]
+fn help_lookup_accepts_a_hash_command_without_its_prefix() {
+    let tree = CommandTree::new(vec![endpoint("#今日发言排行")]).unwrap();
+    let mut catalog = CatalogStore::default();
+    catalog.register("msg_rank", &tree).unwrap();
+
+    let help = catalog.find(&["今日发言排行"]).unwrap();
+    assert_eq!(help.command.path, ["#今日发言排行"]);
+}
+
+#[test]
+fn extracts_message_text_without_trimming_raw_content() {
+    let message = Message::new()
+        .add_text("  !md   first  ")
+        .add_image("base64://ignored")
+        .add_text("  second  ");
+
+    assert_eq!(
+        extract_command_text(&message).as_deref(),
+        Some("  !md   first  \n  second  ")
+    );
+    assert_eq!(extract_command_text(&Message::new()), None);
 }
 
 #[kovi::tokio::test]
