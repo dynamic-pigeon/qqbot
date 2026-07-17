@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::Cursor,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -14,7 +13,7 @@ use tracing::{self, info};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
 };
-use wordcloud::{Mask, WordCloud};
+use wordcloud::{Mask, WordCloud, WordCloudError};
 
 use crate::config::{modify_config, read_config};
 
@@ -234,30 +233,22 @@ async fn make_word_cloud(
     };
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let raw_words: Vec<String> = JIEBA
-            .cut_all(&messages)
-            .into_iter()
-            .map(|t| t.word.to_string())
-            .filter(|s| s.chars().count() > 1)
-            .collect();
-        let items = count_words(raw_words, &stop_words);
-        if items.is_empty() {
+        if messages.is_empty() {
             return Ok(Vec::new());
         }
-        generate_word_cloud_image(&path, items, &background)
+        generate_word_cloud_image(&path, &messages, &stop_words, &background)
     })
     .await
     .map_err(|e| anyhow::anyhow!("词云后台任务失败: {e}"))?
 }
 
-/// 使用 wordcloud-rs 直接生成 PNG 词云图。
+/// 使用 wordcloud-rs 直接处理原始文本生成 PNG 词云图。
 fn generate_word_cloud_image(
     path: &Path,
-    items: Vec<WordCloudItem>,
+    text: &str,
+    stop_words: &[String],
     background: &str,
 ) -> Result<Vec<u8>> {
-    let frequencies = items.into_iter().map(|item| (item.word, item.weight));
-
     let mut builder = WordCloud::builder()
         .dimensions(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .scale(WORDCLOUD_SCALE)
@@ -270,7 +261,18 @@ fn generate_word_cloud_image(
         .min_font_size(4.0)
         .max_font_size(120.0)
         .palette(WORDCLOUD_COLORS)
-        .background_color(parse_background_color(background));
+        .background_color(parse_background_color(background))
+        // 中文分词：jieba 全模式闭包替换默认的英文单词边界。
+        .tokenizer(|text: &str| {
+            JIEBA
+                .cut_all(text)
+                .into_iter()
+                .map(|t| t.word.to_string())
+                .collect()
+        })
+        .stopwords(stop_words.iter().map(String::as_str))
+        // 多字符词阈值，与 Python wordcloud 习惯一致。
+        .min_word_length(2);
 
     // 中文渲染需要 data 目录下的 font.otf 覆盖相应字形。
     let font_path = path.join("font.otf");
@@ -286,9 +288,12 @@ fn generate_word_cloud_image(
     let wordcloud = builder
         .build()
         .map_err(|e| anyhow::anyhow!("初始化词云生成器失败: {e}"))?;
-    let image = wordcloud
-        .generate_from_frequencies(frequencies)
-        .map_err(|e| anyhow::anyhow!("生成词云失败: {e}"))?;
+    // 消息全是停用词、表情或单字时没有有效词可渲染，返回空结果跳过本次发送。
+    let image = match wordcloud.generate(text) {
+        Ok(image) => image,
+        Err(WordCloudError::EmptyInput) => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("生成词云失败: {e}")),
+    };
 
     let mut png = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image)
@@ -373,30 +378,6 @@ async fn load_stop_words(path: &Path) -> Vec<String> {
     }
 }
 
-fn count_words(words: Vec<String>, stop_words: &[String]) -> Vec<WordCloudItem> {
-    let stop_set: std::collections::HashSet<&str> = stop_words.iter().map(|s| s.as_str()).collect();
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for w in words {
-        let w = w.trim().to_string();
-        if w.is_empty() || stop_set.contains(w.as_str()) {
-            continue;
-        }
-        *counts.entry(w).or_insert(0) += 1;
-    }
-    let mut items: Vec<WordCloudItem> = counts
-        .into_iter()
-        .map(|(word, weight)| WordCloudItem { word, weight })
-        .collect();
-    items.sort_by_key(|b| std::cmp::Reverse(b.weight));
-    items.truncate(MAX_WORDS);
-    items
-}
-
-struct WordCloudItem {
-    word: String,
-    weight: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,31 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn test_count_words_orders_by_weight() {
-        let words = vec![
-            "rust".to_string(),
-            "rust".to_string(),
-            "go".to_string(),
-            "go".to_string(),
-            "go".to_string(),
-        ];
-        let items = count_words(words, &[]);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].word, "go");
-        assert_eq!(items[0].weight, 3);
-        assert_eq!(items[1].word, "rust");
-        assert_eq!(items[1].weight, 2);
-    }
-
-    #[test]
-    fn test_count_words_respects_stop_words() {
-        let words = vec!["rust".to_string(), "the".to_string(), "the".to_string()];
-        let items = count_words(words, &["the".to_string()]);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].word, "rust");
-    }
-
-    #[test]
     fn test_normalize_background_color() {
         assert_eq!(normalize_background_color("#161628"), "#161628");
         assert_eq!(normalize_background_color("white"), "#FFFFFF");
@@ -461,22 +417,8 @@ mod tests {
 
     #[test]
     fn test_wordcloud_generate_direct() {
-        let items = vec![
-            WordCloudItem {
-                word: "rust".to_string(),
-                weight: 10,
-            },
-            WordCloudItem {
-                word: "wordcloud".to_string(),
-                weight: 8,
-            },
-            WordCloudItem {
-                word: "layout".to_string(),
-                weight: 6,
-            },
-        ];
-
-        let png = generate_word_cloud_image(Path::new("/nonexistent"), items, "white").unwrap();
+        let text = "rust rust rust rust wordcloud wordcloud layout";
+        let png = generate_word_cloud_image(Path::new("/nonexistent"), text, &[], "white").unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         let image = image::load_from_memory(&png).unwrap().to_rgba8();
@@ -486,5 +428,18 @@ mod tests {
                 .pixels()
                 .any(|pixel| *pixel != Rgba([255, 255, 255, 255]))
         );
+    }
+
+    #[test]
+    fn test_wordcloud_no_usable_words_returns_empty() {
+        let stop_words = vec!["the".to_string()];
+        let result = generate_word_cloud_image(
+            Path::new("/nonexistent"),
+            "the the the",
+            &stop_words,
+            "white",
+        )
+        .unwrap();
+        assert!(result.is_empty());
     }
 }
