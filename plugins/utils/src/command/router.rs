@@ -101,7 +101,8 @@ fn check_event_access(
     scope: super::MessageScope,
     permission: Permission,
 ) -> Result<(), AccessError> {
-    let source = if event.group_id.is_some() {
+    // 群临时会话的私聊消息同样携带 group_id，只有 message_type 能可靠区分来源。
+    let source = if event.message_type == "group" {
         MessageSource::Group
     } else {
         MessageSource::Private
