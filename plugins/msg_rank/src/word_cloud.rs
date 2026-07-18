@@ -1,4 +1,6 @@
 use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
     sync::{
@@ -21,49 +23,70 @@ use wordcloud::{Mask, WordCloud, WordCloudError};
 
 use crate::config::{modify_config, read_config};
 
-static JIEBA_CACHE: LazyLock<JiebaCache> = LazyLock::new(JiebaCache::new);
+static RESOURCE_CACHE: LazyLock<ResourceCache> = LazyLock::new(ResourceCache::new);
 
-/// jieba 词典加载后约占 56MB 常驻内存，而词云每天只生成几次；
-/// 空闲超过此时间后卸载词典，下次生成时重新加载（加载耗时在亚秒级）。
-const JIEBA_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 生成词云的重资源（jieba 词典 ~54MB + 字体 ~16MB）加载后常驻内存，
+/// 而词云每天只生成几次；空闲超过此时间后卸载，下次生成时重新加载（加载耗时在亚秒级）。
+const RESOURCE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// jieba 词典的按需缓存：首次生成词云时加载，空闲超时后自动卸载。
+/// 一次词云生成所需的重资源。
+struct WordCloudResources {
+    jieba: Arc<jieba_rs::Jieba>,
+    /// data/font.otf 的字节；文件不存在时为 None，回退到 wordcloud 内置字体。
+    /// fontdue 每次生成仍会解析字体，但免去了每次从磁盘读 16MB。
+    font_bytes: Option<Arc<[u8]>>,
+}
+
+/// 重资源的按需缓存：首次生成词云时加载，空闲超时后自动卸载。
 /// 进行中的生成任务持有 `Arc` 克隆，卸载只移除缓存引用，内存随任务结束释放。
-struct JiebaCache {
-    jieba: Mutex<Option<Arc<jieba_rs::Jieba>>>,
-    /// 每次取用词典递增；空闲回收任务通过比对代数判断期间是否有新取用。
+struct ResourceCache {
+    resources: Mutex<Option<Arc<WordCloudResources>>>,
+    /// 每次取用资源递增；空闲回收任务通过比对代数判断期间是否有新取用。
     generation: AtomicU64,
     idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
-impl JiebaCache {
+impl ResourceCache {
     fn new() -> Self {
         Self {
-            jieba: Mutex::new(None),
+            resources: Mutex::new(None),
             generation: AtomicU64::new(0),
             idle_task: Mutex::new(None),
         }
     }
 
-    fn get(&self) -> Arc<jieba_rs::Jieba> {
+    fn get(&self, font_path: &Path) -> Result<Arc<WordCloudResources>> {
         let snapshot = self
             .generation
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
-        let jieba = {
-            let mut guard = self.jieba.lock().unwrap_or_else(|p| p.into_inner());
+        let resources = {
+            let mut guard = self.resources.lock().unwrap_or_else(|p| p.into_inner());
             match &*guard {
-                Some(jieba) => Arc::clone(jieba),
+                Some(resources) => Arc::clone(resources),
                 None => {
-                    info!("加载 jieba 词典");
-                    let jieba = Arc::new(jieba_rs::Jieba::new());
-                    *guard = Some(Arc::clone(&jieba));
-                    jieba
+                    info!("加载 jieba 词典与词云字体");
+                    let font_bytes = match std::fs::read(font_path) {
+                        Ok(bytes) => Some(Arc::from(bytes)),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "读取字体失败 {}: {e}",
+                                font_path.display()
+                            ));
+                        }
+                    };
+                    let resources = Arc::new(WordCloudResources {
+                        jieba: Arc::new(jieba_rs::Jieba::new()),
+                        font_bytes,
+                    });
+                    *guard = Some(Arc::clone(&resources));
+                    resources
                 }
             }
         };
         self.schedule_idle_cleanup(snapshot);
-        jieba
+        Ok(resources)
     }
 
     fn schedule_idle_cleanup(&self, snapshot: u64) {
@@ -75,11 +98,11 @@ impl JiebaCache {
         if let Some(previous) = task.take() {
             previous.abort();
         }
-        *task = Some(handle.spawn(try_evict_idle_jieba(snapshot)));
+        *task = Some(handle.spawn(try_evict_idle_resources(snapshot)));
     }
 
     async fn try_evict_idle(&self, snapshot: u64) {
-        tokio::time::sleep(JIEBA_IDLE_TIMEOUT).await;
+        tokio::time::sleep(RESOURCE_IDLE_TIMEOUT).await;
         self.evict_if_unchanged(snapshot);
     }
 
@@ -88,20 +111,20 @@ impl JiebaCache {
         if self.generation.load(Ordering::Relaxed) != snapshot {
             return;
         }
-        let mut guard = self.jieba.lock().unwrap_or_else(|p| p.into_inner());
+        let mut guard = self.resources.lock().unwrap_or_else(|p| p.into_inner());
         // 获取锁后再次检查，避免与新取用竞态
         if self.generation.load(Ordering::Relaxed) != snapshot {
             return;
         }
         if guard.take().is_some() {
-            info!("jieba 词典空闲超过 {:?}，已卸载", JIEBA_IDLE_TIMEOUT);
+            info!("词云资源空闲超过 {:?}，已卸载", RESOURCE_IDLE_TIMEOUT);
         }
     }
 }
 
 /// 后台空闲回收任务入口：从静态缓存读取当前代数并尝试卸载。
-async fn try_evict_idle_jieba(snapshot: u64) {
-    JIEBA_CACHE.try_evict_idle(snapshot).await;
+async fn try_evict_idle_resources(snapshot: u64) {
+    RESOURCE_CACHE.try_evict_idle(snapshot).await;
 }
 
 /// 输出词云布局尺寸。实际 PNG 通过 2 倍 scale 渲染成 800×800。
@@ -112,7 +135,7 @@ const WORDCLOUD_SCALE: u32 = 2;
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
 const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
-/// 词云生成全局串行：单次生成的瞬时内存高（16MB 字体 + 全模式分词的大量分配），
+/// 词云生成全局串行：单次生成要加载词典和字体并布局整张画布，
 /// 并发生成会让内存峰值成倍叠加。
 static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(1));
 
@@ -330,15 +353,22 @@ async fn make_word_cloud(
     .map_err(|e| anyhow::anyhow!("词云后台任务失败: {e}"))?
 }
 
-/// 使用 wordcloud-rs 直接处理原始文本生成 PNG 词云图。
+/// 词频统计的最小词长，多字符词阈值与 Python wordcloud 习惯一致。
+const MIN_WORD_LENGTH: usize = 2;
+/// 词频统计的最大词长，与 wordcloud 库 max_word_length 的默认值一致。
+const MAX_WORD_LENGTH: usize = 256;
+
+/// 使用 wordcloud-rs 生成 PNG 词云图。
 fn generate_word_cloud_image(
     path: &Path,
     text: &str,
     stop_words: &[String],
     background: &str,
 ) -> Result<Vec<u8>> {
-    // 生成期间持有词典 Arc：即使空闲回收触发，内存也随本次生成结束才释放。
-    let jieba = JIEBA_CACHE.get();
+    // 生成期间持有资源 Arc：即使空闲回收触发，内存也随本次生成结束才释放。
+    let resources = RESOURCE_CACHE.get(&path.join("font.otf"))?;
+    let frequencies = count_frequencies(&resources.jieba, text, stop_words);
+
     let mut builder = WordCloud::builder()
         .dimensions(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .scale(WORDCLOUD_SCALE)
@@ -351,23 +381,11 @@ fn generate_word_cloud_image(
         .min_font_size(4.0)
         .max_font_size(120.0)
         .palette(WORDCLOUD_COLORS)
-        .background_color(parse_background_color(background))
-        // 中文分词：jieba 全模式闭包替换默认的英文单词边界。
-        .tokenizer(move |text: &str| {
-            jieba
-                .cut_all(text)
-                .into_iter()
-                .map(|t| t.word.to_string())
-                .collect()
-        })
-        .stopwords(stop_words.iter().map(String::as_str))
-        // 多字符词阈值，与 Python wordcloud 习惯一致。
-        .min_word_length(2);
+        .background_color(parse_background_color(background));
 
     // 中文渲染需要 data 目录下的 font.otf 覆盖相应字形。
-    let font_path = path.join("font.otf");
-    if font_path.exists() {
-        builder = builder.font_path(font_path);
+    if let Some(font_bytes) = &resources.font_bytes {
+        builder = builder.font_data(Arc::clone(font_bytes));
     }
 
     // 加载自定义遮罩（如果 data 目录下存在 mask.png / mask.jpg）。
@@ -379,7 +397,7 @@ fn generate_word_cloud_image(
         .build()
         .map_err(|e| anyhow::anyhow!("初始化词云生成器失败: {e}"))?;
     // 消息全是停用词、表情或单字时没有有效词可渲染，返回空结果跳过本次发送。
-    let image = match wordcloud.generate(text) {
+    let image = match wordcloud.generate_from_frequencies(frequencies) {
         Ok(image) => image,
         Err(WordCloudError::EmptyInput) => return Ok(Vec::new()),
         Err(e) => return Err(anyhow::anyhow!("生成词云失败: {e}")),
@@ -390,6 +408,43 @@ fn generate_word_cloud_image(
         .write_to(&mut png, ImageFormat::Png)
         .map_err(|e| anyhow::anyhow!("导出 PNG 失败: {e}"))?;
     Ok(png.into_inner())
+}
+
+/// 对 jieba 全模式分词结果直接计数词频。
+///
+/// 2MB 输入会产生近百万 token，键直接借用输入文本（`Cow::Borrowed`），
+/// 只有含大写字母的词才分配小写副本；如果先物化成 `Vec<String>` 再统计，
+/// 实测进程 RSS 峰值会超过 600MB。
+fn count_frequencies<'a>(
+    jieba: &jieba_rs::Jieba,
+    text: &'a str,
+    stop_words: &[String],
+) -> HashMap<Cow<'a, str>, u64> {
+    let stop_words: HashSet<String> = stop_words.iter().map(|word| word.to_lowercase()).collect();
+    let mut counts: HashMap<Cow<'a, str>, u64> = HashMap::new();
+    for token in jieba.cut_all(text) {
+        let word = token.word.trim();
+        let word_length = word.chars().count();
+        // 超长词（如整段链接）只跳过自身，不让单个词导致整次生成失败。
+        if !(MIN_WORD_LENGTH..=MAX_WORD_LENGTH).contains(&word_length) {
+            continue;
+        }
+        let key: Cow<'a, str> = if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(word.to_lowercase())
+        } else {
+            Cow::Borrowed(word)
+        };
+        if stop_words.contains(key.as_ref())
+            || key
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .all(|character| character.is_numeric())
+        {
+            continue;
+        }
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
 }
 
 /// 尝试读取 data/mask.png 或 data/mask.jpg 作为词云遮罩。
@@ -474,21 +529,21 @@ mod tests {
     use utils::command::{Permission, ResolveOutcome, RouteError};
 
     #[tokio::test]
-    async fn jieba_cache_evicts_only_when_snapshot_matches() {
-        let cache = JiebaCache::new();
-        let jieba = cache.get();
-        assert!(cache.jieba.lock().unwrap().is_some());
+    async fn resource_cache_evicts_only_when_snapshot_matches() {
+        let cache = ResourceCache::new();
+        let resources = cache.get(Path::new("/nonexistent/font.otf")).unwrap();
+        assert!(cache.resources.lock().unwrap().is_some());
 
         // 代数不一致（期间有新取用）→ 保留缓存
         let stale = cache.generation.load(Ordering::Relaxed).wrapping_add(1);
         cache.evict_if_unchanged(stale);
-        assert!(cache.jieba.lock().unwrap().is_some());
+        assert!(cache.resources.lock().unwrap().is_some());
 
         // 代数一致 → 卸载缓存引用；已持有 Arc 的任务不受影响
         let current = cache.generation.load(Ordering::Relaxed);
         cache.evict_if_unchanged(current);
-        assert!(cache.jieba.lock().unwrap().is_none());
-        assert!(!jieba.cut_all("测试").is_empty());
+        assert!(cache.resources.lock().unwrap().is_none());
+        assert!(!resources.jieba.cut_all("测试").is_empty());
     }
 
     #[test]
