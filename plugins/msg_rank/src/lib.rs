@@ -88,7 +88,7 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
         return;
     }
 
-    if let Err(e) = db::add_msg(group, user, text).await {
+    if let Err(e) = db::add_msg(group, user, text) {
         tracing::error!("添加消息失败: {}", e);
     }
 }

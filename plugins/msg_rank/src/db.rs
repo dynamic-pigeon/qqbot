@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,8 +17,29 @@ static FLUSH_DONE_RX: OnceCell<Mutex<Option<oneshot::Receiver<()>>>> = OnceCell:
 const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 100;
 const BUFFER_CAPACITY: usize = 10_000;
+/// 消费端缓冲上限（条数）。数据库持续写不进去时达到上限即丢弃新消息，
+/// 保证内存有界（约 MAX_BUFFERED_RECORDS × 4KB）且发送端不会被阻塞。
+const MAX_BUFFERED_RECORDS: usize = 10_000;
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 const MESSAGE_RETENTION_SECS: i64 = 8 * 24 * 60 * 60;
+
+/// 缓冲区满 / 数据库不可用时的丢弃计数，恢复后由 [`note_recovered`] 清零并汇总上报。
+static DROPPED_MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+/// 每 1000 条丢弃报一次，避免数据库故障期间刷日志。
+fn note_dropped() {
+    let dropped = DROPPED_MESSAGES.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped % 1000 == 1 {
+        tracing::error!("消息缓冲区已满（数据库不可用？），已累计丢弃 {dropped} 条消息");
+    }
+}
+
+fn note_recovered() {
+    let dropped = DROPPED_MESSAGES.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!("数据库写入恢复，故障期间共丢弃 {dropped} 条消息");
+    }
+}
 
 struct MsgRecord {
     group_id: i64,
@@ -134,9 +156,13 @@ fn init_buffer() {
         loop {
             kovi::tokio::select! {
                 Some(record) = rx.recv() => {
-                    state.push(record);
-                    if state.len() >= FLUSH_BATCH_SIZE {
-                        flush_batch(&mut state).await;
+                    if state.len() >= MAX_BUFFERED_RECORDS {
+                        note_dropped();
+                    } else {
+                        state.push(record);
+                        if state.len() >= FLUSH_BATCH_SIZE {
+                            flush_batch(&mut state).await;
+                        }
                     }
                 }
                 _ = interval.tick() => {
@@ -206,6 +232,7 @@ async fn flush_batch(state: &mut BufferState) {
     match query.execute(pool).await {
         Ok(_) => {
             state.records.drain(..chunk_size);
+            note_recovered();
         }
         Err(e) => {
             // 保留批次，避免消息丢失；下次 flush 自动重试。
@@ -239,7 +266,7 @@ pub(crate) async fn flush_on_shutdown() {
     }
 }
 
-pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: String) -> Result<()> {
+pub(crate) fn add_msg(group_id: i64, user_id: i64, msg: String) -> Result<()> {
     let timestamp = chrono::Local::now().timestamp();
     let record = MsgRecord {
         group_id,
@@ -250,11 +277,15 @@ pub(crate) async fn add_msg(group_id: i64, user_id: i64, msg: String) -> Result<
     let sender = MSG_SENDER
         .get()
         .ok_or_else(|| anyhow::anyhow!("消息缓冲区未初始化"))?;
-    sender
-        .send(record)
-        .await
-        .map_err(|_| anyhow::anyhow!("消息缓冲区已关闭"))?;
-    Ok(())
+    match sender.try_send(record) {
+        Ok(()) => Ok(()),
+        // 缓冲区满说明数据库持续写不进去：丢弃并计数，不能阻塞群消息处理路径。
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            note_dropped();
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow::anyhow!("消息缓冲区已关闭")),
+    }
 }
 
 pub(crate) async fn msg_count_top_with_time_range(
@@ -408,9 +439,9 @@ mod tests {
         rt.block_on(async {
             init_db(&tmp).await.unwrap();
 
-            add_msg(1, 100, "hello".into()).await.unwrap();
-            add_msg(1, 101, "world".into()).await.unwrap();
-            add_msg(2, 100, "other".into()).await.unwrap();
+            add_msg(1, 100, "hello".into()).unwrap();
+            add_msg(1, 101, "world".into()).unwrap();
+            add_msg(2, 100, "other".into()).unwrap();
 
             flush_on_shutdown().await;
 
