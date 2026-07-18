@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -73,14 +76,24 @@ impl OcrMemory {
     }
 }
 
+/// 未配置腾讯云时跳过的告警只报一次，避免每条图片消息刷日志。
+static OCR_MISSING_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// 对图片URL进行OCR识别
 ///
 /// # 参数
 /// * `img_url` - 图片的URL地址（必须通过 [`utils::validate_image_url_async`] 校验）
 ///
 /// # 返回
-/// * `Result<Arc<String>>` - OCR识别的文本结果
+/// * `Result<Arc<String>>` - OCR识别的文本结果；未配置腾讯云时返回空串
 pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
+    // 未配置腾讯云时直接短路，不为注定失败的识别下载原图。
+    if crate::config::read_config().tencent.is_none() {
+        if !OCR_MISSING_CONFIG_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!("未配置腾讯云 OCR，跳过图片文字识别");
+        }
+        return Ok(Arc::new(String::new()));
+    }
     let _permit = OCR_POOL.acquire(Duration::from_secs(2)).await?;
     let img = get_img_bytes_from_url(img_url).await?;
     let result = OCR_MEMORY.get_or_insert(img).await?;
