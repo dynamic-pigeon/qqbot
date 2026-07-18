@@ -67,8 +67,7 @@ impl JiebaCache {
     }
 
     fn schedule_idle_cleanup(&self, snapshot: u64) {
-        // 非 tokio 上下文（如单元测试）无法安排回收任务；
-        // 此时词典随进程常驻，与 LazyLock 直载行为一致。
+        // 非 tokio 上下文（如单元测试）无法安排回收任务，此时词典随进程常驻。
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -113,7 +112,9 @@ const WORDCLOUD_SCALE: u32 = 2;
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
 const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
-static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(2));
+/// 词云生成全局串行：单次生成的瞬时内存高（16MB 字体 + 全模式分词的大量分配），
+/// 并发生成会让内存峰值成倍叠加。
+static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(1));
 
 /// Python wordcloud 默认 viridis 配色。
 const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
@@ -295,8 +296,9 @@ async fn make_word_cloud(
     notify_group: i64,
     duration: chrono::Duration,
 ) -> Result<Vec<u8>> {
+    // 生成全局串行，排队的任务需等待前一个个完成，超时时间需覆盖最坏等待。
     let _permit = WORDCLOUD_POOL
-        .acquire(std::time::Duration::from_secs(10))
+        .acquire(std::time::Duration::from_secs(10 * 60))
         .await?;
     let end_time = chrono::Local::now();
     let start_time = end_time - duration;
