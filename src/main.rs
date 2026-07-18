@@ -3,6 +3,20 @@ use kovi_onebot::{OneBotDriver, load_local_conf};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+// musl 系统分配器对词云、截图这类周期性大分配几乎不归还内存，
+// jemalloc / mimalloc 会在分配活动结束后把空闲页还给 OS。
+// 两者只能选一个作为全局分配器。
+#[cfg(all(feature = "jemalloc", feature = "mimalloc"))]
+compile_error!("features `jemalloc` and `mimalloc` are mutually exclusive");
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(unix)]
 fn restrict_sensitive_file(path: impl AsRef<std::path::Path>) {
     use std::os::unix::fs::PermissionsExt as _;

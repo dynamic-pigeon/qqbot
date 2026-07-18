@@ -1,7 +1,11 @@
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -17,7 +21,89 @@ use wordcloud::{Mask, WordCloud, WordCloudError};
 
 use crate::config::{modify_config, read_config};
 
-static JIEBA: LazyLock<jieba_rs::Jieba> = LazyLock::new(jieba_rs::Jieba::new);
+static JIEBA_CACHE: LazyLock<JiebaCache> = LazyLock::new(JiebaCache::new);
+
+/// jieba 词典加载后约占 56MB 常驻内存，而词云每天只生成几次；
+/// 空闲超过此时间后卸载词典，下次生成时重新加载（加载耗时在亚秒级）。
+const JIEBA_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// jieba 词典的按需缓存：首次生成词云时加载，空闲超时后自动卸载。
+/// 进行中的生成任务持有 `Arc` 克隆，卸载只移除缓存引用，内存随任务结束释放。
+struct JiebaCache {
+    jieba: Mutex<Option<Arc<jieba_rs::Jieba>>>,
+    /// 每次取用词典递增；空闲回收任务通过比对代数判断期间是否有新取用。
+    generation: AtomicU64,
+    idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl JiebaCache {
+    fn new() -> Self {
+        Self {
+            jieba: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            idle_task: Mutex::new(None),
+        }
+    }
+
+    fn get(&self) -> Arc<jieba_rs::Jieba> {
+        let snapshot = self
+            .generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let jieba = {
+            let mut guard = self.jieba.lock().unwrap_or_else(|p| p.into_inner());
+            match &*guard {
+                Some(jieba) => Arc::clone(jieba),
+                None => {
+                    info!("加载 jieba 词典");
+                    let jieba = Arc::new(jieba_rs::Jieba::new());
+                    *guard = Some(Arc::clone(&jieba));
+                    jieba
+                }
+            }
+        };
+        self.schedule_idle_cleanup(snapshot);
+        jieba
+    }
+
+    fn schedule_idle_cleanup(&self, snapshot: u64) {
+        // 非 tokio 上下文（如单元测试）无法安排回收任务；
+        // 此时词典随进程常驻，与 LazyLock 直载行为一致。
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut task = self.idle_task.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        *task = Some(handle.spawn(try_evict_idle_jieba(snapshot)));
+    }
+
+    async fn try_evict_idle(&self, snapshot: u64) {
+        tokio::time::sleep(JIEBA_IDLE_TIMEOUT).await;
+        self.evict_if_unchanged(snapshot);
+    }
+
+    fn evict_if_unchanged(&self, snapshot: u64) {
+        // 期间有新的取用 → 不卸载
+        if self.generation.load(Ordering::Relaxed) != snapshot {
+            return;
+        }
+        let mut guard = self.jieba.lock().unwrap_or_else(|p| p.into_inner());
+        // 获取锁后再次检查，避免与新取用竞态
+        if self.generation.load(Ordering::Relaxed) != snapshot {
+            return;
+        }
+        if guard.take().is_some() {
+            info!("jieba 词典空闲超过 {:?}，已卸载", JIEBA_IDLE_TIMEOUT);
+        }
+    }
+}
+
+/// 后台空闲回收任务入口：从静态缓存读取当前代数并尝试卸载。
+async fn try_evict_idle_jieba(snapshot: u64) {
+    JIEBA_CACHE.try_evict_idle(snapshot).await;
+}
 
 /// 输出词云布局尺寸。实际 PNG 通过 2 倍 scale 渲染成 800×800。
 const WORDCLOUD_WIDTH: u32 = 400;
@@ -249,6 +335,8 @@ fn generate_word_cloud_image(
     stop_words: &[String],
     background: &str,
 ) -> Result<Vec<u8>> {
+    // 生成期间持有词典 Arc：即使空闲回收触发，内存也随本次生成结束才释放。
+    let jieba = JIEBA_CACHE.get();
     let mut builder = WordCloud::builder()
         .dimensions(WORDCLOUD_WIDTH, WORDCLOUD_HEIGHT)
         .scale(WORDCLOUD_SCALE)
@@ -263,8 +351,8 @@ fn generate_word_cloud_image(
         .palette(WORDCLOUD_COLORS)
         .background_color(parse_background_color(background))
         // 中文分词：jieba 全模式闭包替换默认的英文单词边界。
-        .tokenizer(|text: &str| {
-            JIEBA
+        .tokenizer(move |text: &str| {
+            jieba
                 .cut_all(text)
                 .into_iter()
                 .map(|t| t.word.to_string())
@@ -382,6 +470,24 @@ async fn load_stop_words(path: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use utils::command::{Permission, ResolveOutcome, RouteError};
+
+    #[tokio::test]
+    async fn jieba_cache_evicts_only_when_snapshot_matches() {
+        let cache = JiebaCache::new();
+        let jieba = cache.get();
+        assert!(cache.jieba.lock().unwrap().is_some());
+
+        // 代数不一致（期间有新取用）→ 保留缓存
+        let stale = cache.generation.load(Ordering::Relaxed).wrapping_add(1);
+        cache.evict_if_unchanged(stale);
+        assert!(cache.jieba.lock().unwrap().is_some());
+
+        // 代数一致 → 卸载缓存引用；已持有 Arc 的任务不受影响
+        let current = cache.generation.load(Ordering::Relaxed);
+        cache.evict_if_unchanged(current);
+        assert!(cache.jieba.lock().unwrap().is_none());
+        assert!(!jieba.cut_all("测试").is_empty());
+    }
 
     #[test]
     fn command_tree_registers_admin_group_subcommands() {

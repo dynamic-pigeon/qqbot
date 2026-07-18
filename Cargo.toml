@@ -5,6 +5,16 @@ edition = "2024"
 authors = ["dynamic-pigeon <3040313336@qq.com>"]
 license = "MIT"
 
+[features]
+default = []
+# 全局分配器二选一（互斥，同时开启会编译报错）。
+# musl 默认分配器几乎不归还内存，词云/截图等大分配后 RSS 会一直停在高水位；
+# jemalloc 碎片控制好，mimalloc 构建更轻、归还同样积极。
+# 部署 Linux 时建议开启其一：
+#   cargo zigbuild --target x86_64-unknown-linux-musl --release --features jemalloc
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }
 help_msg = { version = "0.1.0", path = "plugins/help_msg" }
@@ -18,6 +28,8 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 dotenvy.workspace = true
 tracing.workspace = true
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", optional = true }
 
 [workspace]
 members = [
