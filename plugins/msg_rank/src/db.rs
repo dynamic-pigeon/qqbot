@@ -212,24 +212,18 @@ async fn flush_batch(state: &mut BufferState) {
         }
     };
 
-    let placeholders: Vec<String> = (0..chunk_size)
-        .map(|_| "(?, ?, ?, ?)".to_string())
-        .collect();
-    let sql = format!(
-        "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES {}",
-        placeholders.join(", ")
+    // QueryBuilder 单缓冲构建 SQL，占位符与绑定参数由库生成。
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "INSERT INTO MSG (group_id, user_id, msg, timestamp) ",
     );
+    builder.push_values(&state.records[..chunk_size], |mut row, record| {
+        row.push_bind(record.group_id)
+            .push_bind(record.user_id)
+            .push_bind(&record.msg)
+            .push_bind(record.timestamp);
+    });
 
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
-    for record in &state.records[..chunk_size] {
-        query = query
-            .bind(record.group_id)
-            .bind(record.user_id)
-            .bind(&record.msg)
-            .bind(record.timestamp);
-    }
-
-    match query.execute(pool).await {
+    match builder.build().execute(pool).await {
         Ok(_) => {
             state.records.drain(..chunk_size);
             note_recovered();
@@ -417,16 +411,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_placeholders_for_batch_insert() {
-        let placeholders: Vec<String> = (0..3).map(|_| "(?, ?, ?, ?)".to_string()).collect();
-        let sql = format!(
-            "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES {}",
-            placeholders.join(", ")
+    fn test_query_builder_generates_batch_insert_sql() {
+        let records = vec![
+            MsgRecord {
+                group_id: 1,
+                user_id: 100,
+                msg: "a".into(),
+                timestamp: 1,
+            },
+            MsgRecord {
+                group_id: 2,
+                user_id: 101,
+                msg: "b".into(),
+                timestamp: 2,
+            },
+        ];
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO MSG (group_id, user_id, msg, timestamp) ",
         );
-        assert_eq!(
-            sql,
-            "INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)"
-        );
+        builder.push_values(&records, |mut row, record| {
+            row.push_bind(record.group_id)
+                .push_bind(record.user_id)
+                .push_bind(&record.msg)
+                .push_bind(record.timestamp);
+        });
+        let sql = builder.sql();
+        let sql = sql.as_str();
+        assert!(sql.starts_with("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES "));
+        // 每条记录一组 4 个绑定参数，组间逗号分隔
+        assert_eq!(sql.matches("), (").count(), records.len() - 1);
     }
 
     #[test]
