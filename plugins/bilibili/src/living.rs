@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -56,11 +59,23 @@ pub async fn init() {
     .unwrap();
 }
 
+/// 轮询防重入标记：上一轮还没跑完时直接跳过本轮。
+static POLL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 提前 return 时也能复位 [`POLL_RUNNING`]。
+struct PollGuard;
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        POLL_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::RuntimeBot>) {
-    let mut map = match map.try_lock() {
-        Ok(map) => map,
-        Err(_) => return,
-    };
+    if POLL_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _guard = PollGuard;
 
     let cfg = config::read_config();
 
@@ -76,27 +91,32 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
         }
     };
 
-    let mut start = Vec::new();
-    let mut end = Vec::new();
-    for (uid, info) in status {
-        let status = info.live_status != 0;
-        match map.entry(uid) {
-            Entry::Vacant(e) => {
-                e.insert(status);
-            }
-            Entry::Occupied(mut e) => {
-                let prev = *e.get();
-                if prev != status {
+    // 只在比对状态时短暂持锁，网络请求和消息发送都在锁外进行
+    let (start, end) = {
+        let mut map = map.lock().await;
+        let mut start = Vec::new();
+        let mut end = Vec::new();
+        for (uid, info) in status {
+            let status = info.live_status != 0;
+            match map.entry(uid) {
+                Entry::Vacant(e) => {
                     e.insert(status);
-                    if status {
-                        start.push((uid, info));
-                    } else {
-                        end.push((uid, info));
+                }
+                Entry::Occupied(mut e) => {
+                    let prev = *e.get();
+                    if prev != status {
+                        e.insert(status);
+                        if status {
+                            start.push((uid, info));
+                        } else {
+                            end.push((uid, info));
+                        }
                     }
                 }
             }
         }
-    }
+        (start, end)
+    };
 
     for (uid, info) in start {
         notify(&bot, &cfg, uid, &info, NotifyKind::Start).await;

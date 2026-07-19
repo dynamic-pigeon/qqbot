@@ -124,6 +124,14 @@ fn dynamic_command() -> Command {
         )
 }
 
+// 群命令按 MessageScope::Group 声明，group_id 理论上必有值；
+// 缺失时按内部错误上报而不是 panic，避免框架行为变化时击垮消息循环。
+fn group_id(ctx: &CommandContext) -> Result<i64, CommandError> {
+    ctx.event()
+        .group_id
+        .ok_or_else(|| CommandError::internal(anyhow::anyhow!("群命令事件缺少 group_id")))
+}
+
 async fn live_add(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
@@ -131,7 +139,7 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
         return Err(CommandError::user("该 uid 没有直播间或者 bot 网络错误"));
     }
 
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     config::modify_config(|config| {
         if let Some(subscription) = config.subscribe.iter_mut().find(|item| item.uid == uid) {
             if !subscription.groups.contains(&group) {
@@ -153,7 +161,7 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
 async fn live_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     config::modify_config(|config| {
         if let Some(index) = config.subscribe.iter().position(|item| item.uid == uid) {
             let subscription = &mut config.subscribe[index];
@@ -171,7 +179,7 @@ async fn live_remove(ctx: CommandContext) -> CommandResult {
 
 async fn live_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     let uids = config::read_config()
         .subscribe
         .iter()
@@ -197,7 +205,7 @@ async fn live_list(ctx: CommandContext) -> CommandResult {
 async fn dynamic_add(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     let added = dynamics::add_subscribe(uid, group)
         .await
         .map_err(CommandError::internal)?;
@@ -212,7 +220,7 @@ async fn dynamic_add(ctx: CommandContext) -> CommandResult {
 async fn dynamic_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     dynamics::remove_subscribe(uid, group)
         .await
         .map_err(CommandError::internal)?;
@@ -222,7 +230,7 @@ async fn dynamic_remove(ctx: CommandContext) -> CommandResult {
 
 async fn dynamic_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     let entries = dynamics::list_subscribes(group).await;
     if entries.is_empty() {
         ctx.reply("本群尚未订阅任何动态");
@@ -265,7 +273,7 @@ async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
     let count = parse_dynamic_fetch_count(ctx.arg(1))?;
     ctx.ensure_no_extra_args(2)?;
 
-    let group = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group = group_id(&ctx)?;
     let items = dynamics::fetch_recent(uid, count)
         .await
         .map_err(CommandError::internal)?;
