@@ -23,6 +23,16 @@ use anyhow::Result;
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PRIVATE_NETWORK_PROTECTION_ENV: &str = "PRIVATE_NETWORK_PROTECTION";
 
+/// 全局共享的 HTTP client，复用连接池，避免每次下载都重新 TCP/TLS 握手。
+/// 仅在未开启私网保护时使用；开启后每次请求需要按本次校验结果做 DNS pinning，
+/// 必须构建带 `resolve_to_addrs` 的临时 client。
+static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("构建共享 reqwest client 失败")
+});
+
 static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
     let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) else {
         return false;
@@ -140,8 +150,9 @@ pub async fn validate_image_url_async_with_options(
 
 /// 下载经过白名单校验的图片，并对实际响应体实施硬字节上限。
 ///
-/// 启用私网保护时，请求客户端会固定使用本次校验通过的地址，避免校验与连接之间
-/// 再次解析域名造成 DNS rebinding。
+/// 默认复用全局共享 client 以命中连接池；启用私网保护时改用带 DNS pinning 的
+/// 临时 client，固定使用本次校验通过的地址，避免校验与连接之间再次解析域名造成
+/// DNS rebinding。
 pub async fn download_image_limited(
     url: &str,
     allowed_hosts: &[&str],
@@ -155,20 +166,26 @@ pub async fn download_image_limited(
     }
 
     let parsed = reqwest::Url::parse(url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("image url 缺少 host"))?
-        .to_string();
 
-    let mut client_builder = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .redirect(reqwest::redirect::Policy::none());
-    if protect_private_network {
+    let response = if protect_private_network {
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("image url 缺少 host"))?
+            .to_string();
         let addrs = resolve_public_addrs(url).await?;
-        client_builder = client_builder.resolve_to_addrs(&host, &addrs);
-    }
-    let client = client_builder.build()?;
-    let response = client.get(parsed).send().await?.error_for_status()?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addrs)
+            .build()?;
+        client.get(parsed).timeout(request_timeout).send().await?
+    } else {
+        SHARED_CLIENT
+            .get(parsed)
+            .timeout(request_timeout)
+            .send()
+            .await?
+    };
+    let response = response.error_for_status()?;
     if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
         let content_type = content_type.to_str().unwrap_or_default();
         if !content_type.to_ascii_lowercase().starts_with("image/") {
