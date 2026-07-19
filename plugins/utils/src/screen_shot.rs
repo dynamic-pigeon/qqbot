@@ -170,19 +170,24 @@ impl ScreenshotManager {
             .wrapping_add(1);
 
         let result = {
-            let guard = self.browser.read().await;
-            let browser = guard
-                .as_ref()
-                .expect("browser must exist after ensure_browser");
+            let first = {
+                let guard = self.browser.read().await;
+                match guard.as_ref() {
+                    Some(browser) => Self::do_screenshot(browser, html, selector).await,
+                    // 空闲回收可能恰好赶在 ensure_browser 之后关闭浏览器，视为可重试的失败
+                    None => Err(anyhow::anyhow!("浏览器实例已被回收")),
+                }
+            };
 
-            match Self::do_screenshot(browser, html, selector).await {
+            match first {
                 Ok(bytes) => Ok(bytes),
                 Err(e) => {
-                    error!("截图失败，尝试重启浏览器后重试: {}", e);
-                    drop(guard);
+                    error!("截图失败（{}），尝试重启浏览器后重试", e);
                     self.restart_browser().await?;
                     let guard = self.browser.read().await;
-                    let browser = guard.as_ref().expect("browser must exist after restart");
+                    let browser = guard
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("浏览器重启后仍不可用"))?;
                     Self::do_screenshot(browser, html, selector).await
                 }
             }

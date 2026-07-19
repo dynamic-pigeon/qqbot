@@ -82,3 +82,8 @@ serde_json = "1.0"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt"] }
 wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
