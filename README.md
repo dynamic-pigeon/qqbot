@@ -9,7 +9,9 @@ cp .env.example .env
 cargo run --release
 ```
 
-OneBot 连接配置位于本地 `kovi.conf.toml`，插件启用和访问控制位于 `kovi.plugin.toml`。这两个文件包含部署相关信息，不提交到 Git。B 站动态订阅需要在 `.env` 中配置 `BILIBILI_COOKIE`。
+OneBot 连接配置位于本地 `kovi.conf.toml`，插件启用和访问控制位于 `kovi.plugin.toml`。这两个文件包含部署相关信息，不提交到 Git。
+
+B 站动态订阅默认以游客身份运行，不需要登录或配置 Cookie。模块会自动获取游客标识并生成 WBI 签名；若普通 HTTP 请求持续触发 B 站风控，会自动使用本机 Chrome/Chromium 后备。`BILIBILI_COOKIE` 仅作为可选兼容配置保留。使用动态订阅或 Markdown 截图时，运行环境需要安装 Chrome/Chromium。
 
 图片下载的私网保护默认关闭，以兼容所有流量经本地代理地址转发的环境。在 DNS 能直接返回目标公网地址的部署中，可设置 `PRIVATE_NETWORK_PROTECTION=true`，启用非公网地址拦截和 DNS pinning。无论该开关是否启用，HTTPS、Host 白名单、重定向禁用、超时和响应体大小限制都会保留。
 
