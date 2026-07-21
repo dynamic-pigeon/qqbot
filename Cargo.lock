@@ -309,13 +309,17 @@ dependencies = [
  "arc-swap",
  "base64",
  "bytes",
+ "chromiumoxide",
+ "futures",
  "kovi",
  "kovi-onebot",
+ "md-5",
  "regex",
  "reqwest",
  "serde",
  "thiserror 2.0.18",
  "tracing",
+ "urlencoding",
  "utils",
 ]
 

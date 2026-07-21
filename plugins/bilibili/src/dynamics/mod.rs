@@ -1,3 +1,4 @@
+mod browser;
 mod fetch;
 mod types;
 

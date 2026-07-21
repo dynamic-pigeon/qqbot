@@ -1,14 +1,21 @@
-use std::sync::LazyLock;
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    sync::LazyLock,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use kovi::serde_json;
+use md5::{Digest as _, Md5};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE as COOKIE_HEADER};
 use serde::Deserialize;
 
 use crate::CLIENT;
 
-/// 从 `BILIBILI_COOKIE` 环境变量读取 cookie 字符串。
+/// 从 `BILIBILI_COOKIE` 环境变量读取可选的 cookie 字符串。
 /// 典型值: `"buvid3=xxx; b_nut=xxx"` 或 `"SESSDATA=xxx; buvid3=xxx"`。
-/// 未设置或为空字符串时返回 None，请求保持无 Cookie。
+/// 未设置或为空字符串时自动获取 Bilibili 游客 Cookie。
 ///
 /// 注意: cookie 包含 `SESSDATA` 等登录态凭据，绝对禁止在日志中打印明文。
 static COOKIE: LazyLock<Option<String>> = LazyLock::new(|| {
@@ -33,9 +40,30 @@ static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub const SPACE_FEED_URL: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space";
+const FINGER_SPI_URL: &str = "https://api.bilibili.com/x/frontend/finger/spi";
+const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 
 const DEFAULT_TIMEZONE_OFFSET: i32 = -480;
-const DEFAULT_FEATURES: &str = "itemOpusStyle";
+const DEFAULT_FEATURES: &str = "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,\
+forwardListHidden,decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,\
+avatarAutoTheme,sunflowerStyle,cardsEnhance,eva3CardOpus,eva3CardVideo,eva3CardComment,eva3CardUser";
+const WEB_LOCATION: &str = "333.1387";
+const SESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MIXIN_KEY_ENC_TAB: [usize; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
+    28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
+    54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+
+#[derive(Clone)]
+struct WebSession {
+    cookie: String,
+    mixin_key: String,
+    expires_at: Instant,
+}
+
+static WEB_SESSION: kovi::tokio::sync::Mutex<Option<WebSession>> =
+    kovi::tokio::sync::Mutex::const_new(None);
 
 /// 预解析的硬编码 API URL。`Url::parse` 不是 const，所以放 LazyLock。
 /// 若 `SPACE_FEED_URL` 被未来编辑损坏，这里会立刻以原文 panic，便于排查。
@@ -44,17 +72,93 @@ pub static SPACE_FEED_URL_PARSED: LazyLock<reqwest::Url> = LazyLock::new(|| {
         .unwrap_or_else(|e| panic!("hardcoded SPACE_FEED_URL=`{SPACE_FEED_URL}` 解析失败: {e}"))
 });
 
-fn build_space_url(uid: u64, offset: Option<&str>) -> reqwest::Url {
-    let mut url = SPACE_FEED_URL_PARSED.clone();
-    {
-        let mut q = url.query_pairs_mut();
-        q.append_pair("host_mid", &uid.to_string());
-        q.append_pair("timezone_offset", &DEFAULT_TIMEZONE_OFFSET.to_string());
-        q.append_pair("features", DEFAULT_FEATURES);
-        if let Some(off) = offset {
-            q.append_pair("offset", off);
-        }
+fn build_space_params(uid: u64, offset: Option<&str>) -> BTreeMap<String, String> {
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let viewport_seed = now_millis ^ uid;
+    let dm_img_inter = serde_json::json!({
+        "ds": [],
+        "wh": [
+            4000 + viewport_seed % 311,
+            4300 + (viewport_seed / 7) % 311,
+            1 + (viewport_seed / 13) % 100
+        ],
+        "of": [
+            100 + (viewport_seed / 17) % 301,
+            200 + (viewport_seed / 19) % 601,
+            100 + (viewport_seed / 17) % 301
+        ]
+    });
+
+    BTreeMap::from([
+        ("offset".into(), offset.unwrap_or_default().into()),
+        ("host_mid".into(), uid.to_string()),
+        (
+            "timezone_offset".into(),
+            DEFAULT_TIMEZONE_OFFSET.to_string(),
+        ),
+        ("platform".into(), "web".into()),
+        ("features".into(), DEFAULT_FEATURES.into()),
+        ("web_location".into(), WEB_LOCATION.into()),
+        ("dm_img_list".into(), "[]".into()),
+        (
+            "dm_img_str".into(),
+            URL_SAFE_NO_PAD.encode("WebGL 1.0 (OpenGL ES 2.0 Chromium)"),
+        ),
+        (
+            "dm_cover_img_str".into(),
+            URL_SAFE_NO_PAD.encode(
+                "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), \
+                 SwiftShader driver)",
+            ),
+        ),
+        ("dm_img_inter".into(), dm_img_inter.to_string()),
+        (
+            "x-bili-device-req-json".into(),
+            serde_json::json!({
+                "platform": "web",
+                "device": "pc",
+                "spmid": WEB_LOCATION
+            })
+            .to_string(),
+        ),
+    ])
+}
+
+fn signed_query(mut params: BTreeMap<String, String>, mixin_key: &str, wts: u64) -> String {
+    params.insert("wts".into(), wts.to_string());
+    let query = params
+        .iter()
+        .map(|(key, value)| {
+            let filtered: String = value
+                .chars()
+                .filter(|c| !matches!(c, '!' | '\'' | '(' | ')' | '*'))
+                .collect();
+            format!(
+                "{}={}",
+                urlencoding::encode(key),
+                urlencoding::encode(&filtered)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let digest = Md5::digest(format!("{query}{mixin_key}").as_bytes());
+    let mut w_rid = String::with_capacity(32);
+    for byte in digest {
+        write!(&mut w_rid, "{byte:02x}").expect("writing to String cannot fail");
     }
+    format!("{query}&w_rid={w_rid}")
+}
+
+fn build_space_url(uid: u64, offset: Option<&str>, mixin_key: &str, wts: u64) -> reqwest::Url {
+    let mut url = SPACE_FEED_URL_PARSED.clone();
+    url.set_query(Some(&signed_query(
+        build_space_params(uid, offset),
+        mixin_key,
+        wts,
+    )));
     url
 }
 
@@ -66,9 +170,25 @@ pub enum DynamicsError {
     Deserialize(#[from] serde_json::Error),
     #[error("bilibili 动态 API 错误 code={0} message={1}")]
     Api(i32, String),
+    #[error("bilibili 动态响应异常 HTTP {status}, content-type={content_type}")]
+    UnexpectedResponse { status: u16, content_type: String },
+    #[error("bilibili 匿名会话初始化失败: {0}")]
+    Session(String),
+    #[error("bilibili Chromium 后备请求失败: {0}")]
+    Browser(#[source] anyhow::Error),
+}
+
+impl DynamicsError {
+    fn is_risk_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Api(-101 | -352 | -412, _) | Self::UnexpectedResponse { .. }
+        )
+    }
 }
 
 #[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
 struct ApiResponse<T> {
     code: i32,
     #[serde(default)]
@@ -87,45 +207,194 @@ struct SpaceData {
     offset: String,
 }
 
-/// 拉取指定 UID 的 B 站用户空间动态。
-///
-/// 端点: <https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space>
-///
-/// **Env vars:** 通过 `.env` 文件或系统环境设置以下变量：
-/// - `BILIBILI_COOKIE` — B 站 cookie（推荐 `buvid3=...; b_nut=...`），可降低被反爬拦截的概率
-/// - `BILIBILI_USER_AGENT` — 自定义 UA 字符串；未设置时使用内置 Chrome 147 Linux
-///
-/// 注意: B 站 web dynamic 接口风控较严，依赖 host 的 User-Agent + Referer +
-/// 其他浏览器 header 才可能返回 JSON。从被风控的 IP 调用会返回 HTML 验证码页
-/// 或 `-412 request was banned` / `-352` 错误码。这些情况会落到
-/// `DynamicsError::Http` (反序列化失败) 或 `DynamicsError::Api(code, msg)`。
-pub async fn fetch_user_dynamics(
-    uid: u64,
-    offset: Option<&str>,
-) -> Result<crate::dynamics::types::DynamicsPage, DynamicsError> {
-    let url = build_space_url(uid, offset);
-    let mut req = CLIENT
-        .get(url)
-        .header(reqwest::header::USER_AGENT, USER_AGENT.as_str())
-        .header(reqwest::header::REFERER, "https://www.bilibili.com/");
-    if let Some(c) = COOKIE.as_deref() {
-        req = req.header(reqwest::header::COOKIE, c);
-    }
-    let resp = kovi::tokio::time::timeout(Duration::from_secs(10), req.send())
-        .await
-        .map_err(|_| DynamicsError::Api(-1, "请求超时".into()))??;
+#[derive(Deserialize)]
+struct NavData {
+    wbi_img: WbiImg,
+}
 
-    let api: ApiResponse<SpaceData> = resp.json().await?;
+#[derive(Deserialize)]
+struct WbiImg {
+    img_url: String,
+    sub_url: String,
+}
+
+#[derive(Deserialize)]
+struct FingerData {
+    b_3: String,
+}
+
+fn guest_cookie(buvid3: &str, timestamp: u64) -> Result<String, DynamicsError> {
+    if buvid3.is_empty()
+        || !buvid3
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(DynamicsError::Session(
+            "finger/spi 返回的 buvid3 无效".into(),
+        ));
+    }
+    Ok(format!("buvid3={buvid3}; b_nut={timestamp}"))
+}
+
+fn wbi_resource_key(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let file = parsed.path_segments()?.next_back()?;
+    Some(
+        file.split_once('.')
+            .map_or(file, |(stem, _)| stem)
+            .to_string(),
+    )
+}
+
+fn mixin_key(img_url: &str, sub_url: &str) -> Result<String, DynamicsError> {
+    let source = format!(
+        "{}{}",
+        wbi_resource_key(img_url)
+            .ok_or_else(|| DynamicsError::Session("WBI img_url 无效".into()))?,
+        wbi_resource_key(sub_url)
+            .ok_or_else(|| DynamicsError::Session("WBI sub_url 无效".into()))?
+    );
+    let bytes = source.as_bytes();
+    if MIXIN_KEY_ENC_TAB.iter().any(|&index| index >= bytes.len()) {
+        return Err(DynamicsError::Session("WBI key 长度异常".into()));
+    }
+    Ok(MIXIN_KEY_ENC_TAB
+        .iter()
+        .take(32)
+        .map(|&index| bytes[index] as char)
+        .collect())
+}
+
+async fn bootstrap_guest_cookie() -> Result<String, DynamicsError> {
+    let response = CLIENT
+        .get(FINGER_SPI_URL)
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .send()
+        .await?;
+    let api: ApiResponse<FingerData> = response.json().await?;
     if api.code != 0 {
         return Err(DynamicsError::Api(api.code, api.message));
     }
-    let data = api.data.unwrap_or_default();
+    let fingerprint = api
+        .data
+        .ok_or_else(|| DynamicsError::Session("finger/spi 响应缺少游客标识".into()))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    guest_cookie(&fingerprint.b_3, timestamp)
+}
+
+async fn fetch_mixin_key(cookie: &str) -> Result<String, DynamicsError> {
+    let response = CLIENT
+        .get(NAV_URL)
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(COOKIE_HEADER, cookie)
+        .send()
+        .await?;
+    let api: ApiResponse<NavData> = response.json().await?;
+    let images = match api.data {
+        Some(data) => data.wbi_img,
+        None if api.code != 0 => return Err(DynamicsError::Api(api.code, api.message)),
+        None => return Err(DynamicsError::Session("nav 响应缺少 WBI 图片信息".into())),
+    };
+    mixin_key(&images.img_url, &images.sub_url)
+}
+
+async fn web_session(force_refresh: bool) -> Result<WebSession, DynamicsError> {
+    let mut state = WEB_SESSION.lock().await;
+    if !force_refresh
+        && let Some(session) = state.as_ref()
+        && session.expires_at > Instant::now()
+    {
+        return Ok(session.clone());
+    }
+
+    let cookie = match COOKIE.as_ref() {
+        Some(cookie) => cookie.clone(),
+        None => bootstrap_guest_cookie().await?,
+    };
+    let session = WebSession {
+        mixin_key: fetch_mixin_key(&cookie).await?,
+        cookie,
+        expires_at: Instant::now() + SESSION_TTL,
+    };
+    *state = Some(session.clone());
+    Ok(session)
+}
+
+async fn fetch_page(
+    uid: u64,
+    offset: Option<&str>,
+    session: &WebSession,
+) -> Result<DynamicsPage, DynamicsError> {
+    let wts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let url = build_space_url(uid, offset, &session.mixin_key, wts);
+    let response = CLIENT
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT.as_str())
+        .header(
+            reqwest::header::REFERER,
+            format!("https://space.bilibili.com/{uid}/dynamic"),
+        )
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(COOKIE_HEADER, &session.cookie)
+        .send()
+        .await?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if !status.is_success() {
+        return Err(DynamicsError::UnexpectedResponse {
+            status: status.as_u16(),
+            content_type,
+        });
+    }
+    let body = response.bytes().await?;
+    let api: ApiResponse<SpaceData> = serde_json::from_slice(&body).map_err(|error| {
+        if content_type.contains("json") {
+            DynamicsError::Deserialize(error)
+        } else {
+            DynamicsError::UnexpectedResponse {
+                status: status.as_u16(),
+                content_type,
+            }
+        }
+    })?;
+    if api.code != 0 {
+        return Err(DynamicsError::Api(api.code, api.message));
+    }
+    Ok(convert_page_data(api.data.unwrap_or_default()))
+}
+
+async fn fetch_page_with_browser(
+    uid: u64,
+    offset: Option<&str>,
+) -> Result<DynamicsPage, DynamicsError> {
+    let body = super::browser::fetch_space_body(uid, offset)
+        .await
+        .map_err(DynamicsError::Browser)?;
+    let api: ApiResponse<SpaceData> = serde_json::from_str(&body)?;
+    if api.code != 0 {
+        return Err(DynamicsError::Api(api.code, api.message));
+    }
+    Ok(convert_page_data(api.data.unwrap_or_default()))
+}
+
+fn convert_page_data(data: SpaceData) -> DynamicsPage {
     let next_offset = if data.offset.is_empty() {
         None
     } else {
         Some(data.offset)
     };
-    Ok(DynamicsPage {
+    DynamicsPage {
         items: data
             .items
             .into_iter()
@@ -133,14 +402,55 @@ pub async fn fetch_user_dynamics(
                 Ok(raw) => Some(convert_item(raw)),
                 Err(e) => {
                     tracing::warn!("跳过无法反序列化的 dynamic item: {e}");
-                    println!("跳过无法反序列化的 dynamic item: {e}");
                     None
                 }
             })
             .collect(),
         has_more: data.has_more,
         next_offset,
-    })
+    }
+}
+
+/// 拉取指定 UID 的 B 站用户空间动态。
+///
+/// 端点: <https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space>
+///
+/// **Env vars:** 通过 `.env` 文件或系统环境设置以下变量：
+/// - `BILIBILI_COOKIE` — 可选的 B 站 cookie；未设置时自动获取游客 Cookie
+/// - `BILIBILI_USER_AGENT` — 自定义 UA 字符串；未设置时使用内置 Chrome 147 Linux
+///
+/// 注意: B 站 web dynamic 接口风控较严，依赖 host 的 User-Agent + Referer +
+/// WBI 签名和游客 Cookie。从被风控的 IP 调用仍可能返回 HTML 验证码页、
+/// HTTP 412 或 `-352` 错误码；首次命中时会刷新匿名会话并重试一次。
+pub async fn fetch_user_dynamics(
+    uid: u64,
+    offset: Option<&str>,
+) -> Result<DynamicsPage, DynamicsError> {
+    let session = web_session(false).await?;
+    match fetch_page(uid, offset, &session).await {
+        Err(error) if error.is_risk_control() => {
+            tracing::warn!("Bilibili 动态请求触发风控，刷新匿名会话后重试一次: {error}");
+            let refreshed = web_session(true).await?;
+            match fetch_page(uid, offset, &refreshed).await {
+                Err(error) if error.is_risk_control() => {
+                    tracing::warn!(
+                        "Bilibili 动态 HTTP 请求持续触发风控，切换 Chromium 后备: {error}"
+                    );
+                    match fetch_page_with_browser(uid, offset).await {
+                        Err(error) if error.is_risk_control() => {
+                            tracing::warn!(
+                                "Bilibili Chromium 后备触发风控，刷新页面后重试一次: {error}"
+                            );
+                            fetch_page_with_browser(uid, offset).await
+                        }
+                        result => result,
+                    }
+                }
+                result => result,
+            }
+        }
+        result => result,
+    }
 }
 
 use crate::dynamics::types::{
@@ -354,16 +664,16 @@ mod tests {
     use super::*;
     use kovi::tokio;
 
+    const TEST_UID: u64 = 546_195;
+
     #[tokio::test]
-    // 注意: 本测试在此开发 IP 上被 B 站风控拦截（HTML captcha / -412 / -352）。
-    // 生产环境部署到干净 IP 时取消 ignore 即可正常联调。
-    #[ignore = "bilibili web dynamic endpoint blocks this dev IP; pass when run from prod network"]
-    async fn fetch_uid1_succeeds() {
-        let page = fetch_user_dynamics(1, None)
+    #[ignore = "requires the public Bilibili API"]
+    async fn anonymous_fetch_succeeds() {
+        let page = fetch_user_dynamics(TEST_UID, None)
             .await
-            .expect("feed/space failed (likely anti-bot)");
+            .expect("anonymous feed/space request failed");
         println!(
-            "uid=1 has_more={} next_offset={:?} items={}",
+            "uid={TEST_UID} has_more={} next_offset={:?} items={}",
             page.has_more,
             page.next_offset,
             page.items.len()
@@ -374,18 +684,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "bilibili web dynamic endpoint blocks this dev IP; pass when run from prod network"]
-    async fn fetch_uid1_has_items() {
-        let page = fetch_user_dynamics(1, None).await.unwrap();
-        assert!(!page.items.is_empty(), "uid=1 应有动态");
+    #[ignore = "requires the public Bilibili API"]
+    async fn anonymous_fetch_has_items() {
+        let page = fetch_user_dynamics(TEST_UID, None).await.unwrap();
+        assert!(!page.items.is_empty(), "uid={TEST_UID} 应有动态");
     }
 
     #[tokio::test]
-    #[ignore = "bilibili web dynamic endpoint blocks this dev IP; pass when run from prod network"]
-    async fn fetch_uid1_paginate() {
-        let first = fetch_user_dynamics(1, None).await.unwrap();
-        if let Some(off) = first.next_offset.as_deref() {
-            let second = fetch_user_dynamics(1, Some(off)).await.unwrap();
+    #[ignore = "requires the public Bilibili API"]
+    async fn anonymous_fetch_paginates() {
+        let first = fetch_user_dynamics(TEST_UID, None).await.unwrap();
+        if let Some(offset) = first.next_offset.as_deref() {
+            let second = fetch_user_dynamics(TEST_UID, Some(offset)).await.unwrap();
             println!("page2 items={}", second.items.len());
         }
     }
@@ -397,17 +707,54 @@ mod url_tests {
 
     #[test]
     fn url_builds_without_offset() {
-        let url = build_space_url(1, None);
+        let url = build_space_url(1, None, "ea1db124af3c7062474693fa704f4ff8", 1_702_204_169);
         assert!(url.as_str().contains("host_mid=1"));
         assert!(url.as_str().contains("timezone_offset=-480"));
         assert!(url.as_str().contains("features=itemOpusStyle"));
+        assert!(url.as_str().contains("w_rid="));
+        assert!(url.as_str().contains("wts=1702204169"));
     }
 
     #[test]
     fn url_builds_with_offset() {
-        let url = build_space_url(2, Some("abc"));
+        let url = build_space_url(
+            2,
+            Some("abc"),
+            "ea1db124af3c7062474693fa704f4ff8",
+            1_702_204_169,
+        );
         assert!(url.as_str().contains("host_mid=2"));
         assert!(url.as_str().contains("offset=abc"));
+    }
+
+    #[test]
+    fn known_wbi_signing_input_matches() {
+        let key = mixin_key(
+            "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+            "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png",
+        )
+        .unwrap();
+        assert_eq!(key, "ea1db124af3c7062474693fa704f4ff8");
+
+        let params = BTreeMap::from([
+            ("foo".into(), "114".into()),
+            ("bar".into(), "514".into()),
+            ("baz".into(), "1919810".into()),
+        ]);
+        assert_eq!(
+            signed_query(params, &key, 1_702_204_169),
+            "bar=514&baz=1919810&foo=114&wts=1702204169&\
+             w_rid=6149fdadf571698ca7e6a567265cd0ee"
+        );
+    }
+
+    #[test]
+    fn guest_cookie_contains_only_required_values() {
+        assert_eq!(
+            guest_cookie("ABC-123infoc", 1_700_000_000).unwrap(),
+            "buvid3=ABC-123infoc; b_nut=1700000000"
+        );
+        assert!(guest_cookie("bad; SESSDATA=injected", 1_700_000_000).is_err());
     }
 
     #[test]
