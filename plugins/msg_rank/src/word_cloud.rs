@@ -3,10 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -23,7 +20,8 @@ use wordcloud::{Mask, WordCloud, WordCloudError};
 
 use crate::config::{modify_config, read_config};
 
-static RESOURCE_CACHE: LazyLock<ResourceCache> = LazyLock::new(ResourceCache::new);
+static RESOURCE_MANAGER: tokio::sync::OnceCell<utils::ResourceManager<WordCloudResources>> =
+    tokio::sync::OnceCell::const_new();
 
 /// 生成词云的重资源（jieba 词典 ~54MB + 字体 ~16MB）加载后常驻内存，
 /// 而词云每天只生成几次；空闲超过此时间后卸载，下次生成时重新加载（加载耗时在亚秒级）。
@@ -37,94 +35,43 @@ struct WordCloudResources {
     font_bytes: Option<Arc<[u8]>>,
 }
 
-/// 重资源的按需缓存：首次生成词云时加载，空闲超时后自动卸载。
-/// 进行中的生成任务持有 `Arc` 克隆，卸载只移除缓存引用，内存随任务结束释放。
-struct ResourceCache {
-    resources: Mutex<Option<Arc<WordCloudResources>>>,
-    /// 每次取用资源递增；空闲回收任务通过比对代数判断期间是否有新取用。
-    generation: AtomicU64,
-    idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+async fn resource_manager(
+    font_path: PathBuf,
+) -> &'static utils::ResourceManager<WordCloudResources> {
+    RESOURCE_MANAGER
+        .get_or_init(move || async move {
+            utils::ResourceManager::new_with_destructor(
+                RESOURCE_IDLE_TIMEOUT,
+                move || {
+                    let font_path = font_path.clone();
+                    async move {
+                        tokio::task::spawn_blocking(move || load_word_cloud_resources(&font_path))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("词云资源加载任务失败: {e}"))?
+                    }
+                },
+                |resources| async move {
+                    info!("词云资源空闲超过 {:?}，已卸载", RESOURCE_IDLE_TIMEOUT);
+                    drop(resources);
+                },
+            )
+        })
+        .await
 }
 
-impl ResourceCache {
-    fn new() -> Self {
-        Self {
-            resources: Mutex::new(None),
-            generation: AtomicU64::new(0),
-            idle_task: Mutex::new(None),
+fn load_word_cloud_resources(font_path: &Path) -> Result<WordCloudResources> {
+    info!("加载 jieba 词典与词云字体");
+    let font_bytes = match std::fs::read(font_path) {
+        Ok(bytes) => Some(Arc::from(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(anyhow::anyhow!("读取字体失败 {}: {e}", font_path.display()));
         }
-    }
-
-    fn get(&self, font_path: &Path) -> Result<Arc<WordCloudResources>> {
-        let snapshot = self
-            .generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let resources = {
-            let mut guard = self.resources.lock().unwrap_or_else(|p| p.into_inner());
-            match &*guard {
-                Some(resources) => Arc::clone(resources),
-                None => {
-                    info!("加载 jieba 词典与词云字体");
-                    let font_bytes = match std::fs::read(font_path) {
-                        Ok(bytes) => Some(Arc::from(bytes)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(anyhow::anyhow!(
-                                "读取字体失败 {}: {e}",
-                                font_path.display()
-                            ));
-                        }
-                    };
-                    let resources = Arc::new(WordCloudResources {
-                        jieba: Arc::new(jieba_rs::Jieba::new()),
-                        font_bytes,
-                    });
-                    *guard = Some(Arc::clone(&resources));
-                    resources
-                }
-            }
-        };
-        self.schedule_idle_cleanup(snapshot);
-        Ok(resources)
-    }
-
-    fn schedule_idle_cleanup(&self, snapshot: u64) {
-        // 非 tokio 上下文（如单元测试）无法安排回收任务，此时词典随进程常驻。
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let mut task = self.idle_task.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(previous) = task.take() {
-            previous.abort();
-        }
-        *task = Some(handle.spawn(try_evict_idle_resources(snapshot)));
-    }
-
-    async fn try_evict_idle(&self, snapshot: u64) {
-        tokio::time::sleep(RESOURCE_IDLE_TIMEOUT).await;
-        self.evict_if_unchanged(snapshot);
-    }
-
-    fn evict_if_unchanged(&self, snapshot: u64) {
-        // 期间有新的取用 → 不卸载
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-        let mut guard = self.resources.lock().unwrap_or_else(|p| p.into_inner());
-        // 获取锁后再次检查，避免与新取用竞态
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-        if guard.take().is_some() {
-            info!("词云资源空闲超过 {:?}，已卸载", RESOURCE_IDLE_TIMEOUT);
-        }
-    }
-}
-
-/// 后台空闲回收任务入口：从静态缓存读取当前代数并尝试卸载。
-async fn try_evict_idle_resources(snapshot: u64) {
-    RESOURCE_CACHE.try_evict_idle(snapshot).await;
+    };
+    Ok(WordCloudResources {
+        jieba: Arc::new(jieba_rs::Jieba::new()),
+        font_bytes,
+    })
 }
 
 /// 输出词云布局尺寸。实际 PNG 通过 2 倍 scale 渲染成 800×800。
@@ -342,12 +289,13 @@ async fn make_word_cloud(
         let config = read_config();
         config.wordcloud_background.clone()
     };
+    let resources = resource_manager(path.join("font.otf")).await.get().await?;
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
-        generate_word_cloud_image(&path, &messages, &stop_words, &background)
+        generate_word_cloud_image(&resources, &path, &messages, &stop_words, &background)
     })
     .await
     .map_err(|e| anyhow::anyhow!("词云后台任务失败: {e}"))?
@@ -360,13 +308,12 @@ const MAX_WORD_LENGTH: usize = 256;
 
 /// 使用 wordcloud-rs 生成 PNG 词云图。
 fn generate_word_cloud_image(
+    resources: &WordCloudResources,
     path: &Path,
     text: &str,
     stop_words: &[String],
     background: &str,
 ) -> Result<Vec<u8>> {
-    // 生成期间持有资源 Arc：即使空闲回收触发，内存也随本次生成结束才释放。
-    let resources = RESOURCE_CACHE.get(&path.join("font.otf"))?;
     let frequencies = count_frequencies(&resources.jieba, text, stop_words);
 
     let mut builder = WordCloud::builder()
@@ -528,24 +475,6 @@ mod tests {
     use super::*;
     use utils::command::{Permission, ResolveOutcome, RouteError};
 
-    #[tokio::test]
-    async fn resource_cache_evicts_only_when_snapshot_matches() {
-        let cache = ResourceCache::new();
-        let resources = cache.get(Path::new("/nonexistent/font.otf")).unwrap();
-        assert!(cache.resources.lock().unwrap().is_some());
-
-        // 代数不一致（期间有新取用）→ 保留缓存
-        let stale = cache.generation.load(Ordering::Relaxed).wrapping_add(1);
-        cache.evict_if_unchanged(stale);
-        assert!(cache.resources.lock().unwrap().is_some());
-
-        // 代数一致 → 卸载缓存引用；已持有 Arc 的任务不受影响
-        let current = cache.generation.load(Ordering::Relaxed);
-        cache.evict_if_unchanged(current);
-        assert!(cache.resources.lock().unwrap().is_none());
-        assert!(!resources.jieba.cut_all("测试").is_empty());
-    }
-
     #[test]
     fn command_tree_registers_admin_group_subcommands() {
         let tree = utils::command::CommandTree::new(vec![wordcloud_command(Arc::new(
@@ -581,7 +510,10 @@ mod tests {
     #[test]
     fn test_wordcloud_generate_direct() {
         let text = "rust rust rust rust wordcloud wordcloud layout";
-        let png = generate_word_cloud_image(Path::new("/nonexistent"), text, &[], "white").unwrap();
+        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf")).unwrap();
+        let png =
+            generate_word_cloud_image(&resources, Path::new("/nonexistent"), text, &[], "white")
+                .unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         let image = image::load_from_memory(&png).unwrap().to_rgba8();
@@ -596,7 +528,9 @@ mod tests {
     #[test]
     fn test_wordcloud_no_usable_words_returns_empty() {
         let stop_words = vec!["the".to_string()];
+        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf")).unwrap();
         let result = generate_word_cloud_image(
+            &resources,
             Path::new("/nonexistent"),
             "the the the",
             &stop_words,
