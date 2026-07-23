@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -14,7 +8,7 @@ use futures::StreamExt;
 use kovi::tokio::{self, sync::OnceCell};
 use tracing::{error, info};
 
-use crate::BoundedPool;
+use crate::{BoundedPool, ResourceManager};
 
 /// 截图默认超时：避免浏览器偶发卡死永久占用一个 tokio task。
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,36 +27,33 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// - `html`: 完整 HTML 内容
 /// - `selector`: 若提供，只截取该 CSS 选择器匹配的元素；否则截取全页
 pub async fn screenshot(html: &str, selector: Option<&str>) -> Result<Vec<u8>> {
-    let manager = get_manager().await?;
-    manager.screenshot(html, selector).await
+    get_manager().await.screenshot(html, selector).await
 }
 
-async fn get_manager() -> Result<&'static ScreenshotManager> {
+async fn get_manager() -> &'static ScreenshotManager {
     static MANAGER: OnceCell<ScreenshotManager> = OnceCell::const_new();
     MANAGER
-        .get_or_try_init(|| async { Ok(ScreenshotManager::new()) })
+        .get_or_init(|| async { ScreenshotManager::new() })
         .await
 }
 
 pub struct ScreenshotManager {
-    /// 浏览器实例：`None` 表示未启动或已被空闲回收。
-    browser: tokio::sync::RwLock<Option<Browser>>,
-    /// 串行化浏览器启动 / 关闭 / 重启，避免竞态。
-    lifecycle_lock: tokio::sync::Mutex<()>,
-    /// 每次截图递增的代数，空闲回收任务通过比对代数判断浏览器是否仍在使用。
-    generation: AtomicU64,
+    browser: ResourceManager<Browser>,
     pool: BoundedPool,
-    idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ScreenshotManager {
     fn new() -> Self {
         Self {
-            browser: tokio::sync::RwLock::new(None),
-            lifecycle_lock: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
+            browser: ResourceManager::new_with_destructor(
+                IDLE_TIMEOUT,
+                || async {
+                    info!("launching chromiumoxide browser (lazy init)");
+                    Self::launch_browser().await
+                },
+                Self::close_browser,
+            ),
             pool: BoundedPool::new(MAX_CONCURRENT_SCREENSHOTS),
-            idle_task: Mutex::new(None),
         }
     }
 
@@ -98,62 +89,10 @@ impl ScreenshotManager {
         Ok(browser)
     }
 
-    /// 确保浏览器在运行：已存在则直接返回，不存在则启动一个。
-    async fn ensure_browser(&self) -> Result<()> {
-        if self.browser.read().await.is_some() {
-            return Ok(());
-        }
-
-        let _lock = self.lifecycle_lock.lock().await;
-        // 双重检查：其他任务可能在我们等锁期间启动了浏览器
-        if self.browser.read().await.is_some() {
-            return Ok(());
-        }
-
-        info!("launching chromiumoxide browser (lazy init)");
-        let browser = Self::launch_browser().await?;
-        *self.browser.write().await = Some(browser);
-        Ok(())
-    }
-
-    /// 关闭当前浏览器并启动新的。调用方应已确认浏览器存在。
-    async fn restart_browser(&self) -> Result<()> {
-        let _lock = self.lifecycle_lock.lock().await;
-        let mut guard = self.browser.write().await;
-        if let Some(mut browser) = guard.take() {
-            info!("restarting chromiumoxide browser");
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
-        }
-        *guard = Some(Self::launch_browser().await?);
-        Ok(())
-    }
-
-    /// 空闲回收：等待 [`IDLE_TIMEOUT`] 后，若代数未变则关闭浏览器。
-    ///
-    /// 由 [`screenshot`] 安排单个可取消的后台任务调用。
-    async fn try_close_idle(&self, snapshot: u64) {
-        tokio::time::sleep(IDLE_TIMEOUT).await;
-
-        // 期间有新的截图请求 → 不回收
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-
-        let _lock = self.lifecycle_lock.lock().await;
-        // 获取锁后再次检查，避免与正在排队的 ensure_browser 竞态
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-
-        if let Some(mut browser) = self.browser.write().await.take() {
-            info!(
-                "chromiumoxide browser idle for {:?}, shutting down",
-                IDLE_TIMEOUT
-            );
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
-        }
+    async fn close_browser(mut browser: Browser) {
+        info!("shutting down chromiumoxide browser");
+        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
+        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
     }
 
     pub async fn screenshot(&self, html: &str, selector: Option<&str>) -> Result<Vec<u8>> {
@@ -161,52 +100,17 @@ impl ScreenshotManager {
             anyhow::bail!("HTML 超过截图输入上限: {} bytes", MAX_HTML_BYTES);
         }
         let _permit = self.pool.acquire(SCREENSHOT_WAIT_TIMEOUT).await?;
-        self.ensure_browser().await?;
-
-        // 递增代数并记录当前值，供空闲回收任务比对
-        let snapshot = self
-            .generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-
-        let result = {
-            let first = {
-                let guard = self.browser.read().await;
-                match guard.as_ref() {
-                    Some(browser) => Self::do_screenshot(browser, html, selector).await,
-                    // 空闲回收可能恰好赶在 ensure_browser 之后关闭浏览器，视为可重试的失败
-                    None => Err(anyhow::anyhow!("浏览器实例已被回收")),
-                }
-            };
-
-            match first {
-                Ok(bytes) => Ok(bytes),
-                Err(e) => {
-                    error!("截图失败（{}），尝试重启浏览器后重试", e);
-                    self.restart_browser().await?;
-                    let guard = self.browser.read().await;
-                    let browser = guard
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("浏览器重启后仍不可用"))?;
-                    Self::do_screenshot(browser, html, selector).await
-                }
+        let browser = self.browser.get().await?;
+        match Self::do_screenshot(&browser, html, selector).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                error!("截图失败（{}），尝试重启浏览器后重试", e);
+                self.browser.invalidate(&browser);
+                drop(browser);
+                let browser = self.browser.get().await?;
+                Self::do_screenshot(&browser, html, selector).await
             }
-        };
-
-        self.schedule_idle_cleanup(snapshot);
-
-        result
-    }
-
-    fn schedule_idle_cleanup(&self, snapshot: u64) {
-        let mut task = self
-            .idle_task
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = task.take() {
-            previous.abort();
         }
-        *task = Some(tokio::spawn(try_close_idle(snapshot)));
     }
 
     async fn do_screenshot(
@@ -283,14 +187,6 @@ fn validate_dimensions(width: f64, height: f64) -> Result<()> {
         anyhow::bail!("截图像素面积超过上限: {width}x{height}");
     }
     Ok(())
-}
-
-/// 后台空闲回收入口：从静态 [`ScreenshotManager`] 读取当前代数并尝试关闭。
-async fn try_close_idle(snapshot: u64) {
-    // Manager 在首次截图时已初始化，这里只会取到已存在的实例。
-    if let Ok(manager) = get_manager().await {
-        manager.try_close_idle(snapshot).await;
-    }
 }
 
 #[cfg(test)]

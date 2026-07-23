@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -35,21 +29,22 @@ async fn manager() -> &'static BrowserManager {
 }
 
 struct BrowserManager {
-    browser: tokio::sync::RwLock<Option<Browser>>,
-    lifecycle_lock: tokio::sync::Mutex<()>,
+    browser: utils::ResourceManager<Browser>,
     request_lock: tokio::sync::Mutex<()>,
-    generation: AtomicU64,
-    idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl BrowserManager {
     fn new() -> Self {
         Self {
-            browser: tokio::sync::RwLock::new(None),
-            lifecycle_lock: tokio::sync::Mutex::new(()),
+            browser: utils::ResourceManager::new_with_destructor(
+                IDLE_TIMEOUT,
+                || async {
+                    tracing::info!("启动 Bilibili 匿名动态 Chromium 后备");
+                    Self::launch_browser().await
+                },
+                Self::close_browser,
+            ),
             request_lock: tokio::sync::Mutex::new(()),
-            generation: AtomicU64::new(0),
-            idle_task: Mutex::new(None),
         }
     }
 
@@ -81,71 +76,22 @@ impl BrowserManager {
         Ok(browser)
     }
 
-    async fn ensure_browser(&self) -> Result<()> {
-        if self.browser.read().await.is_some() {
-            return Ok(());
-        }
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        if self.browser.read().await.is_none() {
-            tracing::info!("启动 Bilibili 匿名动态 Chromium 后备");
-            *self.browser.write().await = Some(Self::launch_browser().await?);
-        }
-        Ok(())
+    async fn close_browser(mut browser: Browser) {
+        tracing::info!("关闭 Bilibili 匿名动态 Chromium 后备");
+        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
+        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
     }
 
     async fn fetch(&self, uid: u64, offset: Option<&str>) -> Result<String> {
         let _request = self.request_lock.lock().await;
-        self.ensure_browser().await?;
-        let snapshot = self
-            .generation
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        let result = async {
-            let browser = self.browser.read().await;
-            let browser = browser.as_ref().context("Chromium 实例意外丢失")?;
-            tokio::time::timeout(
-                BROWSER_REQUEST_TIMEOUT,
-                fetch_with_browser(browser, uid, offset),
-            )
-            .await
-            .context("Chromium 动态请求超时")?
-        }
-        .await;
-        self.schedule_idle_cleanup(snapshot);
-        result
+        let browser = self.browser.get().await?;
+        tokio::time::timeout(
+            BROWSER_REQUEST_TIMEOUT,
+            fetch_with_browser(&browser, uid, offset),
+        )
+        .await
+        .context("Chromium 动态请求超时")?
     }
-
-    fn schedule_idle_cleanup(&self, snapshot: u64) {
-        let mut task = self
-            .idle_task
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = task.take() {
-            previous.abort();
-        }
-        *task = Some(tokio::spawn(close_idle_browser(snapshot)));
-    }
-
-    async fn close_if_idle(&self, snapshot: u64) {
-        tokio::time::sleep(IDLE_TIMEOUT).await;
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-        let _request = self.request_lock.lock().await;
-        let _lifecycle = self.lifecycle_lock.lock().await;
-        if self.generation.load(Ordering::Relaxed) != snapshot {
-            return;
-        }
-        if let Some(mut browser) = self.browser.write().await.take() {
-            tracing::info!("关闭空闲的 Bilibili 匿名动态 Chromium 后备");
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-            let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
-        }
-    }
-}
-
-async fn close_idle_browser(snapshot: u64) {
-    manager().await.close_if_idle(snapshot).await;
 }
 
 async fn fetch_with_browser(browser: &Browser, uid: u64, offset: Option<&str>) -> Result<String> {
