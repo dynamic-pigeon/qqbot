@@ -58,7 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build("./logs")
         .unwrap();
 
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    // 日志 channel 按行数预分配 slot：4096 行约 130KB 常驻内存，足够覆盖日常日志突发。
+    let (non_blocking, _guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(4096)
+        .finish(file_appender);
 
     tracing_subscriber::registry()
         .with(env_filter)
