@@ -22,10 +22,16 @@ struct MemberInfoApiResponse {
     user_id: i64,
 }
 
+// 按字节限容：头像（最大 2MB）是条目体积的大头，只按条数限制时缓存可能涨到 GB 级。
+const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 static USER_INFO_CACHE: std::sync::LazyLock<Cache<(i64, i64), UserInfo>> =
     std::sync::LazyLock::new(|| {
         Cache::builder()
-            .max_capacity(2048)
+            .weigher(|_key: &(i64, i64), info: &UserInfo| {
+                (info.avatar.len() + info.nickname.len() + 64) as u32
+            })
+            .max_capacity(MAX_CACHE_BYTES)
             // moka 缓存保留 24 小时，用于 stale fallback； freshness 由 fetched_at 控制。
             .time_to_live(Duration::from_secs(60 * 60 * 24))
             .build()

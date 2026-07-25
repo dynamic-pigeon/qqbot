@@ -33,6 +33,8 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .pool_max_idle_per_host(16)
+        // 空闲连接定时归还，避免 keep-alive 的 TLS 连接无限期挂起。
+        .pool_idle_timeout(Duration::from_secs(90))
         .timeout(Duration::from_secs(10))
         // SSRF 防御：禁止跟随 redirect，防止 attacker 用公网域名 → 内网 IP 跳转
         // 绕过 URL host 白名单。
