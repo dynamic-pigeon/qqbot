@@ -106,25 +106,28 @@ pub async fn gen_rank_html_with_time_range(
         anyhow::bail!("该时间范围暂无发言数据");
     }
 
-    let mut entries: Vec<(user_info::UserInfo, u32)> = Vec::with_capacity(top.len());
-    for (user_id, cnt) in top {
-        match user_info::get_user_info(bot, group_id, user_id).await {
-            Ok(info) => entries.push((info, cnt)),
-            Err(e) => {
-                tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
-                // 使用 user_id 作为昵称占位
-                entries.push((
-                    user_info::UserInfo {
-                        user_id,
-                        nickname: user_id.to_string(),
-                        avatar: bytes::Bytes::new(),
-                        fetched_at: std::time::Instant::now(),
-                    },
-                    cnt,
-                ));
+    // 每个用户都要走群成员 API + 头像下载且各自带重试，串行拉取会让
+    // 命令响应时间叠加上去，并行后总耗时约等于最慢的一个用户。
+    let entries: Vec<(user_info::UserInfo, u32)> =
+        futures::future::join_all(top.into_iter().map(|(user_id, cnt)| async move {
+            match user_info::get_user_info(bot, group_id, user_id).await {
+                Ok(info) => (info, cnt),
+                Err(e) => {
+                    tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
+                    // 使用 user_id 作为昵称占位
+                    (
+                        user_info::UserInfo {
+                            user_id,
+                            nickname: user_id.to_string(),
+                            avatar: bytes::Bytes::new(),
+                            fetched_at: std::time::Instant::now(),
+                        },
+                        cnt,
+                    )
+                }
             }
-        }
-    }
+        }))
+        .await;
 
     let html = render_rank_html(&entries)?;
     Ok(html)
