@@ -32,12 +32,12 @@ static USER_INFO_CACHE: std::sync::LazyLock<Cache<(i64, i64), UserInfo>> =
                 (info.avatar.len() + info.nickname.len() + 64) as u32
             })
             .max_capacity(MAX_CACHE_BYTES)
-            // moka 缓存保留 24 小时，用于 stale fallback； freshness 由 fetched_at 控制。
+            // TTL 24 小时只是条目存活上限；是否刷新由 fetched_at 控制。
             .time_to_live(Duration::from_secs(60 * 60 * 24))
             .build()
     });
 
-/// 1 小时内视为 fresh，超过则触发后台刷新，失败时仍可回落到 stale 缓存。
+/// 1 小时内视为 fresh，超过则重新拉取，失败时仍可回落到 stale 缓存。
 const FRESH_DURATION: Duration = Duration::from_secs(60 * 60);
 
 /// 含初始请求最多 3 次尝试：初始、200ms 后、500ms 后。
@@ -60,10 +60,17 @@ pub(super) async fn get_user_info(
     let key = (group_id, user_id);
 
     // fresh 缓存直接返回，不走 API。
-    if let Some(info) = USER_INFO_CACHE.get(&key).await
+    let stale = USER_INFO_CACHE.get(&key).await;
+    if let Some(info) = &stale
         && info.fetched_at.elapsed() < FRESH_DURATION
     {
-        return Ok(info);
+        return Ok(info.clone());
+    }
+
+    // try_get_with 对 TTL 内已存在的条目直接返回、不会执行初始化闭包，
+    // 所以 stale 条目必须先移除，刷新才会真正发生。
+    if stale.is_some() {
+        USER_INFO_CACHE.invalidate(&key).await;
     }
 
     let bot = bot.clone();
@@ -77,8 +84,8 @@ pub(super) async fn get_user_info(
     {
         Ok(info) => Ok(info),
         Err(arc) => {
-            // 刷新失败时，只要 moka 里还有条目（24 小时内），就作为 stale fallback 返回。
-            if let Some(stale) = USER_INFO_CACHE.get(&key).await {
+            // 刷新失败时回落到刷新前保存的 stale 条目。
+            if let Some(stale) = stale {
                 tracing::warn!("获取用户 {} 信息失败，使用缓存数据: {}", user_id, arc);
                 Ok(stale)
             } else {

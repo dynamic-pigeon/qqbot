@@ -178,12 +178,22 @@ fn init_buffer() {
                 _ = &mut shutdown_rx => {
                     while let Ok(record) = rx.try_recv() {
                         state.push(record);
-                        if state.len() >= FLUSH_BATCH_SIZE {
-                            flush_batch(&mut state).await;
+                    }
+                    // flush_batch 失败时会保留批次，靠「长度不再下降」识别 DB 持续故障，
+                    // 避免关闭流程无限重试。
+                    const MAX_SHUTDOWN_FLUSH_FAILURES: usize = 3;
+                    let mut failures = 0;
+                    while !state.is_empty() && failures < MAX_SHUTDOWN_FLUSH_FAILURES {
+                        let before = state.len();
+                        flush_batch(&mut state).await;
+                        if state.len() < before {
+                            failures = 0;
+                        } else {
+                            failures += 1;
                         }
                     }
-                    while !state.is_empty() {
-                        flush_batch(&mut state).await;
+                    if !state.is_empty() {
+                        tracing::warn!("关闭刷新未完成，丢弃 {} 条消息", state.len());
                     }
                     let _ = done_tx.send(());
                     break;
