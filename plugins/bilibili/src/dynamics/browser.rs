@@ -85,18 +85,16 @@ impl BrowserManager {
     async fn fetch(&self, uid: u64, offset: Option<&str>) -> Result<String> {
         let _request = self.request_lock.lock().await;
         let browser = self.browser.get().await?;
-        tokio::time::timeout(
-            BROWSER_REQUEST_TIMEOUT,
-            fetch_with_browser(&browser, uid, offset),
-        )
-        .await
-        .context("Chromium 动态请求超时")?
+        fetch_with_browser(&browser, uid, offset).await
     }
 }
 
 async fn fetch_with_browser(browser: &Browser, uid: u64, offset: Option<&str>) -> Result<String> {
     let page = browser.new_page("about:blank").await?;
-    let operation = async {
+    // 超时只包住抓取阶段、不包住 close：超时 drop 掉抓取 future 后仍需显式
+    // 关闭 tab（chromiumoxide 的 Page 没有 Drop 自动关闭），否则风控期反复
+    // 超时会在浏览器里累积僵尸 tab。
+    let operation = tokio::time::timeout(BROWSER_REQUEST_TIMEOUT, async {
         for attempt in 0..2 {
             match capture_dynamic_body(&page, uid, offset).await {
                 Ok(body) => return Ok(body),
@@ -107,10 +105,10 @@ async fn fetch_with_browser(browser: &Browser, uid: u64, offset: Option<&str>) -
             }
         }
         unreachable!()
-    }
+    })
     .await;
     let _ = tokio::time::timeout(PAGE_CLOSE_TIMEOUT, page.close()).await;
-    operation
+    operation.context("Chromium 动态请求超时")?
 }
 
 async fn capture_dynamic_body(
