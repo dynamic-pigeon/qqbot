@@ -9,7 +9,7 @@ use kovi::{
     tokio::{self, sync::OnceCell},
 };
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct Config {
     pub subscribe: Vec<Subscribe>,
     #[serde(default)]
@@ -45,13 +45,24 @@ pub async fn init() -> anyhow::Result<()> {
     let config_path = path.join("config.json");
     let config = if config_path.exists() {
         let data = tokio::fs::read(&config_path).await?;
-        serde_json::from_slice(&data)?
-    } else {
-        Config {
-            subscribe: Vec::new(),
-            dynamic_subscribe: Vec::new(),
-            dynamic_checkpoints: Vec::new(),
+        match serde_json::from_slice(&data) {
+            Ok(config) => config,
+            Err(error) => {
+                // 配置损坏（如上次写入中途崩溃）不应击垮插件启动：
+                // 备份原文件后回退空配置，订阅可重新添加。
+                let backup = config_path.with_extension("json.bak");
+                tracing::error!(
+                    "bilibili 配置解析失败: {error}，备份到 {} 并回退空配置",
+                    backup.display()
+                );
+                if let Err(error) = tokio::fs::rename(&config_path, &backup).await {
+                    tracing::warn!("备份损坏的配置文件失败: {error}");
+                }
+                Config::default()
+            }
         }
+    } else {
+        Config::default()
     };
     if !config_path.exists() {
         write_config(&config, &config_path)?;
@@ -100,17 +111,49 @@ where
 }
 
 pub fn write_config(config: &Config, path: impl AsRef<Path>) -> anyhow::Result<()> {
-    match kovi::utils::save_json_data(config, path) {
-        Err(e) => {
-            anyhow::bail!("保存配置文件失败: {}", e);
-        }
-        Ok(_) => Ok(()),
-    }
+    let path = path.as_ref();
+    // 先写临时文件再 rename：checkpoint 每轮 poll 都会写盘，直接截断写一旦
+    // 中途崩溃会留下半个 JSON。同目录 rename 是原子的。
+    let tmp_path = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(config)?;
+    std::fs::write(&tmp_path, data)?;
+    // rename 会用临时文件替换目标，权限需在替换前收紧，否则回退为 umask 默认值。
+    restrict_config_permissions(&tmp_path)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_config_roundtrip_and_cleans_up_tmp() {
+        let dir = std::env::temp_dir().join(format!("bili_config_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let cfg = Config {
+            dynamic_checkpoints: vec![DynamicCheckpoint {
+                uid: 1,
+                group: 2,
+                last_seen: 3,
+            }],
+            ..Config::default()
+        };
+        write_config(&cfg, &path).unwrap();
+        let back: Config = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back.dynamic_checkpoints, cfg.dynamic_checkpoints);
+        assert!(!dir.join("config.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn config_backward_compatible_without_dynamic_subscribe() {

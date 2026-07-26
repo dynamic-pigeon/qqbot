@@ -49,20 +49,16 @@ impl Display for Card {
     }
 }
 
-pub async fn fetch_card(name: &str) -> Result<Card> {
+/// 查询卡片，`Ok(None)` 表示查无此卡（正常的用户输入分支，不算内部错误）。
+pub async fn fetch_card(name: &str) -> Result<Option<Card>> {
     let url = format!(
         "https://ygocdb.com/api/v0/?search={}",
         urlencoding::encode(name)
     );
-    let response = HTTP_CLIENT.get(&url).send().await?;
+    let response = HTTP_CLIENT.get(&url).send().await?.error_for_status()?;
     let body = utils::read_response_limited(response, MAX_API_RESPONSE_BYTES).await?;
     let resp: ApiRes = serde_json::from_slice(&body)?;
-    let ret = resp
-        .result
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No card found for name: {}", name))?;
-    Ok(ret)
+    Ok(resp.result.into_iter().next())
 }
 
 async fn fetch_img(card_id: u64) -> Result<Bytes> {

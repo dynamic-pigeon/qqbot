@@ -257,37 +257,31 @@ pub async fn push_dynamic(
     author: &DynamicAuthor,
     item: &DynamicItem,
 ) -> anyhow::Result<()> {
-    let mut msg = Message::new();
-    let body = format_body(author, item);
     let total = count_pics_total(item);
     let sent = collect_pics(item);
-    let body = if total > sent.len() {
-        format!("{}\n（还有 {} 张图片未显示）", body, total - sent.len())
-    } else {
-        body
-    };
-    msg = msg.add_text(body);
+    let mut body = format_body(author, item);
+    if total > sent.len() {
+        body = format!("{}\n（还有 {} 张图片未显示）", body, total - sent.len());
+    }
 
-    let mut failed_pics: usize = 0;
+    let mut images: Vec<Bytes> = Vec::new();
     for src in &sent {
         match fetch_image(src).await {
-            Ok(bytes) => {
-                let b64 = STANDARD.encode(&bytes);
-                msg.push_image(&format!("base64://{}", b64));
-            }
-            Err(e) => {
-                tracing::warn!("拉取动态图片失败 {}: {e}", src);
-                failed_pics += 1;
-            }
+            Ok(bytes) => images.push(bytes),
+            Err(e) => tracing::warn!("拉取动态图片失败 {}: {e}", src),
         }
     }
 
-    // 若所有图片都下载失败（如封面 CDN 抖动），整条推送是空消息，回 Err 让 caller 计数如实反映
-    if !sent.is_empty() && failed_pics == sent.len() {
-        return Err(anyhow::anyhow!(
-            "动态 {} 张图片全部下载失败，放弃推送空消息",
-            sent.len()
-        ));
+    // 图片全部失败时降级为纯文本推送：确定性失败（如封面 URL 持续 403）
+    // 不应让 cron 每轮都卡在同一条动态上，宁可丢图也要推进 checkpoint。
+    if !sent.is_empty() && images.is_empty() {
+        body.push_str("\n（图片下载失败）");
+    }
+
+    let mut msg = Message::new().add_text(body);
+    for bytes in &images {
+        let b64 = STANDARD.encode(bytes);
+        msg.push_image(&format!("base64://{}", b64));
     }
 
     // 用 send_group_msg_return 真正等待 onebot 确认送达；

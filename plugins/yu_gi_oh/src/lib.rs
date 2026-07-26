@@ -53,9 +53,12 @@ async fn handle_card_query(ctx: CommandContext) -> CommandResult {
         return Err(CommandError::user("查询过于频繁，请稍后重试"));
     }
 
-    let card = fetch_card::fetch_card(card_name)
+    let Some(card) = fetch_card::fetch_card(card_name)
         .await
-        .map_err(CommandError::internal)?;
+        .map_err(CommandError::internal)?
+    else {
+        return Err(CommandError::user(format!("未找到卡片：{card_name}")));
+    };
     let img = match card.fetch_image().await {
         Ok(data) => data,
         Err(error) => {
