@@ -39,6 +39,10 @@ static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
         .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
 });
 
+/// 直连 API 响应字节上限：正常动态 JSON 只有几百 KB，超限说明响应异常
+/// （被风控返回 HTML 或超大 payload），与 Chromium 后备路径的上限一致。
+const MAX_API_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 pub const SPACE_FEED_URL: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space";
 const FINGER_SPI_URL: &str = "https://api.bilibili.com/x/frontend/finger/spi";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
@@ -176,13 +180,15 @@ pub enum DynamicsError {
     Session(String),
     #[error("bilibili Chromium 后备请求失败: {0}")]
     Browser(#[source] anyhow::Error),
+    #[error("bilibili 动态响应超过大小上限: {0}")]
+    BodyLimit(#[source] anyhow::Error),
 }
 
 impl DynamicsError {
     fn is_risk_control(&self) -> bool {
         matches!(
             self,
-            Self::Api(-101 | -352 | -412, _) | Self::UnexpectedResponse { .. }
+            Self::Api(-101 | -352 | -412, _) | Self::UnexpectedResponse { .. } | Self::BodyLimit(_)
         )
     }
 }
@@ -357,7 +363,9 @@ async fn fetch_page(
             content_type,
         });
     }
-    let body = response.bytes().await?;
+    let body = utils::read_response_limited(response, MAX_API_RESPONSE_BYTES)
+        .await
+        .map_err(DynamicsError::BodyLimit)?;
     let api: ApiResponse<SpaceData> = serde_json::from_slice(&body).map_err(|error| {
         if content_type.contains("json") {
             DynamicsError::Deserialize(error)

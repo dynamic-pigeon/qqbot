@@ -107,8 +107,12 @@ static RATE_LIMITER: LazyLock<kovi::tokio::sync::Mutex<HashMap<i64, Vec<Instant>
 async fn check_rate_limit(group_id: i64) -> bool {
     let mut map = RATE_LIMITER.lock().await;
     let now = Instant::now();
+    // 顺带清理窗口已空的键，避免 map 随见过的群数无限增长。
+    map.retain(|_, entries| {
+        entries.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
+        !entries.is_empty()
+    });
     let entries = map.entry(group_id).or_default();
-    entries.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
 
     if entries.len() >= RATE_LIMIT_MAX_PER_WINDOW {
         false
