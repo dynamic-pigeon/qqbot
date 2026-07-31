@@ -15,6 +15,93 @@ static MARKDOWN_OPTIONS: LazyLock<Options> = LazyLock::new(|| {
     options
 });
 
+// sanitize 白名单集合合计约 4KB 常驻内存，相比单次截图启动的浏览器进程
+// （数百 MB）是噪声级别，不值得为它们做按需构建与空闲回收，直接静态化。
+static ALLOWED_TAGS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    [
+        // 基础结构
+        "p",
+        "br",
+        "hr",
+        "div",
+        "span",
+        // 标题
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        // 文本格式
+        "strong",
+        "em",
+        "b",
+        "i",
+        "u",
+        "s",
+        "del",
+        "ins",
+        "mark",
+        "sub",
+        "sup",
+        "code",
+        "pre",
+        "kbd",
+        "samp",
+        "var",
+        // 列表
+        "ul",
+        "ol",
+        "li",
+        "dl",
+        "dt",
+        "dd",
+        // 表格
+        "table",
+        "thead",
+        "tbody",
+        "tfoot",
+        "tr",
+        "th",
+        "td",
+        "caption",
+        "col",
+        "colgroup",
+        // 引用
+        "blockquote",
+        "q",
+        "cite",
+        // 细节
+        "details",
+        "summary",
+        // 链接（仅保留文本，href 会被 scheme 过滤）
+        "a",
+        // 其他语义标签
+        "abbr",
+        "bdi",
+        "bdo",
+        "dfn",
+        "small",
+        "time",
+        "wbr",
+    ]
+    .into_iter()
+    .collect()
+});
+
+static GENERIC_ATTRS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    ["class", "id", "title", "dir", "lang"]
+        .into_iter()
+        .collect()
+});
+
+/// 各标签额外允许的属性；目前只有 `a` 的 `href`。
+static TAG_ATTRIBUTES: LazyLock<HashMap<&'static str, HashSet<&'static str>>> =
+    LazyLock::new(|| HashMap::from([("a", HashSet::from(["href"]))]));
+
+static URL_SCHEMES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| ["http", "https", "mailto"].into_iter().collect());
+
 #[derive(Template)]
 #[template(path = "markdown.html")]
 struct MarkdownTemplate {
@@ -87,93 +174,13 @@ pub fn md_to_html(md: &str) -> String {
 ///
 /// 该 sanitizer 与 CSP 头配合使用：即使某处被绕过，Chromium 也被限制在最小权限集。
 fn sanitize_html(input: &str) -> String {
-    let allowed_tags: HashSet<&str> = [
-        // 基础结构
-        "p",
-        "br",
-        "hr",
-        "div",
-        "span",
-        // 标题
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        // 文本格式
-        "strong",
-        "em",
-        "b",
-        "i",
-        "u",
-        "s",
-        "del",
-        "ins",
-        "mark",
-        "sub",
-        "sup",
-        "code",
-        "pre",
-        "kbd",
-        "samp",
-        "var",
-        // 列表
-        "ul",
-        "ol",
-        "li",
-        "dl",
-        "dt",
-        "dd",
-        // 表格
-        "table",
-        "thead",
-        "tbody",
-        "tfoot",
-        "tr",
-        "th",
-        "td",
-        "caption",
-        "col",
-        "colgroup",
-        // 引用
-        "blockquote",
-        "q",
-        "cite",
-        // 细节
-        "details",
-        "summary",
-        // 链接（仅保留文本，href 会被 scheme 过滤）
-        "a",
-        // 其他语义标签
-        "abbr",
-        "bdi",
-        "bdo",
-        "dfn",
-        "small",
-        "time",
-        "wbr",
-    ]
-    .iter()
-    .copied()
-    .collect();
-
-    let generic_attrs: HashSet<&str> = ["class", "id", "title", "dir", "lang"]
-        .iter()
-        .copied()
-        .collect();
-
-    let mut tag_attributes: HashMap<&str, HashSet<&str>> = HashMap::new();
-    let a_attrs: HashSet<&str> = ["href"].iter().copied().collect();
-    tag_attributes.insert("a", a_attrs);
-
-    let url_schemes: HashSet<&str> = ["http", "https", "mailto"].iter().copied().collect();
-
+    // ammonia 的 setter 是 move 语义，这里从静态白名单 clone 一份；
+    // clone 直接复制 hashbrown 内部表，不重新计算 hash，比每次重建快。
     ammonia::Builder::default()
-        .tags(allowed_tags)
-        .generic_attributes(generic_attrs)
-        .tag_attributes(tag_attributes)
-        .url_schemes(url_schemes)
+        .tags(ALLOWED_TAGS.clone())
+        .generic_attributes(GENERIC_ATTRS.clone())
+        .tag_attributes(TAG_ATTRIBUTES.clone())
+        .url_schemes(URL_SCHEMES.clone())
         .link_rel(Some("nofollow noopener noreferrer"))
         .clean(input)
         .to_string()

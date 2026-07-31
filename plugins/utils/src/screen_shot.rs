@@ -6,7 +6,7 @@ use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewpo
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
 use kovi::tokio::{self, sync::OnceCell};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{BoundedPool, ResourceManager};
 
@@ -209,7 +209,14 @@ impl ScreenshotManager {
             .await
             .map_err(|_| anyhow::anyhow!("截图超时"))?;
 
-        let _ = tokio::time::timeout(PAGE_CLOSE_TIMEOUT, page.close()).await;
+        // close 超时说明页面或浏览器卡住，页面会残留在浏览器进程内；
+        // 由 5 分钟 idle 回收或下次错误触发的浏览器整体重启兜底。
+        if tokio::time::timeout(PAGE_CLOSE_TIMEOUT, page.close())
+            .await
+            .is_err()
+        {
+            debug!("页面关闭超时，页面残留在浏览器进程内，等待浏览器整体回收");
+        }
         res
     }
 }
