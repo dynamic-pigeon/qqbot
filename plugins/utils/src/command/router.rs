@@ -87,12 +87,19 @@ impl CommandRouter {
 }
 
 pub fn extract_command_text(message: &Message) -> Option<String> {
-    let parts = message
+    // 每条消息都会经过这里：单 text 段直接 clone，多段才拼合，
+    // 避免为最常见的单段消息分配临时 Vec。
+    let mut parts = message
         .iter()
         .filter(|segment| segment.kind == "text")
-        .filter_map(|segment| segment.data.get("text").and_then(|value| value.as_str()))
-        .collect::<Vec<_>>();
-    (!parts.is_empty()).then(|| parts.join("\n"))
+        .filter_map(|segment| segment.data.get("text").and_then(|value| value.as_str()));
+    let first = parts.next()?;
+    let mut combined = first.to_owned();
+    for part in parts {
+        combined.push('\n');
+        combined.push_str(part);
+    }
+    Some(combined)
 }
 
 fn check_event_access(
