@@ -525,6 +525,36 @@ mod tests {
         );
     }
 
+    /// 用真实 font.otf（含 CJK 字形）生成词云，覆盖 `ArcBorrowedFont`
+    /// 零拷贝字体分支。数据文件缺失时跳过，避免未部署数据的环境失败。
+    #[test]
+    fn test_wordcloud_generate_with_real_font() {
+        let font_path = Path::new("../../data/msg_rank/font.otf");
+        if !font_path.exists() {
+            eprintln!("skip: 缺少 data/msg_rank/font.otf");
+            return;
+        }
+        let resources = load_word_cloud_resources(font_path).unwrap();
+        let text = "rust 词云 生成 测试 测试 代码 高亮 布局 字体 渲染 中文 文本";
+        let png = generate_word_cloud_image(
+            &resources,
+            font_path.parent().unwrap(),
+            text,
+            &[],
+            "white",
+        )
+        .unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (800, 800));
+        assert!(
+            image
+                .pixels()
+                .any(|pixel| *pixel != Rgba([255, 255, 255, 255]))
+        );
+    }
+
     #[test]
     fn test_wordcloud_no_usable_words_returns_empty() {
         let stop_words = vec!["the".to_string()];
