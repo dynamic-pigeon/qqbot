@@ -64,14 +64,15 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('.math-inline').forEach(el => {
         const tex = el.textContent;
         const span = document.createElement('span');
-        katex.render(tex, span, { displayMode: false });
+        // 解析失败的公式渲染成红色报错文本而非抛异常，否则渲染中断会导致下方的 .finish 标记缺失
+        katex.render(tex, span, { displayMode: false, throwOnError: false });
         el.replaceWith(span);
     });
     // 渲染 KaTeX 块级公式
     document.querySelectorAll('.math-display').forEach(el => {
         const tex = el.textContent;
         const div = document.createElement('div');
-        katex.render(tex, div, { displayMode: true });
+        katex.render(tex, div, { displayMode: true, throwOnError: false });
         el.replaceWith(div);
     });
 

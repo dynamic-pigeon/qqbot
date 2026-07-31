@@ -55,7 +55,7 @@ async fn handle_daily_rank(ctx: CommandContext) -> CommandResult {
     let html = gen_daily_rank_html(ctx.bot(), group_id)
         .await
         .map_err(CommandError::internal)?;
-    let image = utils::screenshot(&html, None)
+    let image = utils::screenshot(&html, utils::ScreenshotOptions::default())
         .await
         .map_err(CommandError::internal)?;
     let base64_image = STANDARD.encode(image);
