@@ -19,4 +19,4 @@ pub use safe_url::{
     validate_image_url_async, validate_image_url_async_with_options,
     validate_image_url_with_options,
 };
-pub use screen_shot::{ScreenshotManager, screenshot};
+pub use screen_shot::{ScreenshotManager, ScreenshotOptions, screenshot};

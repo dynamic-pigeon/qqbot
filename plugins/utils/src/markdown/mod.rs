@@ -29,7 +29,14 @@ struct MarkdownTemplate {
 pub async fn md_to_img(md: &str) -> Result<Vec<u8>> {
     let html = md_to_html(md);
 
-    let png_data = match crate::screen_shot::screenshot(&html, Some("article.markdown-body")).await
+    // 等模板里的 `.finish` 标志出现再截图，保证 KaTeX / highlight.js 渲染完成。
+    let png_data = match crate::screen_shot::screenshot(
+        &html,
+        crate::screen_shot::ScreenshotOptions::new()
+            .with_selector("article.markdown-body")
+            .with_wait_selectors(&["div.finish"]),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {

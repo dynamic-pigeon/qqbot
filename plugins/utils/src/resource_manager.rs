@@ -186,6 +186,66 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
         true
     }
 
+    /// 让缓存实例失效、等旧实例销毁完成后构建新实例返回。
+    ///
+    /// 与“先 [`invalidate`](Self::invalidate) 再 [`get`](Self::get) 不同：
+    /// 后者的销毁回调在最后一个 lease 释放时异步触发、无人等待，新实例可能在
+    /// 旧实例还没彻底销毁时就构建。对依赖独占外部资源（如浏览器 profile 锁）
+    /// 的实例，二者会互相冲突。本方法保证新实例一定在旧实例销毁完成后才构建。
+    pub async fn replace(&self, mut resource: ManagedResource<T>) -> Result<ManagedResource<T>> {
+        // 从缓存取出旧实例；缓存为空或传入 lease 与缓存实例不一致时无法原地
+        // 替换，退化为普通 get。std MutexGuard 非 Send，取出的动作放在独立块里，
+        // 让守卫在进入任何 await 之前释放。
+        let old = {
+            let mut state = lock_state(&self.inner.state);
+            match state.resource.take() {
+                Some(cached)
+                    if resource
+                        .resource
+                        .as_ref()
+                        .is_some_and(|r| Arc::ptr_eq(r, &cached)) =>
+                {
+                    state.cancel_cleanup();
+                    state.generation = state.generation.wrapping_add(1);
+                    Some(cached)
+                }
+                Some(cached) => {
+                    state.resource = Some(cached);
+                    None
+                }
+                None => None,
+            }
+        };
+        let Some(old) = old else {
+            drop(resource);
+            return self.get().await;
+        };
+
+        // 取出 lease 持有的引用，使 lease 的 Drop 不再触发销毁，随后释放两个
+        // 引用，让 `old` 成为唯一持有者，即可执行销毁回调并等待其完成。
+        let lease_ref = resource.resource.take().expect("lease not released");
+        drop(resource);
+        drop(lease_ref);
+
+        let _build_guard = self.inner.build_lock.lock().await;
+        if let Ok(old_value) = Arc::try_unwrap(old) {
+            (self.inner.destructor)(old_value).await;
+        } else {
+            debug!("resource manager: replace 时旧实例仍有其他引用，跳过显式销毁");
+        }
+
+        let runtime = Handle::try_current()?;
+        let new_resource = Arc::new((self.inner.builder)().await?);
+        let mut state = lock_state(&self.inner.state);
+        state.resource = Some(Arc::clone(&new_resource));
+        state.generation = state.generation.wrapping_add(1);
+        Ok(ManagedResource {
+            resource: Some(new_resource),
+            manager: Arc::downgrade(&self.inner),
+            runtime,
+        })
+    }
+
     fn acquire_cached(&self, runtime: &Handle) -> Option<ManagedResource<T>> {
         let mut state = lock_state(&self.inner.state);
         let resource = Arc::clone(state.resource.as_ref()?);
@@ -229,10 +289,11 @@ impl<T: Send + Sync + 'static> Drop for ManagedResource<T> {
         let Some(manager) = self.manager.upgrade() else {
             return;
         };
-        let resource = self
-            .resource
-            .as_ref()
-            .expect("managed resource already released");
+        // 引用已被显式取出（如 [`ResourceManager::replace`] 接管销毁）时，
+        // 不再触碰管理器；此时对 `Deref` 的使用仍是 bug，但 drop 本身应安全。
+        let Some(resource) = self.resource.as_ref() else {
+            return;
+        };
 
         let mut state = lock_state(&manager.state);
         let is_cached = state
@@ -475,6 +536,30 @@ mod tests {
         drop(old_second_lease);
         tokio::task::yield_now().await;
 
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+        assert!(manager.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn replace_destroys_old_before_building_new() {
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        let manager =
+            ResourceManager::new_with_destructor(Duration::from_secs(10), || async { Ok(42) }, {
+                let destroyed = Arc::clone(&destroyed);
+                move |resource| {
+                    let destroyed = Arc::clone(&destroyed);
+                    async move {
+                        assert_eq!(resource, 42);
+                        destroyed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+
+        let old = manager.get().await.unwrap();
+        let new_lease = manager.replace(old).await.unwrap();
+
+        assert_eq!(*new_lease, 42);
+        // 销毁回调在 replace 返回前已完成，而不是异步触发后无人等待。
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
         assert!(manager.is_initialized());
     }
