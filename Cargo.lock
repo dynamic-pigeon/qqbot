@@ -4261,7 +4261,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wordcloud"
 version = "0.1.0"
-source = "git+https://github.com/dynamic-pigeon/wordcloud-rs#be633730bd2769556d65d92769c4246c2de6230b"
+source = "git+https://github.com/dynamic-pigeon/wordcloud-rs#efbc4857e23e132160fb82abfaa975b4a44a15a8"
 dependencies = [
  "ab_glyph",
  "image",
