@@ -27,6 +27,8 @@ static RANK_COOLDOWN: LazyLock<Mutex<HashMap<i64, Instant>>> =
 fn check_rank_cooldown(group_id: i64) -> Option<u64> {
     let mut map = RANK_COOLDOWN.lock().unwrap();
     let now = Instant::now();
+    // 顺带清理已过期的键，避免 map 随见过的群数无限增长。
+    map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(RANK_COOLDOWN_SECS));
     if let Some(&last) = map.get(&group_id) {
         let elapsed = now.duration_since(last);
         if elapsed < Duration::from_secs(RANK_COOLDOWN_SECS) {
