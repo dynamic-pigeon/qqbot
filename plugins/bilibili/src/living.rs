@@ -94,10 +94,15 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
     // 只在比对状态时短暂持锁，网络请求和消息发送都在锁外进行
     let (start, end) = {
         let mut map = map.lock().await;
+        // 响应缺失的 uid（已注销/封禁）不会再出现，直接清理，
+        // 避免残留旧状态、等主播恢复后误报一次状态变更
+        let present: HashSet<u64> = status.keys().copied().collect();
+        map.retain(|uid, _| present.contains(uid));
         let mut start = Vec::new();
         let mut end = Vec::new();
         for (uid, info) in status {
-            let status = info.live_status != 0;
+            // 只有 live_status == 1 才算开播；2 是轮播（循环播放录像），不算直播
+            let status = info.live_status == 1;
             match map.entry(uid) {
                 Entry::Vacant(e) => {
                     e.insert(status);
@@ -139,11 +144,16 @@ async fn notify(
     info: &LiveRoom,
     kind: NotifyKind,
 ) {
-    let img = match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
-        Ok(img) => img,
-        Err(_) => {
-            tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
-            Default::default()
+    // 无封面时跳过图片，避免对空 URL 做无意义的下载重试
+    let img = if info.cover_from_user.is_empty() {
+        Default::default()
+    } else {
+        match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
+            Ok(img) => img,
+            Err(_) => {
+                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
+                Default::default()
+            }
         }
     };
     let base64_img = STANDARD.encode(&img);
@@ -167,7 +177,10 @@ async fn notify(
         .filter(|s| s.uid == uid)
         .flat_map(|s| &s.groups)
     {
-        bot.send_group_msg(*group, msg.clone());
+        // 用 send_group_msg_return 等待 onebot 确认送达，失败记日志，避免通知静默丢失
+        if let Err(e) = bot.send_group_msg_return(*group, msg.clone()).await {
+            tracing::warn!("直播通知发送失败 group={group}: {e}");
+        }
     }
 }
 
