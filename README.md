@@ -1,6 +1,6 @@
 # QQ Bot
 
-基于 Kovi 和 OneBot 的 Rust QQ 机器人，包含 Markdown 截图、发言排行与词云、B 站订阅和游戏王查卡插件。
+基于 Kovi 和 OneBot 的 Rust QQ 机器人，包含 Markdown 截图、发言排行与词云、B 站订阅、游戏王查卡和英文 Wordle 猜词插件。
 
 ## 运行
 
@@ -23,6 +23,7 @@ B 站动态订阅默认以游客身份运行，不需要登录或配置 Cookie�
 - 单条入库文本最多 4 KiB，最多保留 8 天；图片 OCR 每条消息最多处理 3 张。
 - `/wordcloud disable` 会停止继续采集。已有数据将在保留期到期后自动清理。
 - 中文词云需在 `data/msg_rank/font.otf` 放置覆盖中文字符的字体；未提供时使用 `wordcloud-rs` 内嵌的英文字体。
+- Wordle 词库（官方答案池与可猜池）首次使用时自动下载并缓存到 `data/wordle/`，也可手动放置 `answers.txt` / `allowed.txt` 跳过下载。
 - Markdown、OCR、截图和外部图片下载均有输入、并发、超时和响应体大小限制。
 - 公网部署前应在 `kovi.plugin.toml` 中启用插件访问控制并配置允许的好友或群组。
 

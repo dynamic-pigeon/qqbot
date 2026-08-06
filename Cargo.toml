@@ -23,6 +23,7 @@ kovi-onebot.workspace = true
 kovi-plugin-cmd = { version = "0.4.0", features = ["onebot"] }
 markdown = { version = "0.1.0", path = "plugins/markdown" }
 msg_rank = { version = "0.1.0", path = "plugins/msg_rank" }
+wordle = { version = "0.1.0", path = "plugins/wordle", features = ["qq"] }
 yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
@@ -39,6 +40,7 @@ members = [
     "plugins/utils",
     "plugins/msg_rank",
     "plugins/bilibili",
+    "plugins/wordle",
 ]
 
 [workspace.dependencies]
