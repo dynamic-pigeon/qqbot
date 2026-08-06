@@ -98,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         help_msg,
         markdown,
         yu_gi_oh,
-        bilibili
+        bilibili,
+        wordle
     );
     bot.mount_plugin_set(plugin_set);
     bot.set_plugin_startup_use_file_ref();
