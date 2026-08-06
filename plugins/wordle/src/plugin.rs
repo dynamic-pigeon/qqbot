@@ -58,11 +58,11 @@ pub async fn run() {
 fn wordle_command() -> Command {
     Command::new("/wordle")
         .description("群内英文 Wordle 猜词游戏（公开局，全群共猜）")
-        .usage("/wordle start | guess <单词> | status")
+        .usage("/wordle start [hard] | guess <单词> | status")
         .subcommand(
             Command::new("start")
-                .description("开始一局新的猜词")
-                .usage("/wordle start")
+                .description("开始一局新的猜词（加 hard 为严格模式）")
+                .usage("/wordle start [hard]")
                 .handler(handle_start),
         )
         .subcommand(
@@ -80,7 +80,8 @@ fn wordle_command() -> Command {
 }
 
 async fn handle_start(ctx: CommandContext) -> CommandResult {
-    ctx.ensure_no_extra_args(0)?;
+    let hard = ctx.arg(0).is_some_and(|arg| arg == "hard");
+    ctx.ensure_no_extra_args(1)?;
     let words = word_list().await.map_err(CommandError::internal)?;
     let key = session_key(&ctx);
 
@@ -89,7 +90,12 @@ async fn handle_start(ctx: CommandContext) -> CommandResult {
     if sessions.get(&key).is_some_and(|s| !s.game.is_over()) {
         return Err(CommandError::user("本群已有一局进行中，先把它猜完吧"));
     }
-    let game = Game::new(pick_answer(&words.answers, rand::random()).to_owned());
+    let game = if hard {
+        // 严格模式：答案池作为候选，答案随猜测动态变化。
+        Game::new_adversarial(words.answers.clone())
+    } else {
+        Game::new(pick_answer(&words.answers, rand::random()).to_owned())
+    };
     // 渲染是毫秒级的纯 CPU 操作，持锁完成即可，无并发窗口。
     let png = render_board_png(&game);
     sessions.insert(
@@ -101,7 +107,12 @@ async fn handle_start(ctx: CommandContext) -> CommandResult {
     );
     drop(sessions);
 
-    reply_with_image(&ctx, &png, "🔤 开局！/wordle guess <单词> 开始猜");
+    let note = if hard {
+        "🔤 开局（严格模式）！答案不固定，随你的猜测动态变化"
+    } else {
+        "🔤 开局！/wordle guess <单词> 开始猜"
+    };
+    reply_with_image(&ctx, &png, note);
     Ok(())
 }
 
@@ -154,20 +165,7 @@ fn submit_guess(
     }
     session.last_active = Instant::now();
     let png = render_board_png(&session.game);
-    let note = if session.game.is_won() {
-        Some(format!(
-            "🎉 恭喜猜中！答案是 {}，共用 {} 次",
-            session.game.answer().to_ascii_uppercase(),
-            session.game.guesses_count()
-        ))
-    } else if session.game.is_over() {
-        Some(format!(
-            "😞 次数用尽，答案是 {}",
-            session.game.answer().to_ascii_uppercase()
-        ))
-    } else {
-        None
-    };
+    let note = session.game.result_note();
     Ok((png, note))
 }
 
@@ -303,6 +301,7 @@ mod tests {
 
         for (input, path) in [
             ("/wordle start", vec!["/wordle", "start"]),
+            ("/wordle start hard", vec!["/wordle", "start"]),
             ("/wordle guess slate", vec!["/wordle", "guess"]),
             ("/wordle status", vec!["/wordle", "status"]),
         ] {
@@ -312,6 +311,9 @@ mod tests {
             assert_eq!(command.path(), path);
             if input.contains("slate") {
                 assert_eq!(command.args(), ["slate"]);
+            }
+            if input.contains("hard") {
+                assert_eq!(command.args(), ["hard"]);
             }
         }
 
