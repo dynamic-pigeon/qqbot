@@ -160,4 +160,52 @@ mod tests {
             Duration::from_secs(1)
         );
     }
+
+    #[tokio::test]
+    async fn retry_async_with_backoff_retries_until_success() {
+        // 前两次失败、第三次成功：总调用 3 次并返回成功值
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = retry_async_with_backoff(
+            {
+                let attempts = std::sync::Arc::clone(&attempts);
+                move || {
+                    let attempts = std::sync::Arc::clone(&attempts);
+                    async move {
+                        let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if n < 3 { Err("boom") } else { Ok(42) }
+                    }
+                }
+            },
+            2,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_async_with_backoff_gives_up_after_retries() {
+        // 持续失败：retries=2 时总调用 3 次（1 次尝试 + 2 次重试）后返回错误
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let result = retry_async_with_backoff(
+            {
+                let attempts = std::sync::Arc::clone(&attempts);
+                move || {
+                    let attempts = std::sync::Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err::<i32, &str>("boom")
+                    }
+                }
+            },
+            2,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        )
+        .await;
+        assert_eq!(result, Err("boom"));
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 }

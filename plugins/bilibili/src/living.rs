@@ -11,7 +11,7 @@ use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json, tokio::sync::Mutex};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use serde::Deserialize;
-use utils::retry::retry_async;
+use utils::retry::{retry_async, retry_async_with_backoff};
 
 use crate::{CLIENT, config};
 
@@ -177,8 +177,17 @@ async fn notify(
         .filter(|s| s.uid == uid)
         .flat_map(|s| &s.groups)
     {
-        // 用 send_group_msg_return 等待 onebot 确认送达，失败记日志，避免通知静默丢失
-        if let Err(e) = bot.send_group_msg_return(*group, msg.clone()).await {
+        // 用 send_group_msg_return 等待 onebot 确认送达；瞬时失败（onebot 重连、
+        // 网络抖动）用指数退避重试 2 次（1s → 2s），全部失败才放弃，
+        // 避免开播/结束通知因一次抖动永久丢失。
+        if let Err(e) = retry_async_with_backoff(
+            async || bot.send_group_msg_return(*group, msg.clone()).await,
+            2,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
             tracing::warn!("直播通知发送失败 group={group}: {e}");
         }
     }
