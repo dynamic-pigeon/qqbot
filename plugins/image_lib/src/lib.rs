@@ -10,7 +10,8 @@ mod name;
 mod store;
 
 use commands::{
-    DRAW_MAX_PER_WINDOW, DRAW_WINDOW, add_command, delete_command, draw_command, list_command,
+    DRAW_MAX_PER_WINDOW, DRAW_WINDOW, add_command, alias_command, delete_command, draw_command,
+    list_command, unalias_command,
 };
 use store::Store;
 
@@ -23,6 +24,8 @@ async fn main() {
         .register(add_command(Arc::clone(&store)))
         .register(draw_command(Arc::clone(&store), limiter))
         .register(delete_command(Arc::clone(&store)))
+        .register(alias_command(Arc::clone(&store)))
+        .register(unalias_command(Arc::clone(&store)))
         .register(list_command(store))
         .install()
         .expect("注册图库命令失败");
@@ -57,6 +60,8 @@ mod tests {
                 Arc::new(RateLimiter::new(DRAW_WINDOW, DRAW_MAX_PER_WINDOW)),
             ),
             delete_command(Arc::clone(&store)),
+            alias_command(Arc::clone(&store)),
+            unalias_command(Arc::clone(&store)),
             list_command(store),
         ])
         .unwrap();
@@ -81,6 +86,11 @@ mod tests {
             panic!("expected 删除 猫");
         };
         assert_eq!(wipe.args(), ["猫"]);
+
+        let ResolveOutcome::Matched(alias) = tree.resolve("别名 喵 猫") else {
+            panic!("expected 别名");
+        };
+        assert_eq!(alias.args(), ["喵", "猫"]);
     }
 
     #[test]

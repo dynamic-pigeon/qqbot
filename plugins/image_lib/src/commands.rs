@@ -42,12 +42,34 @@ pub fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Comman
 
 pub fn delete_command(store: Arc<Store>) -> Command {
     Command::new("删除")
-        .description("回复一张图删除该图；管理员可清空整个库")
-        .usage("删除\n删除 <库名>")
+        .description("回复一张图删除该图；管理员删除库名或别名则清空整个库")
+        .usage("删除\n删除 <库名或别名>")
         .scope(MessageScope::Group)
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_delete(ctx, &store).await }
+        })
+}
+
+pub fn alias_command(store: Arc<Store>) -> Command {
+    Command::new("别名")
+        .description("给已有图库起别名，来只/添加/删除都走同一库")
+        .usage("别名 <别名> <库名>")
+        .scope(MessageScope::Group)
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            async move { handle_alias(ctx, &store).await }
+        })
+}
+
+pub fn unalias_command(store: Arc<Store>) -> Command {
+    Command::new("取消别名")
+        .description("去掉一个图库别名，不删除图片")
+        .usage("取消别名 <别名>")
+        .scope(MessageScope::Group)
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            async move { handle_unalias(ctx, &store).await }
         })
 }
 
@@ -79,12 +101,34 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
             ctx.reply(format!("已向「{name}」添加 {} 张", result.added));
             Ok(())
         }
-        Err(StoreError::QuotaExceeded { used, .. }) => Err(CommandError::user(format!(
-            "本群图库容量不足（已用 {} / {}）",
-            format_bytes(used),
-            format_bytes(MAX_GROUP_BYTES)
-        ))),
-        Err(error) => Err(CommandError::internal(error)),
+        Err(error) => Err(map_store_user_error(error)),
+    }
+}
+
+async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
+    let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
+    let target = parse_library_name(ctx.arg(1).unwrap_or(""))?;
+    ctx.ensure_no_extra_args(2)?;
+    let group_id = group_id(&ctx)?;
+    match store.set_alias(group_id, alias, target).await {
+        Ok(canonical) => {
+            ctx.reply(format!("「{alias}」现在是「{canonical}」的别名"));
+            Ok(())
+        }
+        Err(error) => Err(map_store_user_error(error)),
+    }
+}
+
+async fn handle_unalias(ctx: CommandContext, store: &Store) -> CommandResult {
+    let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
+    ctx.ensure_no_extra_args(1)?;
+    let group_id = group_id(&ctx)?;
+    match store.remove_alias(group_id, alias).await {
+        Ok(()) => {
+            ctx.reply(format!("已取消别名「{alias}」"));
+            Ok(())
+        }
+        Err(error) => Err(map_store_user_error(error)),
     }
 }
 
@@ -133,14 +177,14 @@ async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
             }
             let name = parse_library_name(name)?;
             match store.wipe_library(group_id, name).await {
-                Ok(()) => {
-                    ctx.reply(format!("已清空「{name}」"));
+                Ok(canonical) => {
+                    ctx.reply(format!("已清空「{canonical}」"));
                     Ok(())
                 }
                 Err(StoreError::LibraryMissing) => {
                     Err(CommandError::user(format!("「{name}」不存在")))
                 }
-                Err(error) => Err(CommandError::internal(error)),
+                Err(error) => Err(map_store_user_error(error)),
             }
         }
     }
@@ -186,8 +230,13 @@ async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
         format_bytes(MAX_GROUP_BYTES)
     )];
     for library in stats.libraries {
+        let alias_note = if library.aliases.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", library.aliases.join("、"))
+        };
         lines.push(format!(
-            "• {}: {} 张，{}",
+            "• {}{alias_note}: {} 张，{}",
             library.name,
             library.count,
             format_bytes(library.bytes)
@@ -219,6 +268,23 @@ async fn load_replied_images(
         loaded.push(load_image_bytes(segment).await?);
     }
     Ok(loaded)
+}
+
+fn map_store_user_error(error: StoreError) -> CommandError {
+    match error {
+        StoreError::QuotaExceeded { used, .. } => CommandError::user(format!(
+            "本群图库容量不足（已用 {} / {}）",
+            format_bytes(used),
+            format_bytes(MAX_GROUP_BYTES)
+        )),
+        StoreError::LibraryMissing => CommandError::user("库不存在"),
+        StoreError::ImageMissing => CommandError::user("没有这张图"),
+        StoreError::AliasToSelf
+        | StoreError::NameIsLibrary(_)
+        | StoreError::TargetMissing(_)
+        | StoreError::AliasMissing(_) => CommandError::user(error.to_string()),
+        other => CommandError::internal(other),
+    }
 }
 
 fn rate_limited(hit: utils::RateLimitHit) -> CommandError {
