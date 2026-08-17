@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             msg_rank=debug,\
             yu_gi_oh=debug,\
             bilibili=debug,\
+            image_lib=debug,\
             utils=debug",
         )
     });
@@ -99,7 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         markdown,
         yu_gi_oh,
         bilibili,
-        wordle
+        wordle,
+        image_lib
     );
     bot.mount_plugin_set(plugin_set);
     bot.set_plugin_startup_use_file_ref();

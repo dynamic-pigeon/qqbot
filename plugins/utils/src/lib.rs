@@ -1,6 +1,7 @@
 mod bounded_pool;
 pub mod command;
 mod markdown;
+mod rate_limit;
 mod rcu;
 mod resource_manager;
 mod screen_shot;
@@ -11,6 +12,7 @@ pub mod safe_url;
 pub use bounded_pool::{BoundedPool, BoundedResourcePool, ResourceGuard};
 pub use markdown::md_to_html;
 pub use markdown::md_to_img;
+pub use rate_limit::{RateLimitHit, RateLimiter};
 pub use rcu::{RcuCell, RcuReadGuard};
 pub use resource_manager::{ManagedResource, ResourceManager};
 pub use safe_url::{
