@@ -18,6 +18,7 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }
 help_msg = { version = "0.1.0", path = "plugins/help_msg" }
+image_lib = { version = "0.1.0", path = "plugins/image_lib" }
 kovi.workspace = true
 kovi-onebot.workspace = true
 kovi-plugin-cmd = { version = "0.4.0", features = ["onebot"] }
@@ -41,6 +42,7 @@ members = [
     "plugins/msg_rank",
     "plugins/bilibili",
     "plugins/wordle",
+    "plugins/image_lib",
 ]
 
 [workspace.dependencies]
