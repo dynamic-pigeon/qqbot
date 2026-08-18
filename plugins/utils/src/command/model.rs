@@ -200,6 +200,7 @@ pub struct Command {
     pub(crate) scope: Option<MessageScope>,
     pub(crate) children: Vec<Command>,
     pub(crate) handler: Option<CommandHandler>,
+    pub(crate) expose_as_root: bool,
 }
 
 impl Command {
@@ -213,6 +214,7 @@ impl Command {
             scope: None,
             children: Vec::new(),
             handler: None,
+            expose_as_root: false,
         }
     }
 
@@ -243,6 +245,13 @@ impl Command {
 
     pub fn subcommand(mut self, child: Command) -> Self {
         self.children.push(child);
+        self
+    }
+
+    /// 子命令仍挂在父节点下，同时允许不带父路径按根命令匹配。
+    /// 帮助目录只展示父命令，调用方式可以保持原来的短命令。
+    pub fn expose_as_root(mut self) -> Self {
+        self.expose_as_root = true;
         self
     }
 
