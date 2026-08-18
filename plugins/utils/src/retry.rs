@@ -121,44 +121,19 @@ mod tests {
     }
 
     #[test]
-    fn backoff_delay_clamps_attempt_and_saturates() {
-        // attempt 超过 31 后仍按 attempt=31 计算（不 panic、不溢出）
-        let base = Duration::from_millis(1);
+    fn backoff_delay_clamps_edges() {
         let max = Duration::from_secs(1);
-        let at_31 = backoff_delay(31, base, max);
-        let at_100 = backoff_delay(100, base, max);
-        assert_eq!(at_31, at_100);
-        assert_eq!(at_31, max);
-    }
-
-    #[test]
-    fn backoff_delay_zero_base() {
         assert_eq!(
-            backoff_delay(5, Duration::ZERO, Duration::from_secs(1)),
-            Duration::ZERO
+            backoff_delay(31, Duration::from_millis(1), max),
+            backoff_delay(100, Duration::from_millis(1), max)
         );
-    }
-
-    #[test]
-    fn backoff_delay_zero_max() {
-        // max 为 0 时结果恒为 0
+        assert_eq!(backoff_delay(5, Duration::ZERO, max), Duration::ZERO);
         assert_eq!(
             backoff_delay(5, Duration::from_secs(1), Duration::ZERO),
             Duration::ZERO
         );
-    }
-
-    #[test]
-    fn backoff_delay_base_greater_than_max() {
-        // base > max 时取 min，结果恒为 max
-        assert_eq!(
-            backoff_delay(0, Duration::from_secs(10), Duration::from_secs(1)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            backoff_delay(10, Duration::from_secs(10), Duration::from_secs(1)),
-            Duration::from_secs(1)
-        );
+        assert_eq!(backoff_delay(0, Duration::from_secs(10), max), max);
+        assert_eq!(backoff_delay(10, Duration::from_secs(10), max), max);
     }
 
     #[tokio::test]

@@ -357,11 +357,9 @@ fn generate_word_cloud_image(
     Ok(png.into_inner())
 }
 
-/// 对 jieba 全模式分词结果直接计数词频。
+/// 精确模式分词后计数词频。HMM 打开，避免未登录词被拆成单字。
 ///
-/// 2MB 输入会产生近百万 token，键直接借用输入文本（`Cow::Borrowed`），
-/// 只有含大写字母的词才分配小写副本；如果先物化成 `Vec<String>` 再统计，
-/// 实测进程 RSS 峰值会超过 600MB。
+/// 键直接借用输入文本（`Cow::Borrowed`），只有含大写字母的词才分配小写副本。
 fn count_frequencies<'a>(
     jieba: &jieba_rs::Jieba,
     text: &'a str,
@@ -369,11 +367,10 @@ fn count_frequencies<'a>(
 ) -> HashMap<Cow<'a, str>, u64> {
     let stop_words: HashSet<String> = stop_words.iter().map(|word| word.to_lowercase()).collect();
     let mut counts: HashMap<Cow<'a, str>, u64> = HashMap::new();
-    for token in jieba.cut_all(text) {
+    for token in jieba.cut(text, true) {
         let word = token.word.trim();
-        let word_length = word.chars().count();
         // 超长词（如整段链接）只跳过自身，不让单个词导致整次生成失败。
-        if !(MIN_WORD_LENGTH..=MAX_WORD_LENGTH).contains(&word_length) {
+        if !(MIN_WORD_LENGTH..=MAX_WORD_LENGTH).contains(&word.chars().count()) {
             continue;
         }
         let key: Cow<'a, str> = if word.bytes().any(|byte| byte.is_ascii_uppercase()) {
@@ -536,14 +533,9 @@ mod tests {
         }
         let resources = load_word_cloud_resources(font_path).unwrap();
         let text = "rust 词云 生成 测试 测试 代码 高亮 布局 字体 渲染 中文 文本";
-        let png = generate_word_cloud_image(
-            &resources,
-            font_path.parent().unwrap(),
-            text,
-            &[],
-            "white",
-        )
-        .unwrap();
+        let png =
+            generate_word_cloud_image(&resources, font_path.parent().unwrap(), text, &[], "white")
+                .unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
 
         let image = image::load_from_memory(&png).unwrap().to_rgba8();

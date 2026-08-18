@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use kovi::Message;
+use kovi::{Message, Segment};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
@@ -99,7 +99,24 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     let reply_id = extract_reply_id(&ctx.event().message)
         .ok_or_else(|| CommandError::user("请回复一张包含图片的消息后再添加"))?;
 
-    let images = load_replied_images(&ctx, reply_id, MAX_ADD_IMAGES, false).await?;
+    let segments = replied_image_segments(&ctx, reply_id, MAX_ADD_IMAGES, false).await?;
+    let mut images = Vec::with_capacity(segments.len());
+    for segment in &segments {
+        let bytes = match load_image_bytes(segment).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = store.discard_unindexed(group_id, &images).await;
+                return Err(error.into());
+            }
+        };
+        match store.write_blob(group_id, bytes).await {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                let _ = store.discard_unindexed(group_id, &images).await;
+                return Err(CommandError::internal(error));
+            }
+        }
+    }
     match store.add_images(group_id, name, images).await {
         Ok(result) if result.added == 0 => {
             ctx.reply(format!("都已在「{name}」里"));
@@ -158,12 +175,13 @@ async fn handle_draw(
         Err(error) => return Err(CommandError::internal(error)),
     };
 
-    // 空库已经返回。先 peek 限流再读盘，避免打满后还读 5 MiB。
+    // 空库已经返回。先 peek 限流再读盘，避免打满后还读整张图。
     if let Err(hit) = limiter.check(&group_id) {
         return Err(rate_limited(hit));
     }
     let bytes = store
         .read_blob(group_id, &hash)
+        .await
         .map_err(|_| CommandError::user("读取图片失败，请再试一次"))?;
     if let Err(hit) = limiter.try_acquire(group_id) {
         return Err(rate_limited(hit));
@@ -254,12 +272,12 @@ async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
     Ok(())
 }
 
-async fn load_replied_images(
+async fn replied_image_segments(
     ctx: &CommandContext,
     reply_id: i32,
     max: usize,
     single: bool,
-) -> Result<Vec<Vec<u8>>, CommandError> {
+) -> Result<Vec<Segment>, CommandError> {
     let response = ctx
         .bot()
         .get_msg(reply_id)
@@ -271,8 +289,18 @@ async fn load_replied_images(
     let segments =
         parse_message_segments(&response.data).map_err(|_| FetchError::MessageUnavailable)?;
     let images = select_images(&segments, max, single)?;
-    let mut loaded = Vec::with_capacity(images.len());
-    for segment in images {
+    Ok(images.into_iter().cloned().collect())
+}
+
+async fn load_replied_images(
+    ctx: &CommandContext,
+    reply_id: i32,
+    max: usize,
+    single: bool,
+) -> Result<Vec<Vec<u8>>, CommandError> {
+    let segments = replied_image_segments(ctx, reply_id, max, single).await?;
+    let mut loaded = Vec::with_capacity(segments.len());
+    for segment in &segments {
         loaded.push(load_image_bytes(segment).await?);
     }
     Ok(loaded)
