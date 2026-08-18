@@ -303,6 +303,94 @@ fn catalog_replaces_an_owners_root_and_resolves_alias_paths() {
 }
 
 #[test]
+fn exposed_subcommands_resolve_without_parent_prefix() {
+    let tree = CommandTree::new(vec![
+        Command::new("图库")
+            .handler(|_| async { Ok(()) })
+            .subcommand(endpoint("添加").expose_as_root())
+            .subcommand(endpoint("来只")),
+    ])
+    .unwrap();
+
+    let ResolveOutcome::Matched(add) = tree.resolve("添加 猫") else {
+        panic!("expected exposed subcommand to resolve");
+    };
+    assert_eq!(path(&add), ["图库", "添加"]);
+    assert_eq!(add.args(), ["猫"]);
+
+    let ResolveOutcome::Matched(nested) = tree.resolve("图库 添加 猫") else {
+        panic!("expected nested path to resolve");
+    };
+    assert_eq!(path(&nested), ["图库", "添加"]);
+
+    assert!(matches!(tree.resolve("来只 猫"), ResolveOutcome::Ignored));
+
+    let ResolveOutcome::Matched(parent) = tree.resolve("图库") else {
+        panic!("expected parent handler to resolve");
+    };
+    assert_eq!(path(&parent), ["图库"]);
+}
+
+#[test]
+fn rejects_exposed_root_name_conflicts_with_real_roots() {
+    let conflict = CommandTree::new(vec![
+        endpoint("添加"),
+        Command::new("图库")
+            .handler(|_| async { Ok(()) })
+            .subcommand(endpoint("添加").expose_as_root()),
+    ]);
+    assert!(matches!(
+        conflict,
+        Err(CommandRegistrationError::DuplicateName { .. })
+    ));
+}
+
+#[test]
+fn catalog_groups_exposed_subcommands_under_parent_root() {
+    let tree = CommandTree::new(vec![
+        Command::new("图库")
+            .description("管理本群图库")
+            .handler(|_| async { Ok(()) })
+            .subcommand(
+                endpoint("添加")
+                    .description("写入图库")
+                    .usage("添加 <库名>")
+                    .expose_as_root(),
+            ),
+    ])
+    .unwrap();
+    let mut catalog = CatalogStore::default();
+    catalog.register("image_lib", &tree).unwrap();
+
+    assert_eq!(catalog.roots().len(), 1);
+    assert!(catalog.render_help(&[]).contains("`图库`: 管理本群图库"));
+    assert!(!catalog.render_help(&[]).contains("`添加`"));
+    assert!(catalog.render_help(&["图库"]).contains("`添加`: 写入图库"));
+
+    let help = catalog.find(&["添加"]).unwrap();
+    assert_eq!(help.command.path, ["图库", "添加"]);
+    assert!(catalog.render_help(&["添加"]).contains("用法: 添加 <库名>"));
+}
+
+#[test]
+fn catalog_rejects_exposed_root_conflicts_between_plugins() {
+    let grouped = CommandTree::new(vec![
+        Command::new("图库")
+            .handler(|_| async { Ok(()) })
+            .subcommand(endpoint("添加").expose_as_root()),
+    ])
+    .unwrap();
+    let other = CommandTree::new(vec![endpoint("添加")]).unwrap();
+    let mut catalog = CatalogStore::default();
+    catalog.register("image_lib", &grouped).unwrap();
+
+    assert!(matches!(
+        catalog.register("other", &other),
+        Err(CommandRegistrationError::RootConflict { ref root, .. }) if root == "添加"
+    ));
+}
+
+#[test]
 fn catalog_rejects_root_alias_conflicts_between_plugins() {
     let first = CommandTree::new(vec![endpoint("/first").alias("/shared")]).unwrap();
     let second = CommandTree::new(vec![endpoint("/shared")]).unwrap();

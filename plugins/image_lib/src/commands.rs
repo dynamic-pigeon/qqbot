@@ -17,22 +17,41 @@ use crate::store::{MAX_GROUP_BYTES, Store, StoreError, sha256_hex};
 pub const DRAW_WINDOW: Duration = Duration::from_secs(60);
 pub const DRAW_MAX_PER_WINDOW: usize = 5;
 
-pub fn add_command(store: Arc<Store>) -> Command {
+pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
+    Command::new("图库")
+        .description("管理本群图库")
+        .usage("图库")
+        .scope(MessageScope::Group)
+        .handler({
+            let store = Arc::clone(&store);
+            move |ctx| {
+                let store = Arc::clone(&store);
+                async move { handle_list(ctx, &store).await }
+            }
+        })
+        .subcommand(add_command(Arc::clone(&store)))
+        .subcommand(draw_command(Arc::clone(&store), limiter))
+        .subcommand(delete_command(Arc::clone(&store)))
+        .subcommand(alias_command(Arc::clone(&store)))
+        .subcommand(unalias_command(store))
+}
+
+fn add_command(store: Arc<Store>) -> Command {
     Command::new("添加")
         .description("回复一张或多张图，写入本群指定图库")
         .usage("添加 <库名>")
-        .scope(MessageScope::Group)
+        .expose_as_root()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_add(ctx, &store).await }
         })
 }
 
-pub fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
+fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     Command::new("来只")
         .description("从本群指定图库随机发一张图")
         .usage("来只 <库名>")
-        .scope(MessageScope::Group)
+        .expose_as_root()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             let limiter = Arc::clone(&limiter);
@@ -40,47 +59,36 @@ pub fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Comman
         })
 }
 
-pub fn delete_command(store: Arc<Store>) -> Command {
+fn delete_command(store: Arc<Store>) -> Command {
     Command::new("删除")
         .description("回复一张图删除该图；管理员删除库名或别名则清空整个库")
         .usage("删除\n删除 <库名或别名>")
-        .scope(MessageScope::Group)
+        .expose_as_root()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_delete(ctx, &store).await }
         })
 }
 
-pub fn alias_command(store: Arc<Store>) -> Command {
+fn alias_command(store: Arc<Store>) -> Command {
     Command::new("别名")
         .description("给已有图库起别名，来只/添加/删除都走同一库")
         .usage("别名 <别名> <库名>")
-        .scope(MessageScope::Group)
+        .expose_as_root()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_alias(ctx, &store).await }
         })
 }
 
-pub fn unalias_command(store: Arc<Store>) -> Command {
+fn unalias_command(store: Arc<Store>) -> Command {
     Command::new("取消别名")
         .description("去掉一个图库别名，不删除图片")
         .usage("取消别名 <别名>")
-        .scope(MessageScope::Group)
+        .expose_as_root()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_unalias(ctx, &store).await }
-        })
-}
-
-pub fn list_command(store: Arc<Store>) -> Command {
-    Command::new("图库")
-        .description("列出本群图库、张数和占用")
-        .usage("图库")
-        .scope(MessageScope::Group)
-        .handler(move |ctx| {
-            let store = Arc::clone(&store);
-            async move { handle_list(ctx, &store).await }
         })
 }
 

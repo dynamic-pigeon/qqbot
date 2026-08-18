@@ -34,6 +34,7 @@ struct CatalogRoot {
 struct CatalogEntry {
     metadata: CommandMetadata,
     matchers: Vec<Vec<String>>,
+    expose_as_root: bool,
 }
 
 impl CatalogStore {
@@ -42,21 +43,16 @@ impl CatalogStore {
         owner: &str,
         tree: &CommandTree,
     ) -> Result<(), CommandRegistrationError> {
-        for root in tree.roots() {
-            for name in std::iter::once(&root.name).chain(&root.aliases) {
-                if let Some(existing) = self.roots.values().find(|existing| {
-                    existing.owner != owner
-                        && existing.entries.first().is_some_and(|entry| {
-                            entry.matchers[0]
-                                .iter()
-                                .any(|registered| registered == name)
-                        })
-                }) {
-                    return Err(CommandRegistrationError::RootConflict {
-                        root: name.clone(),
-                        owner: existing.owner.clone(),
-                    });
-                }
+        for name in tree_root_facing_names(tree) {
+            if let Some(existing) = self
+                .roots
+                .values()
+                .find(|existing| existing.owner != owner && occupies_root_name(existing, name))
+            {
+                return Err(CommandRegistrationError::RootConflict {
+                    root: name.to_owned(),
+                    owner: existing.owner.clone(),
+                });
             }
         }
 
@@ -83,6 +79,11 @@ impl CatalogStore {
     }
 
     pub fn find(&self, path: &[&str]) -> Option<CommandHelp> {
+        self.find_from_root(path)
+            .or_else(|| self.find_exposed_root(path))
+    }
+
+    fn find_from_root(&self, path: &[&str]) -> Option<CommandHelp> {
         let (first, _) = path.split_first()?;
         let root = self.roots.values().find(|root| {
             root.entries.first().is_some_and(|entry| {
@@ -108,21 +109,36 @@ impl CatalogStore {
                         })
                     })
         })?;
-        let canonical_path = &entry.metadata.path;
-        let children = root
-            .entries
-            .iter()
-            .filter(|candidate| {
-                candidate.metadata.path.len() == canonical_path.len() + 1
-                    && candidate.metadata.path.starts_with(canonical_path)
-            })
-            .map(|candidate| candidate.metadata.clone())
-            .collect();
+        Some(help_from_entry(root, entry))
+    }
 
-        Some(CommandHelp {
-            command: entry.metadata.clone(),
-            children,
-        })
+    fn find_exposed_root(&self, path: &[&str]) -> Option<CommandHelp> {
+        let (first, rest) = path.split_first()?;
+        let (root, entry) = self.roots.values().find_map(|root| {
+            root.entries
+                .iter()
+                .find(|entry| {
+                    entry.expose_as_root
+                        && entry.matchers.last().is_some_and(|names| {
+                            names.iter().any(|name| root_name_matches(name, first))
+                        })
+                })
+                .map(|entry| (root, entry))
+        })?;
+        if rest.is_empty() {
+            return Some(help_from_entry(root, entry));
+        }
+
+        let canonical_path = &entry.metadata.path;
+        let entry = root.entries.iter().find(|candidate| {
+            candidate.metadata.path.len() == canonical_path.len() + rest.len()
+                && candidate.metadata.path.starts_with(canonical_path)
+                && candidate.metadata.path[canonical_path.len()..]
+                    .iter()
+                    .zip(rest)
+                    .all(|(name, part)| name == part)
+        })?;
+        Some(help_from_entry(root, entry))
     }
 
     pub fn render_help(&self, path: &[&str]) -> String {
@@ -208,10 +224,57 @@ fn collect_entries(
             permission: command.permission.unwrap_or_default(),
         },
         matchers: matchers.clone(),
+        expose_as_root: command.expose_as_root,
     });
     for child in &command.children {
         collect_entries(owner, child, &path, &matchers, entries);
     }
+}
+
+fn help_from_entry(root: &CatalogRoot, entry: &CatalogEntry) -> CommandHelp {
+    let canonical_path = &entry.metadata.path;
+    let children = root
+        .entries
+        .iter()
+        .filter(|candidate| {
+            candidate.metadata.path.len() == canonical_path.len() + 1
+                && candidate.metadata.path.starts_with(canonical_path)
+        })
+        .map(|candidate| candidate.metadata.clone())
+        .collect();
+
+    CommandHelp {
+        command: entry.metadata.clone(),
+        children,
+    }
+}
+
+fn tree_root_facing_names(tree: &CommandTree) -> Vec<&str> {
+    let mut names = Vec::new();
+    fn walk<'a>(command: &'a Command, is_root: bool, names: &mut Vec<&'a str>) {
+        if is_root || command.expose_as_root {
+            names.push(command.name.as_str());
+            names.extend(command.aliases.iter().map(String::as_str));
+        }
+        for child in &command.children {
+            walk(child, false, names);
+        }
+    }
+    for root in tree.roots() {
+        walk(root, true, &mut names);
+    }
+    names
+}
+
+fn occupies_root_name(root: &CatalogRoot, name: &str) -> bool {
+    root.entries.iter().any(|entry| {
+        let faces_root = entry.metadata.path.len() == 1 || entry.expose_as_root;
+        faces_root
+            && entry
+                .matchers
+                .last()
+                .is_some_and(|names| names.iter().any(|registered| registered == name))
+    })
 }
 
 fn root_name_matches(registered: &str, requested: &str) -> bool {

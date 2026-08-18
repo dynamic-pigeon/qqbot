@@ -162,6 +162,7 @@ pub struct CommandTree {
 impl CommandTree {
     pub fn new(mut roots: Vec<Command>) -> Result<Self, CommandRegistrationError> {
         validate_siblings(&roots, &[])?;
+        validate_exposed_root_names(&roots)?;
         for root in &mut roots {
             prepare_node(root, Permission::Everyone, MessageScope::Any, &[])?;
         }
@@ -175,11 +176,15 @@ impl CommandTree {
             return ResolveOutcome::Ignored;
         };
         let root_name = &input[root_span.clone()];
-        let Some(mut node) = self.roots.iter().find(|node| node.matches(root_name)) else {
-            return ResolveOutcome::Ignored;
-        };
+        let (mut node, mut path) =
+            if let Some(root) = self.roots.iter().find(|node| node.matches(root_name)) {
+                (root, vec![root.name.clone()])
+            } else if let Some(exposed) = find_exposed_root(&self.roots, root_name) {
+                exposed
+            } else {
+                return ResolveOutcome::Ignored;
+            };
 
-        let mut path = vec![node.name.clone()];
         let mut consumed = 1;
         while let Some(span) = spans.get(consumed) {
             let word = &input[span.clone()];
@@ -280,6 +285,63 @@ fn prepare_node(
     validate_siblings(&node.children, &path)?;
     for child in &mut node.children {
         prepare_node(child, permission, scope, &path)?;
+    }
+    Ok(())
+}
+
+fn find_exposed_root<'a>(roots: &'a [Command], name: &str) -> Option<(&'a Command, Vec<String>)> {
+    fn walk<'a>(node: &'a Command, name: &str, path: &mut Vec<String>) -> Option<&'a Command> {
+        for child in &node.children {
+            path.push(child.name.clone());
+            if child.expose_as_root && child.matches(name) {
+                return Some(child);
+            }
+            if let Some(found) = walk(child, name, path) {
+                return Some(found);
+            }
+            path.pop();
+        }
+        None
+    }
+
+    for root in roots {
+        let mut path = vec![root.name.clone()];
+        if let Some(found) = walk(root, name, &mut path) {
+            return Some((found, path));
+        }
+    }
+    None
+}
+
+fn validate_exposed_root_names(roots: &[Command]) -> Result<(), CommandRegistrationError> {
+    let mut claimed = HashMap::new();
+    for root in roots {
+        for name in std::iter::once(&root.name).chain(&root.aliases) {
+            claimed.insert(name.as_str(), root.name.as_str());
+        }
+    }
+    for root in roots {
+        claim_exposed_root_names(root, &mut claimed)?;
+    }
+    Ok(())
+}
+
+fn claim_exposed_root_names<'a>(
+    command: &'a Command,
+    claimed: &mut HashMap<&'a str, &'a str>,
+) -> Result<(), CommandRegistrationError> {
+    for child in &command.children {
+        if child.expose_as_root {
+            for name in std::iter::once(&child.name).chain(&child.aliases) {
+                if claimed.insert(name.as_str(), child.name.as_str()).is_some() {
+                    return Err(CommandRegistrationError::DuplicateName {
+                        parent_path: "<root>".to_owned(),
+                        name: name.clone(),
+                    });
+                }
+            }
+        }
+        claim_exposed_root_names(child, claimed)?;
     }
     Ok(())
 }
