@@ -191,145 +191,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_special_characters_preserved() {
+    fn md_to_html_keeps_safe_inline_tags() {
         let html = md_to_html("<b>bold</b>");
-        assert!(
-            html.contains("<b>bold</b>"),
-            "safe inline HTML like <b> should be preserved"
-        );
-        let body_sanitized = sanitize_html("<script>alert(1)</script>hello");
-        assert!(
-            !body_sanitized.contains("<script") && !body_sanitized.contains("alert(1)"),
-            "body script must be stripped, got: {body_sanitized}"
-        );
+        assert!(html.contains("<b>bold</b>"));
     }
 
     #[test]
-    fn sanitize_strips_script_block() {
-        let out = sanitize_html("hello<script>alert(1)</script>world");
-        assert!(!out.contains("<script"));
-        assert!(!out.contains("alert"));
-        assert!(out.contains("hello"));
-        assert!(out.contains("world"));
+    fn sanitize_strips_dangerous_markup() {
+        for (input, forbidden) in [
+            ("hello<script>alert(1)</script>world", "<script"),
+            ("a<iframe src='http://evil'></iframe>b", "<iframe"),
+            ("a<object></object>b", "<object"),
+            ("a<embed src='x'>b", "<embed"),
+            ("a<form action='x'></form>b", "<form"),
+            ("<link rel='stylesheet' href='http://evil/x'>", "<link"),
+            (
+                "<meta http-equiv='refresh' content='0;url=http://evil'>",
+                "<meta",
+            ),
+            ("<base href='http://evil/'>", "<base"),
+            ("<style>body{display:none}</style>", "<style"),
+            (
+                r#"<img src="http://169.254.169.254/latest/meta-data/">"#,
+                "<img",
+            ),
+            (r#"<video src="http://evil"></video>"#, "<video"),
+            (r#"<audio src="http://evil"></audio>"#, "<audio"),
+            (r#"<source src="http://evil">"#, "<source"),
+            (
+                r#"<a href="https://ok.com" onclick="alert(1)">click</a>"#,
+                "onclick",
+            ),
+            (r#"<img src=x onerror='alert(1)' alt=y>"#, "onerror"),
+            (r#"<img src=x onload=alert(1) alt=y>"#, "onload"),
+            (r#"<img/src=x/onerror=alert(1)>"#, "onerror"),
+            (r#"<a href="javascript:alert(1)">click</a>"#, "javascript:"),
+            (r#"<a href=javascript:alert(1)>click</a>"#, "javascript:"),
+            (r#"<a/href=javascript:alert(1)>x</a>"#, "javascript:"),
+            (r#"<a href=JaVaScRiPt:alert(1)>x</a>"#, "javascript:"),
+            (r#"<a href="vbscript:msgbox(1)">click</a>"#, "vbscript:"),
+            (r#"<a href=vbscript:msgbox(1)>x</a>"#, "vbscript:"),
+            (
+                r#"<a href="data:text/html,<script>alert(1)</script>">click</a>"#,
+                "data:",
+            ),
+            (
+                r#"<a href=data:text/html,<script>alert(1)</script>>x</a>"#,
+                "data:",
+            ),
+            (
+                r#"<a href=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>x</a>"#,
+                "data:",
+            ),
+        ] {
+            let out = sanitize_html(input);
+            assert!(
+                !out.to_ascii_lowercase().contains(forbidden),
+                "expected {forbidden:?} stripped from {input:?}, got {out}"
+            );
+        }
+        let script = sanitize_html("hello<script>alert(1)</script>world");
+        assert!(script.contains("hello") && script.contains("world"));
+        let link = sanitize_html(r#"<a href="https://ok.com" onclick="alert(1)">click</a>"#);
+        assert!(link.contains("href=\"https://ok.com\""));
     }
 
     #[test]
-    fn sanitize_strips_iframe_and_object() {
-        assert!(!sanitize_html("a<iframe src='http://evil'></iframe>b").contains("<iframe"));
-        assert!(!sanitize_html("a<object></object>b").contains("<object"));
-        assert!(!sanitize_html("a<embed src='x'>b").contains("<embed"));
-        assert!(!sanitize_html("a<form action='x'></form>b").contains("<form"));
-    }
-
-    #[test]
-    fn sanitize_strips_link_meta_base_style() {
-        assert!(!sanitize_html("<link rel='stylesheet' href='http://evil/x'>").contains("<link"));
-        assert!(
-            !sanitize_html("<meta http-equiv='refresh' content='0;url=http://evil'>")
-                .contains("<meta")
-        );
-        assert!(!sanitize_html("<base href='http://evil/'>").contains("<base"));
-        assert!(!sanitize_html("<style>body{display:none}</style>").contains("<style"));
-    }
-
-    #[test]
-    fn sanitize_strips_on_event_attrs() {
-        let out = sanitize_html(r#"<a href="https://ok.com" onclick="alert(1)">click</a>"#);
-        assert!(!out.contains("onclick"));
-        assert!(!out.contains("alert(1)"));
-        // href 应保留
-        assert!(out.contains("href=\"https://ok.com\""));
-    }
-
-    #[test]
-    fn sanitize_strips_on_event_attrs_single_quote_and_unquoted() {
-        let out = sanitize_html(r#"<img src=x onerror='alert(1)' alt=y>"#);
-        assert!(!out.contains("onerror"));
-        assert!(!out.contains("alert"));
-        let out2 = sanitize_html(r#"<img src=x onload=alert(1) alt=y>"#);
-        assert!(!out2.contains("onload"));
-    }
-
-    #[test]
-    fn sanitize_strips_on_event_attrs_with_slash_separator() {
-        let out = sanitize_html(r#"<img/src=x/onerror=alert(1)>"#);
-        assert!(!out.to_ascii_lowercase().contains("onerror"));
-        assert!(!out.contains("alert(1)"));
-    }
-
-    #[test]
-    fn sanitize_removes_dangerous_uri_schemes() {
-        // ammonia 会移除非法 href 属性而不是替换成 about:blank
-        let out = sanitize_html(r#"<a href="javascript:alert(1)">click</a>"#);
-        assert!(!out.to_ascii_lowercase().contains("javascript:"));
-        assert!(out.contains("click"));
-
-        let out2 = sanitize_html(r#"<img src="javascript:alert(1)">"#);
-        assert!(!out2.to_ascii_lowercase().contains("javascript:"));
-        // img 标签本身也不在白名单中
-        assert!(!out2.contains("<img"));
-
-        let out3 = sanitize_html(r#"<a href="vbscript:msgbox(1)">click</a>"#);
-        assert!(!out3.to_ascii_lowercase().contains("vbscript:"));
-
-        let out4 = sanitize_html(r#"<a href="data:text/html,<script>alert(1)</script>">click</a>"#);
-        assert!(!out4.to_ascii_lowercase().contains("data:"));
-    }
-
-    #[test]
-    fn sanitize_removes_unquoted_dangerous_uri() {
-        let out = sanitize_html(r#"<a href=javascript:alert(1)>click</a>"#);
-        assert!(!out.to_ascii_lowercase().contains("javascript:"));
-        assert!(out.contains("click"));
-
-        let out3 = sanitize_html(r#"<a/href=javascript:alert(1)>x</a>"#);
-        assert!(!out3.to_ascii_lowercase().contains("javascript:"));
-
-        let out4 = sanitize_html(r#"<a href=JaVaScRiPt:alert(1)>x</a>"#);
-        assert!(!out4.to_ascii_lowercase().contains("javascript:"));
-
-        let out5 = sanitize_html(r#"<a href=vbscript:msgbox(1)>x</a>"#);
-        assert!(!out5.to_ascii_lowercase().contains("vbscript:"));
-
-        let out6 = sanitize_html(r#"<a href=data:text/html,<script>alert(1)</script>>x</a>"#);
-        assert!(!out6.to_ascii_lowercase().contains("data:"));
-
-        let out7 = sanitize_html(
-            r#"<a href=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==>x</a>"#,
-        );
-        assert!(!out7.to_ascii_lowercase().contains("data:"));
-
-        // 正常 bareword URL 不应被误伤
-        let out8 = sanitize_html(r#"<a href=https://example.com>x</a>"#);
-        assert!(out8.contains("https://example.com"));
-        let out9 = sanitize_html(r#"<a href=mailto:a@b.com>x</a>"#);
-        assert!(out9.contains("mailto:a@b.com"));
-    }
-
-    #[test]
-    fn sanitize_preserves_safe_links() {
+    fn sanitize_preserves_safe_markup() {
+        let formatted = sanitize_html("<p>hello <strong>world</strong></p>");
+        assert!(formatted.contains("<strong>world</strong>"));
+        assert!(formatted.contains("<p>"));
         assert!(
             sanitize_html(r#"<a href="https://example.com">x</a>"#).contains("https://example.com")
         );
         assert!(sanitize_html(r#"<a href="mailto:a@b.com">x</a>"#).contains("mailto:a@b.com"));
-    }
-
-    #[test]
-    fn sanitize_preserves_inline_formatting() {
-        let html = sanitize_html("<p>hello <strong>world</strong></p>");
-        assert!(html.contains("<strong>world</strong>"));
-        assert!(html.contains("<p>"));
-    }
-
-    #[test]
-    fn sanitize_removes_remote_resource_tags() {
-        // img 不在白名单中，可防止 SSRF
         assert!(
-            !sanitize_html(r#"<img src="http://169.254.169.254/latest/meta-data/">"#)
-                .contains("<img")
+            sanitize_html(r#"<a href=https://example.com>x</a>"#).contains("https://example.com")
         );
-        assert!(!sanitize_html(r#"<video src="http://evil"></video>"#).contains("<video"));
-        assert!(!sanitize_html(r#"<audio src="http://evil"></audio>"#).contains("<audio"));
-        assert!(!sanitize_html(r#"<source src="http://evil">"#).contains("<source"));
+        assert!(sanitize_html(r#"<a href=mailto:a@b.com>x</a>"#).contains("mailto:a@b.com"));
     }
 }

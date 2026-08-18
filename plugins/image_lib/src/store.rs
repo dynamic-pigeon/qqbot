@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -67,6 +70,14 @@ pub struct Store {
     pools: Mutex<HashMap<i64, SqlitePool>>,
 }
 
+/// 已哈希、必要时已写入 `blobs/{hash}` 的一张图。
+pub struct PreparedImage {
+    hash: String,
+    size: u64,
+    /// 本次新建的文件；提交失败时删掉。已存在的 blob 为 `None`。
+    created_path: Option<PathBuf>,
+}
+
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         Self::open_with_quota(root, MAX_GROUP_BYTES)
@@ -105,10 +116,7 @@ impl Store {
     }
 
     fn blob_path(&self, group_id: i64, hash: &str) -> Result<PathBuf> {
-        if !is_blob_hash(hash) {
-            anyhow::bail!("非法图片哈希");
-        }
-        Ok(self.blobs_dir(group_id).join(hash))
+        blob_file(&self.blobs_dir(group_id), hash)
     }
 
     async fn with_group<T, F, Fut>(&self, group_id: i64, f: F) -> Result<T, StoreError>
@@ -133,8 +141,12 @@ impl Store {
         }
 
         let dir = self.group_dir(group_id);
-        std::fs::create_dir_all(&dir).context("创建群图库目录失败")?;
-        std::fs::create_dir_all(self.blobs_dir(group_id)).context("创建图片目录失败")?;
+        kovi::tokio::fs::create_dir_all(&dir)
+            .await
+            .context("创建群图库目录失败")?;
+        kovi::tokio::fs::create_dir_all(self.blobs_dir(group_id))
+            .await
+            .context("创建图片目录失败")?;
         let db_path = self.db_path(group_id);
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
@@ -152,72 +164,135 @@ impl Store {
         Ok(pool)
     }
 
+    /// 算哈希；`blobs/{hash}` 不存在才写盘。
+    pub async fn write_blob(
+        &self,
+        group_id: i64,
+        bytes: Vec<u8>,
+    ) -> Result<PreparedImage, StoreError> {
+        if bytes.is_empty() {
+            return Err(StoreError::Other(anyhow::anyhow!("图片为空")));
+        }
+        let blobs = self.blobs_dir(group_id);
+        kovi::tokio::fs::create_dir_all(&blobs)
+            .await
+            .context("创建图片目录失败")?;
+        kovi::tokio::task::spawn_blocking(move || {
+            let hash = sha256_hex(&bytes);
+            let path = blob_file(&blobs, &hash)?;
+            let created_path = if path.exists() {
+                None
+            } else {
+                write_blob_atomic(&path, &bytes)?;
+                Some(path)
+            };
+            Ok(PreparedImage {
+                hash,
+                size: bytes.len() as u64,
+                created_path,
+            })
+        })
+        .await
+        .map_err(|e| StoreError::Other(anyhow::anyhow!("写图片失败: {e}")))?
+    }
+
+    /// 删除尚未入库的新建 blob。索引里已有的同 hash 文件会保留。
+    pub async fn discard_unindexed(
+        &self,
+        group_id: i64,
+        images: &[PreparedImage],
+    ) -> Result<(), StoreError> {
+        let orphans: Vec<(String, PathBuf)> = images
+            .iter()
+            .filter_map(|item| {
+                item.created_path
+                    .clone()
+                    .map(|path| (item.hash.clone(), path))
+            })
+            .collect();
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        match self
+            .with_group(group_id, |pool| {
+                let orphans = &orphans;
+                async move { remove_unindexed(&pool, orphans).await }
+            })
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                for (_, path) in &orphans {
+                    let _ = kovi::tokio::fs::remove_file(path).await;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub async fn add_images(
         &self,
         group_id: i64,
         name: &str,
-        images: Vec<Vec<u8>>,
+        images: Vec<PreparedImage>,
     ) -> Result<AddResult, StoreError> {
-        let prepared: Vec<(String, u64, Vec<u8>)> = images
-            .into_iter()
-            .map(|bytes| {
-                let hash = sha256_hex(&bytes);
-                let size = bytes.len() as u64;
-                (hash, size, bytes)
-            })
-            .collect();
-
         let blobs = self.blobs_dir(group_id);
         let max_group_bytes = self.max_group_bytes;
-        self.with_group(group_id, |pool| async move {
-            let library = resolve_library(&pool, name).await?;
-            let existing = library_hashes(&pool, &library).await?;
+        let result = self
+            .with_group(group_id, |pool| {
+                let images = &images;
+                async move {
+                    let library = resolve_library(&pool, name).await?;
+                    let existing = library_hashes(&pool, &library).await?;
 
-            let mut added_hashes = HashSet::new();
-            let mut to_insert = Vec::new();
-            let mut skipped_dup = 0usize;
-            for (hash, size, bytes) in prepared {
-                if existing.contains(&hash) || !added_hashes.insert(hash.clone()) {
-                    skipped_dup += 1;
-                    continue;
+                    let mut added_hashes = HashSet::new();
+                    let mut to_insert = Vec::new();
+                    let mut skipped_dup = 0usize;
+                    let mut created = Vec::new();
+                    let mut created_bytes = 0u64;
+
+                    for item in images {
+                        if existing.contains(&item.hash) || !added_hashes.insert(item.hash.clone())
+                        {
+                            skipped_dup += 1;
+                            continue;
+                        }
+                        let path = blob_file(&blobs, &item.hash)?;
+                        if !kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                            continue;
+                        }
+                        if let Some(created_path) = &item.created_path {
+                            created.push((item.hash.clone(), created_path.clone()));
+                            created_bytes += item.size;
+                        }
+                        to_insert.push((item.hash.clone(), item.size));
+                    }
+
+                    let used = dir_size(&blobs).await;
+                    if used > max_group_bytes {
+                        remove_unindexed(&pool, &created).await?;
+                        return Err(StoreError::QuotaExceeded {
+                            used: used.saturating_sub(created_bytes),
+                            additional: created_bytes,
+                        });
+                    }
+
+                    if let Err(error) = insert_images(&pool, &library, &to_insert).await {
+                        let _ = remove_unindexed(&pool, &created).await;
+                        return Err(error);
+                    }
+
+                    Ok(AddResult {
+                        added: to_insert.len(),
+                        skipped_dup,
+                    })
                 }
-                to_insert.push((hash, size, bytes));
-            }
-
-            let mut additional = 0u64;
-            let mut to_write = Vec::new();
-            for (hash, size, bytes) in &to_insert {
-                let path = blob_file(&blobs, hash)?;
-                if !path.exists() {
-                    additional += *size;
-                    to_write.push((path, bytes.clone()));
-                }
-            }
-            let used = dir_size(&blobs);
-            if used.saturating_add(additional) > max_group_bytes {
-                return Err(StoreError::QuotaExceeded { used, additional });
-            }
-
-            std::fs::create_dir_all(&blobs).context("创建图片目录失败")?;
-            let mut written = Vec::new();
-            for (path, bytes) in &to_write {
-                write_blob_atomic(path, bytes)?;
-                written.push(path.clone());
-            }
-
-            if let Err(error) = insert_images(&pool, &library, &to_insert).await {
-                for path in written {
-                    let _ = std::fs::remove_file(path);
-                }
-                return Err(error);
-            }
-
-            Ok(AddResult {
-                added: to_insert.len(),
-                skipped_dup,
             })
-        })
-        .await
+            .await;
+        if result.is_err() {
+            let _ = self.discard_unindexed(group_id, &images).await;
+        }
+        result
     }
 
     pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
@@ -238,7 +313,7 @@ impl Store {
             if !hash_still_used(&pool, hash).await?
                 && let Ok(path) = blob_file(&blobs, hash)
             {
-                let _ = std::fs::remove_file(path);
+                let _ = kovi::tokio::fs::remove_file(path).await;
             }
             Ok(libraries)
         })
@@ -266,7 +341,7 @@ impl Store {
                 if !hash_still_used(&pool, &hash).await?
                     && let Ok(path) = blob_file(&blobs, &hash)
                 {
-                    let _ = std::fs::remove_file(path);
+                    let _ = kovi::tokio::fs::remove_file(path).await;
                 }
             }
             Ok(canonical)
@@ -375,15 +450,17 @@ impl Store {
             Ok(GroupStats {
                 libraries,
                 unique_count,
-                unique_bytes: unique_bytes.max(dir_size(&blobs)),
+                unique_bytes: unique_bytes.max(dir_size(&blobs).await),
             })
         })
         .await
     }
 
-    pub fn read_blob(&self, group_id: i64, hash: &str) -> Result<Vec<u8>> {
+    pub async fn read_blob(&self, group_id: i64, hash: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(group_id, hash)?;
-        std::fs::read(&path).with_context(|| format!("读取图片失败: {}", path.display()))
+        kovi::tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("读取图片失败: {}", path.display()))
     }
 }
 
@@ -450,9 +527,9 @@ async fn hash_still_used(pool: &SqlitePool, hash: &str) -> Result<bool, StoreErr
 async fn insert_images(
     pool: &SqlitePool,
     library: &str,
-    images: &[(String, u64, Vec<u8>)],
+    images: &[(String, u64)],
 ) -> Result<(), StoreError> {
-    for (hash, size, _) in images {
+    for (hash, size) in images {
         sqlx::query("INSERT OR IGNORE INTO images (library, hash, size) VALUES (?, ?, ?)")
             .bind(library)
             .bind(hash)
@@ -477,16 +554,20 @@ fn blob_file(blobs: &Path, hash: &str) -> Result<PathBuf> {
     Ok(blobs.join(hash))
 }
 
-fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+async fn dir_size(dir: &Path) -> u64 {
+    let Ok(mut entries) = kovi::tokio::fs::read_dir(dir).await else {
         return 0;
     };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_none())
-        .filter_map(|entry| entry.metadata().ok())
-        .map(|meta| meta.len())
-        .sum()
+    let mut total = 0u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().is_some() {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata().await {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 fn is_blob_hash(hash: &str) -> bool {
@@ -504,10 +585,35 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    restrict_file_permissions(&tmp)?;
-    std::fs::rename(&tmp, path)?;
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        "{name}.{}.{:x}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write = (|| {
+        std::fs::write(&tmp, bytes)?;
+        restrict_file_permissions(&tmp)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
+}
+
+async fn remove_unindexed(
+    pool: &SqlitePool,
+    created: &[(String, PathBuf)],
+) -> Result<(), StoreError> {
+    for (hash, path) in created {
+        if hash_still_used(pool, hash).await? {
+            continue;
+        }
+        let _ = kovi::tokio::fs::remove_file(path).await;
+    }
     Ok(())
 }
 
@@ -543,6 +649,19 @@ mod tests {
         bytes
     }
 
+    async fn add_images(
+        store: &Store,
+        group_id: i64,
+        name: &str,
+        images: Vec<Vec<u8>>,
+    ) -> Result<AddResult, StoreError> {
+        let mut prepared = Vec::with_capacity(images.len());
+        for bytes in images {
+            prepared.push(store.write_blob(group_id, bytes).await?);
+        }
+        store.add_images(group_id, name, prepared).await
+    }
+
     #[tokio::test]
     async fn adds_dedups_shares_blob_and_deletes() {
         let (store, dir) = temp_store();
@@ -550,8 +669,7 @@ mod tests {
         let a = png_like(1);
         let b = png_like(2);
 
-        let first = store
-            .add_images(group, "猫", vec![a.clone()])
+        let first = add_images(&store, group, "猫", vec![a.clone()])
             .await
             .unwrap();
         assert_eq!(
@@ -561,8 +679,7 @@ mod tests {
                 skipped_dup: 0
             }
         );
-        let again = store
-            .add_images(group, "猫", vec![a.clone()])
+        let again = add_images(&store, group, "猫", vec![a.clone()])
             .await
             .unwrap();
         assert_eq!(
@@ -572,8 +689,7 @@ mod tests {
                 skipped_dup: 1
             }
         );
-        store
-            .add_images(group, "狗", vec![a.clone(), b.clone()])
+        add_images(&store, group, "狗", vec![a.clone(), b.clone()])
             .await
             .unwrap();
 
@@ -608,16 +724,14 @@ mod tests {
     async fn alias_resolves_and_wipe_clears_canonical() {
         let (store, dir) = temp_store();
         let group = 2;
-        store
-            .add_images(group, "猫", vec![png_like(1)])
+        add_images(&store, group, "猫", vec![png_like(1)])
             .await
             .unwrap();
         let canonical = store.set_alias(group, "喵", "猫").await.unwrap();
         assert_eq!(canonical, "猫");
         assert!(store.pick_random(group, "喵").await.is_ok());
 
-        store
-            .add_images(group, "喵", vec![png_like(2)])
+        add_images(&store, group, "喵", vec![png_like(2)])
             .await
             .unwrap();
         let stats = store.stats(group).await.unwrap();
@@ -640,12 +754,10 @@ mod tests {
     async fn alias_rejects_existing_library_and_missing_target() {
         let (store, dir) = temp_store();
         let group = 3;
-        store
-            .add_images(group, "猫", vec![png_like(1)])
+        add_images(&store, group, "猫", vec![png_like(1)])
             .await
             .unwrap();
-        store
-            .add_images(group, "狗", vec![png_like(2)])
+        add_images(&store, group, "狗", vec![png_like(2)])
             .await
             .unwrap();
         assert!(matches!(
@@ -668,20 +780,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("image_lib_quota_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open_with_quota(dir.clone(), 40).unwrap();
-        store.add_images(7, "小", vec![png_like(3)]).await.unwrap();
-        let err = store
-            .add_images(7, "小", vec![png_like(4)])
+        add_images(&store, 7, "小", vec![png_like(3)])
+            .await
+            .unwrap();
+        let err = add_images(&store, 7, "小", vec![png_like(4)])
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::QuotaExceeded { .. }));
+
+        let err = add_images(&store, 8, "小", vec![png_like(3), png_like(4)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::QuotaExceeded { .. }));
+        let leftover = std::fs::read_dir(dir.join("8").join("blobs"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().extension().is_none())
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftover, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn blob_path_rejects_non_hex_hash() {
+    #[tokio::test]
+    async fn blob_path_rejects_non_hex_hash() {
         let (store, dir) = temp_store();
-        assert!(store.read_blob(1, "../passwd").is_err());
-        assert!(store.read_blob(1, "zz").is_err());
+        assert!(store.read_blob(1, "../passwd").await.is_err());
+        assert!(store.read_blob(1, "zz").await.is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

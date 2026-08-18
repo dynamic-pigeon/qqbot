@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use kovi::{Message, Segment};
 use serde_json::Value;
 
-pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 pub const MAX_ADD_IMAGES: usize = 10;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -30,7 +30,7 @@ pub enum FetchError {
     TooManyImages,
     #[error("请只回复一张图")]
     ExpectSingleImage,
-    #[error("单张图片不能超过 5 MiB")]
+    #[error("单张图片不能超过 {} MiB", MAX_IMAGE_BYTES / 1024 / 1024)]
     TooLarge,
     #[error("有图片未能读取")]
     Unreadable,
@@ -73,11 +73,11 @@ pub fn image_segments(segments: &[Segment]) -> Vec<&Segment> {
 }
 
 /// 先数图再下载，避免引用了几十张图时先把内存打满再报「太多」。
-pub fn select_images<'a>(
-    segments: &'a [Segment],
+pub fn select_images(
+    segments: &[Segment],
     max: usize,
     single: bool,
-) -> Result<Vec<&'a Segment>, FetchError> {
+) -> Result<Vec<&Segment>, FetchError> {
     let images = image_segments(segments);
     if images.is_empty() {
         return Err(FetchError::NoImages);
@@ -96,7 +96,7 @@ pub async fn load_image_bytes(segment: &Segment) -> Result<Vec<u8>, FetchError> 
         return download_remote(&url).await;
     }
     if let Some(path) = local_file_path(segment) {
-        return read_local_limited(&path);
+        return read_local_limited(&path).await;
     }
     Err(FetchError::Unreadable)
 }
@@ -141,7 +141,7 @@ fn local_file_path(segment: &Segment) -> Option<PathBuf> {
     {
         return None;
     }
-    path.is_file().then(|| path.to_path_buf())
+    Some(path.to_path_buf())
 }
 
 async fn download_remote(url: &str) -> Result<Vec<u8>, FetchError> {
@@ -162,12 +162,19 @@ fn map_download_error(error: anyhow::Error) -> FetchError {
     }
 }
 
-fn read_local_limited(path: &Path) -> Result<Vec<u8>, FetchError> {
-    let meta = std::fs::metadata(path).map_err(|_| FetchError::Unreadable)?;
+async fn read_local_limited(path: &Path) -> Result<Vec<u8>, FetchError> {
+    let meta = kovi::tokio::fs::metadata(path)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
+    if !meta.is_file() {
+        return Err(FetchError::Unreadable);
+    }
     if meta.len() > MAX_IMAGE_BYTES as u64 {
         return Err(FetchError::TooLarge);
     }
-    let bytes = std::fs::read(path).map_err(|_| FetchError::Unreadable)?;
+    let bytes = kovi::tokio::fs::read(path)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(FetchError::TooLarge);
     }

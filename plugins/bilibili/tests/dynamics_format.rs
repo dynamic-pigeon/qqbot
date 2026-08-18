@@ -17,20 +17,9 @@ fn word_with_pics(n: usize) -> DynamicItem {
 }
 
 #[test]
-fn collect_pics_caps_at_three() {
-    let item = word_with_pics(5);
-    assert_eq!(collect_pics(&item).len(), 3);
-}
-
-#[test]
-fn collect_pics_empty_when_no_pics() {
-    let item = DynamicItem::Word {
-        id: "1".into(),
-        text: "x".into(),
-        pics: vec![],
-        author: DynamicAuthor::default(),
-    };
-    assert!(collect_pics(&item).is_empty());
+fn collect_pics_caps_and_empty() {
+    assert_eq!(collect_pics(&word_with_pics(5)).len(), 3);
+    assert!(collect_pics(&word_with_pics(0)).is_empty());
 }
 
 #[test]
@@ -89,83 +78,53 @@ fn format_body_for_video_uses_tougao_template() {
 }
 
 #[test]
-fn format_body_for_video_without_summary_omits_blank_line() {
-    let author = DynamicAuthor {
-        name: "小明".into(),
-        ..DynamicAuthor::default()
-    };
-    let item = DynamicItem::Video {
-        id: "1".into(),
-        bvid: "BV1abc".into(),
-        title: "无简介视频".into(),
-        cover_url: String::new(),
-        summary: None,
-        author: author.clone(),
-    };
-    assert_eq!(
-        format_body(&author, &item),
-        "小明 投稿了视频：无简介视频\nhttps://www.bilibili.com/video/BV1abc"
-    );
-}
-
-#[test]
-fn format_body_for_video_with_empty_title_falls_back_to_summary() {
-    let author = DynamicAuthor {
-        name: "小明".into(),
-        ..DynamicAuthor::default()
-    };
-    let item = DynamicItem::Video {
-        id: "1".into(),
-        bvid: "BV1abc".into(),
-        title: String::new(),
-        cover_url: String::new(),
-        summary: Some(RichText {
-            text: "只有简介".into(),
-        }),
-        author: author.clone(),
-    };
-    assert_eq!(
-        format_body(&author, &item),
-        "小明\n只有简介\nhttps://www.bilibili.com/video/BV1abc"
-    );
-}
-
-#[test]
-fn format_body_for_video_with_empty_name_falls_back_to_pub_action() {
-    let author = DynamicAuthor {
-        name: String::new(),
-        pub_action: "发布了视频".into(),
-    };
-    let item = DynamicItem::Video {
-        id: "1".into(),
-        bvid: "BV1abc".into(),
-        title: "标题".into(),
-        cover_url: String::new(),
-        summary: None,
-        author: author.clone(),
-    };
-    assert_eq!(
-        format_body(&author, &item),
-        "发布了视频 投稿了视频：标题\nhttps://www.bilibili.com/video/BV1abc"
-    );
-}
-
-#[test]
-fn format_body_for_video_with_all_empty_author_and_title_returns_only_url() {
-    let author = DynamicAuthor::default();
-    let item = DynamicItem::Video {
-        id: "1".into(),
-        bvid: "BV1abc".into(),
-        title: String::new(),
-        cover_url: String::new(),
-        summary: None,
-        author: author.clone(),
-    };
-    // 全空时不应出现 leading blank line / 裸冒号
-    assert_eq!(
-        format_body(&author, &item),
-        "https://www.bilibili.com/video/BV1abc"
-    );
+fn format_body_for_video_empty_fields() {
+    let cases = [
+        (
+            DynamicAuthor {
+                name: "小明".into(),
+                ..DynamicAuthor::default()
+            },
+            "无简介视频",
+            None,
+            "小明 投稿了视频：无简介视频\nhttps://www.bilibili.com/video/BV1abc",
+        ),
+        (
+            DynamicAuthor {
+                name: "小明".into(),
+                ..DynamicAuthor::default()
+            },
+            "",
+            Some("只有简介"),
+            "小明\n只有简介\nhttps://www.bilibili.com/video/BV1abc",
+        ),
+        (
+            DynamicAuthor {
+                name: String::new(),
+                pub_action: "发布了视频".into(),
+            },
+            "标题",
+            None,
+            "发布了视频 投稿了视频：标题\nhttps://www.bilibili.com/video/BV1abc",
+        ),
+        (
+            DynamicAuthor::default(),
+            "",
+            None,
+            "https://www.bilibili.com/video/BV1abc",
+        ),
+    ];
+    for (author, title, summary, expected) in cases {
+        let item = DynamicItem::Video {
+            id: "1".into(),
+            bvid: "BV1abc".into(),
+            title: title.into(),
+            cover_url: String::new(),
+            summary: summary.map(|text| RichText { text: text.into() }),
+            author: author.clone(),
+        };
+        assert_eq!(format_body(&author, &item), expected);
+    }
 }
 
 #[test]
