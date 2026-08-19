@@ -22,6 +22,40 @@ pub enum MessageScope {
     Private,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageSource {
+    Group,
+    Private,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum AccessError {
+    #[error("此命令只能在群聊中使用")]
+    GroupOnly,
+    #[error("此命令只能在私聊中使用")]
+    PrivateOnly,
+    #[error("管理员专用命令，普通用户无法使用")]
+    PermissionDenied,
+}
+
+pub fn check_access(
+    scope: MessageScope,
+    permission: Permission,
+    source: MessageSource,
+    is_admin: bool,
+) -> Result<(), AccessError> {
+    match (scope, source) {
+        (MessageScope::Group, MessageSource::Private) => return Err(AccessError::GroupOnly),
+        (MessageScope::Private, MessageSource::Group) => return Err(AccessError::PrivateOnly),
+        _ => {}
+    }
+
+    if permission == Permission::BotAdmin && !is_admin {
+        return Err(AccessError::PermissionDenied);
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CommandError {
     #[error("缺少参数 `{name}`")]
@@ -116,7 +150,6 @@ pub fn render_command_error(error: &CommandError, usage: &str) -> String {
 pub struct CommandContext {
     event: Arc<MsgEvent>,
     bot: Arc<RuntimeBot>,
-    path: Vec<String>,
     arguments: CommandArguments,
 }
 
@@ -124,13 +157,11 @@ impl CommandContext {
     pub(crate) fn new(
         event: Arc<MsgEvent>,
         bot: Arc<RuntimeBot>,
-        path: Vec<String>,
         arguments: CommandArguments,
     ) -> Self {
         Self {
             event,
             bot,
-            path,
             arguments,
         }
     }
@@ -141,10 +172,6 @@ impl CommandContext {
 
     pub fn bot(&self) -> &Arc<RuntimeBot> {
         &self.bot
-    }
-
-    pub fn path(&self) -> &[String] {
-        &self.path
     }
 
     pub fn args(&self) -> &[String] {

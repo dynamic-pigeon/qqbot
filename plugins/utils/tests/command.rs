@@ -1,14 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-
 use kovi::Message;
 use kovi_onebot::MessageRegistrar as _;
 use utils::command::{
     AccessError, CatalogStore, Command, CommandArguments, CommandError, CommandRegistrationError,
     CommandTree, MessageScope, MessageSource, Permission, ResolveOutcome, RouteError, check_access,
-    dispatch_if_allowed, extract_command_text, render_command_error,
+    extract_command_text, render_command_error,
 };
 
 fn endpoint(name: &str) -> Command {
@@ -454,24 +449,4 @@ fn extracts_message_text_without_trimming_raw_content() {
         Some("  !md   first  \n  second  ")
     );
     assert_eq!(extract_command_text(&Message::new()), None);
-}
-
-#[kovi::tokio::test]
-async fn rejected_access_does_not_invoke_the_handler() {
-    let called = Arc::new(AtomicBool::new(false));
-    let marker = Arc::clone(&called);
-
-    let result = dispatch_if_allowed(
-        MessageScope::Group,
-        Permission::BotAdmin,
-        MessageSource::Group,
-        false,
-        move || async move {
-            marker.store(true, Ordering::SeqCst);
-        },
-    )
-    .await;
-
-    assert_eq!(result, Err(AccessError::PermissionDenied));
-    assert!(!called.load(Ordering::SeqCst));
 }

@@ -62,12 +62,7 @@ impl CommandRouter {
                     return;
                 }
 
-                let context = CommandContext::new(
-                    Arc::clone(&event),
-                    Arc::clone(&bot),
-                    path.clone(),
-                    arguments,
-                );
+                let context = CommandContext::new(Arc::clone(&event), Arc::clone(&bot), arguments);
                 if let Err(error) = handler(context).await {
                     if let CommandError::Internal(internal) = &error {
                         tracing::error!(
@@ -114,15 +109,13 @@ fn check_event_access(
     } else {
         MessageSource::Private
     };
-    check_access(scope, Permission::Everyone, source, false)?;
-
     let is_admin = permission == Permission::Everyone
         || bot
             .get_all_admin()
             .unwrap_or_default()
             .iter()
             .any(|id| id.try_as_i64() == Some(event.user_id));
-    check_access(super::MessageScope::Any, permission, source, is_admin)
+    check_access(scope, permission, source, is_admin)
 }
 
 fn reply_access_error(event: &MsgEvent, error: AccessError) {

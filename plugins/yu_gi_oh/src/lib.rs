@@ -1,36 +1,18 @@
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::LazyLock, time::Duration};
 
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
 use kovi_onebot::MessageRegistrar as _;
+use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 mod fetch_card;
 
 const MAX_CARD_NAME_BYTES: usize = 128;
 const QUERY_COOLDOWN: Duration = Duration::from_secs(3);
-static QUERY_TIMES: LazyLock<Mutex<HashMap<i64, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn query_allowed(user_id: i64) -> bool {
-    let mut times = QUERY_TIMES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    times.retain(|_, last| now.duration_since(*last) < Duration::from_secs(10 * 60));
-    if times
-        .get(&user_id)
-        .is_some_and(|last| now.duration_since(*last) < QUERY_COOLDOWN)
-    {
-        return false;
-    }
-    times.insert(user_id, now);
-    true
-}
+static QUERY_LIMITER: LazyLock<RateLimiter<i64>> =
+    LazyLock::new(|| RateLimiter::new(QUERY_COOLDOWN, 1));
 
 fn card_query_command() -> Command {
     Command::new("/查卡")
@@ -49,7 +31,7 @@ async fn handle_card_query(ctx: CommandContext) -> CommandResult {
     if card_name.len() > MAX_CARD_NAME_BYTES {
         return Err(CommandError::user("卡片名称过长"));
     }
-    if !query_allowed(ctx.event().user_id) {
+    if QUERY_LIMITER.try_acquire(ctx.event().user_id).is_err() {
         return Err(CommandError::user("查询过于频繁，请稍后重试"));
     }
 

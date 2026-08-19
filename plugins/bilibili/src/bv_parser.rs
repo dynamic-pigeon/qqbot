@@ -1,10 +1,7 @@
-use std::{
-    collections::HashMap,
-    sync::LazyLock,
-    time::{Duration, Instant},
-};
+use std::{sync::LazyLock, time::Duration};
 
 use serde::Deserialize;
+use utils::RateLimiter;
 
 use crate::CLIENT;
 
@@ -97,29 +94,11 @@ impl ApiRes {
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
 const RATE_LIMIT_MAX_PER_WINDOW: usize = 3;
 
-static RATE_LIMITER: LazyLock<kovi::tokio::sync::Mutex<HashMap<i64, Vec<Instant>>>> =
-    LazyLock::new(|| kovi::tokio::sync::Mutex::new(HashMap::new()));
+static RATE_LIMITER: LazyLock<RateLimiter<i64>> =
+    LazyLock::new(|| RateLimiter::new(RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_PER_WINDOW));
 
-/// 检查指定群是否在滑动窗口内超过请求上限。
-///
-/// 返回 `true` 表示允许本次请求，并记录请求时间；
-/// 返回 `false` 表示该群已触发限流。
-async fn check_rate_limit(group_id: i64) -> bool {
-    let mut map = RATE_LIMITER.lock().await;
-    let now = Instant::now();
-    // 顺带清理窗口已空的键，避免 map 随见过的群数无限增长。
-    map.retain(|_, entries| {
-        entries.retain(|t| now.duration_since(*t) < RATE_LIMIT_WINDOW);
-        !entries.is_empty()
-    });
-    let entries = map.entry(group_id).or_default();
-
-    if entries.len() >= RATE_LIMIT_MAX_PER_WINDOW {
-        false
-    } else {
-        entries.push(now);
-        true
-    }
+fn check_rate_limit(group_id: i64) -> bool {
+    RATE_LIMITER.try_acquire(group_id).is_ok()
 }
 
 static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -193,7 +172,7 @@ async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
 }
 
 async fn parse_bv(bv: &str, group_id: i64) -> Result<BvInfo, BvError> {
-    if !check_rate_limit(group_id).await {
+    if !check_rate_limit(group_id) {
         return Err(BvError::RateLimited);
     }
 
@@ -259,26 +238,18 @@ https://www.bilibili.com/video/BV198XLBaEYp";
         assert!(res.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_per_group() {
-        // 使用极大 group_id 避免与真实网络测试冲突。
-        let group_a = i64::MAX;
-        let group_b = i64::MAX - 1;
+    #[test]
+    fn test_rate_limit_per_group() {
+        // 每次取新的群号，避免静态限流器在同进程重复跑测试时被污染。
+        static NEXT_GROUP: std::sync::atomic::AtomicI64 =
+            std::sync::atomic::AtomicI64::new(i64::MAX);
+        let group_a = NEXT_GROUP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let group_b = NEXT_GROUP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
-        {
-            let mut map = RATE_LIMITER.lock().await;
-            map.remove(&group_a);
-            map.remove(&group_b);
-        }
-
-        // group_a 前 3 次允许。
-        assert!(check_rate_limit(group_a).await);
-        assert!(check_rate_limit(group_a).await);
-        assert!(check_rate_limit(group_a).await);
-        // 第 4 次应被限流。
-        assert!(!check_rate_limit(group_a).await);
-
-        // group_b 不受 group_a 影响。
-        assert!(check_rate_limit(group_b).await);
+        assert!(check_rate_limit(group_a));
+        assert!(check_rate_limit(group_a));
+        assert!(check_rate_limit(group_a));
+        assert!(!check_rate_limit(group_a));
+        assert!(check_rate_limit(group_b));
     }
 }
