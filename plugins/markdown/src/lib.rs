@@ -1,36 +1,16 @@
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::LazyLock, time::Duration};
 
 use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
 use kovi_onebot::MessageRegistrar as _;
+use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
 const MARKDOWN_COOLDOWN: Duration = Duration::from_secs(10);
-const COOLDOWN_ENTRY_TTL: Duration = Duration::from_secs(10 * 60);
 
-static MARKDOWN_COOLDOWNS: LazyLock<Mutex<HashMap<i64, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn check_cooldown(user_id: i64) -> Option<u64> {
-    let mut entries = MARKDOWN_COOLDOWNS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    entries.retain(|_, last| now.duration_since(*last) < COOLDOWN_ENTRY_TTL);
-    if let Some(last) = entries.get(&user_id) {
-        let elapsed = now.duration_since(*last);
-        if elapsed < MARKDOWN_COOLDOWN {
-            return Some((MARKDOWN_COOLDOWN - elapsed).as_secs().max(1));
-        }
-    }
-    entries.insert(user_id, now);
-    None
-}
+static MARKDOWN_COOLDOWNS: LazyLock<RateLimiter<i64>> =
+    LazyLock::new(|| RateLimiter::new(MARKDOWN_COOLDOWN, 1));
 
 fn markdown_command() -> Command {
     Command::new("!md")
@@ -52,9 +32,10 @@ async fn handle_markdown(ctx: CommandContext) -> CommandResult {
             MAX_MARKDOWN_BYTES / 1024
         )));
     }
-    if let Some(remaining) = check_cooldown(ctx.event().user_id) {
+    if let Err(hit) = MARKDOWN_COOLDOWNS.try_acquire(ctx.event().user_id) {
         return Err(CommandError::user(format!(
-            "请求过于频繁，请在 {remaining} 秒后重试"
+            "请求过于频繁，请在 {} 秒后重试",
+            hit.retry_after_secs()
         )));
     }
 

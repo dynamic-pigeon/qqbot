@@ -79,40 +79,23 @@ impl CatalogStore {
     }
 
     pub fn find(&self, path: &[&str]) -> Option<CommandHelp> {
-        self.find_from_root(path)
-            .or_else(|| self.find_exposed_root(path))
+        if path.is_empty() {
+            return None;
+        }
+        self.find_canonical(path)
+            .or_else(|| self.find_exposed(path))
     }
 
-    fn find_from_root(&self, path: &[&str]) -> Option<CommandHelp> {
-        let (first, _) = path.split_first()?;
-        let root = self.roots.values().find(|root| {
-            root.entries.first().is_some_and(|entry| {
-                entry.matchers[0]
-                    .iter()
-                    .any(|name| root_name_matches(name, first))
-            })
-        })?;
-        let entry = root.entries.iter().find(|entry| {
-            entry.matchers.len() == path.len()
-                && entry
-                    .matchers
-                    .iter()
-                    .enumerate()
-                    .zip(path)
-                    .all(|((index, names), part)| {
-                        names.iter().any(|name| {
-                            if index == 0 {
-                                root_name_matches(name, part)
-                            } else {
-                                name == part
-                            }
-                        })
-                    })
-        })?;
-        Some(help_from_entry(root, entry))
+    fn find_canonical(&self, path: &[&str]) -> Option<CommandHelp> {
+        self.roots.values().find_map(|root| {
+            root.entries
+                .iter()
+                .find(|entry| path_matches(&entry.matchers, path))
+                .map(|entry| help_from_entry(root, entry))
+        })
     }
 
-    fn find_exposed_root(&self, path: &[&str]) -> Option<CommandHelp> {
+    fn find_exposed(&self, path: &[&str]) -> Option<CommandHelp> {
         let (first, rest) = path.split_first()?;
         let (root, entry) = self.roots.values().find_map(|root| {
             root.entries
@@ -130,15 +113,17 @@ impl CatalogStore {
         }
 
         let canonical_path = &entry.metadata.path;
-        let entry = root.entries.iter().find(|candidate| {
-            candidate.metadata.path.len() == canonical_path.len() + rest.len()
-                && candidate.metadata.path.starts_with(canonical_path)
-                && candidate.metadata.path[canonical_path.len()..]
-                    .iter()
-                    .zip(rest)
-                    .all(|(name, part)| name == part)
-        })?;
-        Some(help_from_entry(root, entry))
+        root.entries
+            .iter()
+            .find(|candidate| {
+                candidate.metadata.path.len() == canonical_path.len() + rest.len()
+                    && candidate.metadata.path.starts_with(canonical_path)
+                    && candidate.metadata.path[canonical_path.len()..]
+                        .iter()
+                        .zip(rest)
+                        .all(|(name, part)| name == part)
+            })
+            .map(|entry| help_from_entry(root, entry))
     }
 
     pub fn render_help(&self, path: &[&str]) -> String {
@@ -169,14 +154,6 @@ static COMMAND_CATALOG: LazyLock<RwLock<CatalogStore>> =
 pub struct CommandCatalog;
 
 impl CommandCatalog {
-    pub fn roots() -> Vec<CommandMetadata> {
-        read_catalog().roots()
-    }
-
-    pub fn find(path: &[&str]) -> Option<CommandHelp> {
-        read_catalog().find(path)
-    }
-
     pub fn render_help(path: &[&str]) -> String {
         read_catalog().render_help(path)
     }
@@ -247,6 +224,23 @@ fn help_from_entry(root: &CatalogRoot, entry: &CatalogEntry) -> CommandHelp {
         command: entry.metadata.clone(),
         children,
     }
+}
+
+fn path_matches(matchers: &[Vec<String>], path: &[&str]) -> bool {
+    matchers.len() == path.len()
+        && matchers
+            .iter()
+            .enumerate()
+            .zip(path)
+            .all(|((index, names), part)| {
+                names.iter().any(|name| {
+                    if index == 0 {
+                        root_name_matches(name, part)
+                    } else {
+                        name == part
+                    }
+                })
+            })
 }
 
 fn tree_root_facing_names(tree: &CommandTree) -> Vec<&str> {

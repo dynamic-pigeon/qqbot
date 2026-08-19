@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::LazyLock, time::Duration};
 
 use anyhow::Result;
 use askama::Template;
@@ -10,34 +6,17 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::TimeZone as _;
 use kovi::RuntimeBot;
 use kovi_onebot::MessageRegistrar as _;
+use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
 
 mod user_info;
 
 /// 每群连续两次 `#今日发言排行` 之间的最短间隔。
-const RANK_COOLDOWN_SECS: u64 = 30;
+const RANK_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// 每群上一次执行 `#今日发言排行` 的时间戳，用于节流防止恶意刷屏打满
-/// DB 连接池与 chromium 渲染进程。`LazyLock<Mutex<_>>` 的锁只覆盖
-/// 「读上次时间 + 写入新时间」O(1) 临界区，不跨 await。
-static RANK_COOLDOWN: LazyLock<Mutex<HashMap<i64, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// 检查并更新每群调用节流。返回 `Some(剩余秒数)` 表示仍在冷却中，`None` 表示放行。
-fn check_rank_cooldown(group_id: i64) -> Option<u64> {
-    let mut map = RANK_COOLDOWN.lock().unwrap();
-    let now = Instant::now();
-    // 顺带清理已过期的键，避免 map 随见过的群数无限增长。
-    map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(RANK_COOLDOWN_SECS));
-    if let Some(&last) = map.get(&group_id) {
-        let elapsed = now.duration_since(last);
-        if elapsed < Duration::from_secs(RANK_COOLDOWN_SECS) {
-            return Some(RANK_COOLDOWN_SECS - elapsed.as_secs());
-        }
-    }
-    map.insert(group_id, now);
-    None
-}
+/// 按群节流，避免连续刷排行打满 DB 连接池和 chromium。
+static RANK_COOLDOWN_LIMITER: LazyLock<RateLimiter<i64>> =
+    LazyLock::new(|| RateLimiter::new(RANK_COOLDOWN, 1));
 
 pub(crate) fn daily_rank_command() -> Command {
     Command::new("#今日发言排行")
@@ -50,8 +29,11 @@ pub(crate) fn daily_rank_command() -> Command {
 async fn handle_daily_rank(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
-    if let Some(remain) = check_rank_cooldown(group_id) {
-        return Err(CommandError::user(format!("刚跑完，{remain} 秒后再试一次")));
+    if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
+        return Err(CommandError::user(format!(
+            "刚跑完，{} 秒后再试一次",
+            hit.retry_after_secs()
+        )));
     }
 
     let html = gen_daily_rank_html(ctx.bot(), group_id)
