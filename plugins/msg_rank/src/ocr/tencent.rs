@@ -5,10 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
-use kovi::{
-    log::warn,
-    serde_json::{self, Value},
-};
+use kovi::serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{HTTP_CLIENT, hex_encode};
@@ -37,18 +34,9 @@ fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
 
 /// 执行腾讯云OCR API调用
 pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
-    let tencent_config = {
-        let config = crate::config::read_config();
-        match config.tencent.clone() {
-            Some(cfg) => cfg,
-            None => {
-                warn!("Tencent Cloud OCR configuration is missing");
-                return Ok(String::new());
-            }
-        }
-    };
-    let secret_id = tencent_config.secret_id;
-    let secret_key = tencent_config.secret_key;
+    let config = super::ocr_config();
+    let secret_id = config.secret_id.as_str();
+    let secret_key = config.secret_key.as_str();
 
     let service = "ocr";
     let host = "ocr.tencentcloudapi.com";

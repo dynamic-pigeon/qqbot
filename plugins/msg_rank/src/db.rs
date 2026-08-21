@@ -21,7 +21,10 @@ const BUFFER_CAPACITY: usize = 10_000;
 /// 保证内存有界（约 MAX_BUFFERED_RECORDS × 4KB）且发送端不会被阻塞。
 const MAX_BUFFERED_RECORDS: usize = 10_000;
 const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
-const MESSAGE_RETENTION_SECS: i64 = 8 * 24 * 60 * 60;
+
+fn message_retention_secs() -> i64 {
+    crate::config::static_config().retention_days.max(1) as i64 * 24 * 60 * 60
+}
 
 /// 缓冲区满 / 数据库不可用时的丢弃计数，恢复后由 [`note_recovered`] 清零并汇总上报。
 static DROPPED_MESSAGES: AtomicU64 = AtomicU64::new(0);
@@ -365,7 +368,7 @@ SELECT msg FROM MSG
 }
 
 async fn delete_expired_messages() -> Result<u64> {
-    let cutoff = chrono::Local::now().timestamp() - MESSAGE_RETENTION_SECS;
+    let cutoff = chrono::Local::now().timestamp() - message_retention_secs();
     let result = sqlx::query("DELETE FROM MSG WHERE timestamp < ?")
         .bind(cutoff)
         .execute(get_pool()?)
@@ -494,7 +497,7 @@ mod tests {
                 .bind(1_i64)
                 .bind(100_i64)
                 .bind("expired")
-                .bind(chrono::Local::now().timestamp() - MESSAGE_RETENTION_SECS - 1)
+                .bind(chrono::Local::now().timestamp() - message_retention_secs() - 1)
                 .execute(get_pool().unwrap())
                 .await
                 .unwrap();

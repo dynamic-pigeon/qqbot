@@ -1,0 +1,25 @@
+# 复制为 config.toml 后按部署修改。运行时状态仍写在各插件的 data/ 下。
+
+[network]
+# 拦截非公网地址并做 DNS pinning。默认关闭，以兼容经本地代理转发的部署。
+# 若同时设置环境变量 PRIVATE_NETWORK_PROTECTION，以环境变量为准。
+private_network_protection = false
+
+[ocr]
+# 腾讯云 OCR。两项都填写后才会识别图片文字。
+secret_id = ""
+secret_key = ""
+
+[msg_rank]
+retention_days = 8
+wordcloud_concurrency = 1
+
+[[msg_rank.wordcloud]]
+cron = "0 21 * * *"
+days = 1
+title = "今日词云"
+
+[[msg_rank.wordcloud]]
+cron = "0 10 * * 6"
+days = 7
+title = "上周词云"

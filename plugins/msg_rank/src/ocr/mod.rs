@@ -16,6 +16,27 @@ mod tencent;
 
 use tencent::get_ocr;
 
+/// 根目录 `config.toml` 的 `[ocr]`。两项都非空才启用腾讯云识别。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+struct OcrConfig {
+    secret_id: String,
+    secret_key: String,
+}
+
+impl OcrConfig {
+    fn is_configured(&self) -> bool {
+        !self.secret_id.trim().is_empty() && !self.secret_key.trim().is_empty()
+    }
+}
+
+fn ocr_config() -> &'static OcrConfig {
+    static CONFIG: LazyLock<OcrConfig> = LazyLock::new(|| {
+        utils::config::parse("ocr").unwrap_or_else(|error| panic!("解析 [ocr] 配置失败: {error:#}"))
+    });
+    &CONFIG
+}
+
 /// OCR 输入图片的 QQ CDN 域名白名单，用于 `validate_image_url_async` 的 SSRF 防御。
 pub const ALLOWED_QQ_HOSTS: &[&str] = &[
     "multimedia.nt.qq.com.cn",
@@ -88,7 +109,7 @@ static OCR_MISSING_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
 /// * `Result<Arc<String>>` - OCR识别的文本结果；未配置腾讯云时返回空串
 pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
     // 未配置腾讯云时直接短路，不为注定失败的识别下载原图。
-    if crate::config::read_config().tencent.is_none() {
+    if !ocr_config().is_configured() {
         if !OCR_MISSING_CONFIG_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!("未配置腾讯云 OCR，跳过图片文字识别");
         }
