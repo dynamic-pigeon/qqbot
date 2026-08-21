@@ -30,14 +30,21 @@ static COOKIE: LazyLock<Option<String>> = LazyLock::new(|| {
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
 
-/// 从 `BILIBILI_USER_AGENT` 环境变量读取 UA 字符串；为空时回退到默认。
-static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("BILIBILI_USER_AGENT")
-        .ok()
-        .map(|s| s.trim().to_string())
+/// 从 `BILIBILI_USER_AGENT` 环境变量解析 UA；未设置或空白时回退到默认。
+fn resolve_user_agent(raw: Option<&str>) -> String {
+    raw.map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
-});
+}
+
+/// HTTP 直连与 Chromium 后备共用同一份 UA，避免两条路径指纹不一致。
+static USER_AGENT: LazyLock<String> =
+    LazyLock::new(|| resolve_user_agent(std::env::var("BILIBILI_USER_AGENT").ok().as_deref()));
+
+pub(super) fn user_agent() -> &'static str {
+    USER_AGENT.as_str()
+}
 
 /// 直连 API 响应字节上限：正常动态 JSON 只有几百 KB，超限说明响应异常
 /// （被风控返回 HTML 或超大 payload），与 Chromium 后备路径的上限一致。
@@ -425,7 +432,7 @@ fn convert_page_data(data: SpaceData) -> DynamicsPage {
 ///
 /// **Env vars:** 通过 `.env` 文件或系统环境设置以下变量：
 /// - `BILIBILI_COOKIE` — 可选的 B 站 cookie；未设置时自动获取游客 Cookie
-/// - `BILIBILI_USER_AGENT` — 自定义 UA 字符串；未设置时使用内置 Chrome 147 Linux
+/// - `BILIBILI_USER_AGENT` — HTTP 直连与 Chromium 后备共用的 UA；未设置时用内置 Chrome 147 Linux
 ///
 /// 注意: B 站 web dynamic 接口风控较严，依赖 host 的 User-Agent + Referer +
 /// WBI 签名和游客 Cookie。从被风控的 IP 调用仍可能返回 HTML 验证码页、
@@ -712,6 +719,17 @@ mod tests {
 #[cfg(test)]
 mod url_tests {
     use super::*;
+
+    #[test]
+    fn user_agent_trims_and_falls_back() {
+        assert_eq!(resolve_user_agent(None), DEFAULT_USER_AGENT);
+        assert_eq!(resolve_user_agent(Some("")), DEFAULT_USER_AGENT);
+        assert_eq!(resolve_user_agent(Some("  \t")), DEFAULT_USER_AGENT);
+        assert_eq!(
+            resolve_user_agent(Some("  CustomBot/1.0  ")),
+            "CustomBot/1.0"
+        );
+    }
 
     #[test]
     fn url_builds_without_offset() {
