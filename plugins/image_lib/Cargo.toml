@@ -9,6 +9,7 @@ base64.workspace = true
 kovi.workspace = true
 kovi-onebot.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true

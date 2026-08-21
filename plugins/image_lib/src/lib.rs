@@ -5,18 +5,23 @@ use utils::RateLimiter;
 use utils::command::CommandRouter;
 
 mod commands;
+mod config;
 mod fetch;
 mod name;
 mod store;
 
-use commands::{DRAW_MAX_PER_WINDOW, DRAW_WINDOW, image_lib_command};
+use commands::image_lib_command;
 use store::Store;
 
 #[kovi::plugin]
 async fn main() {
     let bot = plugin::get_runtime_bot();
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));
-    let limiter = Arc::new(RateLimiter::new(DRAW_WINDOW, DRAW_MAX_PER_WINDOW));
+    let image_config = config::static_config();
+    let limiter = Arc::new(RateLimiter::new(
+        image_config.draw_window(),
+        image_config.draw_max_per_window(),
+    ));
     CommandRouter::new("image_lib", bot)
         .register(image_lib_command(store, limiter))
         .install()
@@ -39,14 +44,18 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        Arc::new(Store::open(dir).unwrap())
+        Arc::new(Store::open_with_quota(dir, u64::MAX).unwrap())
     }
 
     fn command_tree() -> CommandTree {
         let store = dummy_store();
+        let config = crate::config::StaticConfig::default();
         CommandTree::new(vec![image_lib_command(
             store,
-            Arc::new(RateLimiter::new(DRAW_WINDOW, DRAW_MAX_PER_WINDOW)),
+            Arc::new(RateLimiter::new(
+                config.draw_window(),
+                config.draw_max_per_window(),
+            )),
         )])
         .unwrap()
     }

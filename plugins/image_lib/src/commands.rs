@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine as _;
 use kovi::{Message, Segment};
@@ -12,10 +11,7 @@ use crate::fetch::{
     select_images,
 };
 use crate::name::parse_library_name;
-use crate::store::{MAX_GROUP_BYTES, Store, StoreError, sha256_hex};
-
-pub const DRAW_WINDOW: Duration = Duration::from_secs(60);
-pub const DRAW_MAX_PER_WINDOW: usize = 5;
+use crate::store::{Store, StoreError, sha256_hex};
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     Command::new("图库")
@@ -253,7 +249,7 @@ async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
         stats.libraries.len(),
         stats.unique_count,
         format_bytes(stats.unique_bytes),
-        format_bytes(MAX_GROUP_BYTES)
+        format_bytes(store.max_group_bytes())
     )];
     for library in stats.libraries {
         let alias_note = if library.aliases.is_empty() {
@@ -308,10 +304,10 @@ async fn load_replied_images(
 
 fn map_store_user_error(error: StoreError) -> CommandError {
     match error {
-        StoreError::QuotaExceeded { used, .. } => CommandError::user(format!(
+        StoreError::QuotaExceeded { used, limit, .. } => CommandError::user(format!(
             "本群图库容量不足（已用 {} / {}）",
             format_bytes(used),
-            format_bytes(MAX_GROUP_BYTES)
+            format_bytes(limit)
         )),
         StoreError::LibraryMissing => CommandError::user("库不存在"),
         StoreError::ImageMissing => CommandError::user("没有这张图"),

@@ -23,3 +23,12 @@ title = "今日词云"
 cron = "0 10 * * 6"
 days = 7
 title = "上周词云"
+
+[image_lib]
+# 每个群的图库总容量上限，单位 MiB（1 MiB = 1024 KiB）。
+max_group_mib = 500
+# 单张图片大小上限，单位 MiB。
+max_image_mib = 15
+# 「来只」滑动窗口限流：窗口长度（秒）和窗口内最多抽取次数。
+draw_window_secs = 60
+draw_max_per_window = 5
