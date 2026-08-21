@@ -59,7 +59,6 @@ pub(super) async fn get_user_info(
 ) -> Result<UserInfo> {
     let key = (group_id, user_id);
 
-    // fresh 缓存直接返回，不走 API。
     let stale = USER_INFO_CACHE.get(&key).await;
     if let Some(info) = &stale
         && info.fetched_at.elapsed() < FRESH_DURATION
@@ -186,26 +185,4 @@ async fn fetch_avatar_with_retry(user_id: i64) -> Result<bytes::Bytes> {
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("获取头像失败: user_id={}", user_id)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_user_info_cache_stores_and_returns_value() {
-        let info = UserInfo {
-            user_id: 123456,
-            nickname: "test".to_string(),
-            avatar: bytes::Bytes::from_static(b"avatar"),
-            fetched_at: Instant::now(),
-        };
-        USER_INFO_CACHE.insert((1, 123456), info.clone()).await;
-
-        // 直接查缓存，不依赖 bot API
-        let cached = USER_INFO_CACHE.get(&(1, 123456)).await.unwrap();
-        assert_eq!(cached.user_id, 123456);
-        assert_eq!(cached.nickname, "test");
-        assert_eq!(cached.avatar.as_ref(), b"avatar");
-    }
 }

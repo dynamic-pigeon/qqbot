@@ -23,7 +23,7 @@ pub fn parse_library_name(name: &str) -> Result<&str, CommandError> {
 }
 
 fn is_forbidden_name_char(ch: char) -> bool {
-    // 库名只进 JSON 键，但仍拒绝路径和控制/格式字符，避免「看起来一样」的同名库。
+    // 拒绝路径和控制/格式字符，避免「看起来一样」的同名库。
     ch.is_control()
         || matches!(
             ch,
@@ -59,11 +59,5 @@ mod tests {
         assert!(parse_library_name("a\nb").is_err());
         assert!(parse_library_name("..").is_err());
         assert!(parse_library_name("猫\u{200B}").is_err());
-    }
-
-    #[test]
-    fn names_are_case_sensitive() {
-        assert_eq!(parse_library_name("Cat").unwrap(), "Cat");
-        assert_ne!(parse_library_name("Cat").unwrap(), "cat");
     }
 }

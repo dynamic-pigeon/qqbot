@@ -1,18 +1,9 @@
-//! Integration tests for `utils::safe_url` URL validation (SSRF defense).
-//!
-//! 覆盖范围：
-//! - 白名单内的 host 应该被接受（含子域名后缀匹配）
-//! - 非白名单 host / 非 https scheme / 畸形输入 应该被拒绝
-//! - 开启私网保护时，私有 IP（IPv4 10/8、172.16/12、192.168/16、169.254/16、loopback、unspecified、
-//!   broadcast、multicast；IPv6 loopback、unique-local、link-local、IPv4-mapped IPv6）
-//!   应该被拒绝，防止攻击者用公网域名解析到内网 IP 后访问内部服务。
-//! - 关闭私网保护时，显式位于白名单的私网地址可以通过基础校验。
+//! `utils::safe_url` 的 SSRF 校验：白名单 host、非 https / 畸形输入拒绝，
+//! 以及私网保护开关对字面 IP 的处理。
 
 use utils::safe_url::{is_public_ip, validate_image_url, validate_image_url_with_options};
 
-/// 测试用 host 白名单。`utils` 只暴露校验机制（mechanism），
-/// 不再持有具体 host 列表（policy 在调用方）；
-/// 这里用一组样本数据覆盖 validator 的 hostname 匹配逻辑。
+/// 校验机制不绑定具体业务域名，这里用一组样本覆盖 hostname 匹配。
 const TEST_HOSTS: &[&str] = &[
     "gchat.qpic.cn",
     "multimedia.nt.qq.com.cn",

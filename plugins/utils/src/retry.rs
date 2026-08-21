@@ -138,7 +138,6 @@ mod tests {
 
     #[tokio::test]
     async fn retry_async_with_backoff_retries_until_success() {
-        // 前两次失败、第三次成功：总调用 3 次并返回成功值
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let result = retry_async_with_backoff(
             {
@@ -162,7 +161,6 @@ mod tests {
 
     #[tokio::test]
     async fn retry_async_with_backoff_gives_up_after_retries() {
-        // 持续失败：retries=2 时总调用 3 次（1 次尝试 + 2 次重试）后返回错误
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let result = retry_async_with_backoff(
             {

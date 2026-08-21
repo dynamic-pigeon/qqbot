@@ -100,13 +100,7 @@ impl OcrMemory {
 /// 未配置腾讯云时跳过的告警只报一次，避免每条图片消息刷日志。
 static OCR_MISSING_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// 对图片URL进行OCR识别
-///
-/// # 参数
-/// * `img_url` - 图片的URL地址（必须通过 [`utils::validate_image_url_async`] 校验）
-///
-/// # 返回
-/// * `Result<Arc<String>>` - OCR识别的文本结果；未配置腾讯云时返回空串
+/// 对已校验过的图片 URL 做 OCR。未配置腾讯云时返回空串。
 pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
     // 未配置腾讯云时直接短路，不为注定失败的识别下载原图。
     if !ocr_config().is_configured() {
@@ -122,7 +116,6 @@ pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
     Ok(result)
 }
 
-/// 从URL获取图片
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
     let bytes = utils::download_image_limited(
         img_url,
@@ -134,12 +127,8 @@ async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
     Ok(bytes::Bytes::from(bytes))
 }
 
-/// SHA256哈希并转换为十六进制字符串
 fn sha256_hex(data: &bytes::Bytes) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     crate::hex_encode(&hasher.finalize())
 }
-
-// OCR URL 校验的 SSRF 防御测试已迁移至 `tests/ocr_validation.rs`（integration test）。
-// 该函数在 `lib.rs` 中通过 `pub use` 重新导出，作为公开 API 在 integration test 中验证。

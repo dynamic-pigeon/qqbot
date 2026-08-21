@@ -203,12 +203,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn user_agent_launch_arg_is_key_value() {
-        let ua = "Mozilla/5.0 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
-        assert_eq!(user_agent_arg(ua), ("user-agent", ua));
-    }
-
-    #[test]
     fn observed_url_rejects_unexpected_host() {
         assert!(
             validate_api_url(

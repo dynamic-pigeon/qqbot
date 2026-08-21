@@ -15,7 +15,7 @@ pub(crate) async fn download_bili_image(
 }
 
 fn normalize_bili_image_url(url: &str) -> Result<reqwest::Url> {
-    // Bilibili 部分旧接口仍返回 HTTP CDN 地址；对应 CDN 支持 HTTPS。
+    // 部分接口返回 HTTP 或协议相对 CDN 地址，对应 CDN 支持 HTTPS，统一升到 https。
     let url = if url.starts_with("//") {
         format!("https:{url}")
     } else {

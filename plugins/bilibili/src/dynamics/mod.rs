@@ -305,14 +305,13 @@ pub fn count_pics_total(item: &DynamicItem) -> usize {
 }
 
 /// 构造推送文本。
-/// 投稿视频专用格式：`<name> 投稿了视频：<title>` + 可选 summary + URL，封面作为图片附件由 `push_dynamic` 发送；
-/// 其他类型沿用 `header + summary + url` 的旧格式。
 ///
-/// 健壮性：
-/// - `author.name` 为空时回退到 `author.pub_action`；
-/// - `author.name` 与 `author.pub_action` 同时为空时直接省略 header（避免裸冒号 / leading blank line）；
-/// - Video 标题为空时回退到 summary 文本（避免出现 " 投稿了视频：\nurl" 这类裸冒号）；
-/// - Video 描述（summary.text）始终作为附加段保留，不再被吞掉。
+/// 视频：`{作者} 投稿了视频：{标题}`，后接简介和链接。
+/// 其他类型：作者 header + 摘要 + 链接。
+///
+/// - `author.name` 为空时用 `pub_action`；两者都空则省略 header，避免裸冒号。
+/// - 视频标题为空时用简介代替，避免 `投稿了视频：` 后没有标题。
+/// - 视频简介始终单独成段。
 pub fn format_body(author: &DynamicAuthor, item: &DynamicItem) -> String {
     if let DynamicItem::Video { title, summary, .. } = item {
         let summary_text = summary.as_ref().map(|s| s.text.as_str()).unwrap_or("");
@@ -450,10 +449,9 @@ pub fn format_summary(item: &DynamicItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kovi::tokio;
 
-    #[tokio::test]
-    async fn last_seen_populates_on_first_poll() {
+    #[test]
+    fn dynamic_id_numeric_parses_video_and_article() {
         let v = DynamicItem::Video {
             id: "12345".into(),
             bvid: String::new(),

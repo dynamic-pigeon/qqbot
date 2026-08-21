@@ -276,7 +276,7 @@ impl Command {
     }
 
     /// 子命令仍挂在父节点下，同时允许不带父路径按根命令匹配。
-    /// 帮助目录只展示父命令，调用方式可以保持原来的短命令。
+    /// 帮助目录只展示父命令。
     pub fn expose_as_root(mut self) -> Self {
         self.expose_as_root = true;
         self

@@ -35,8 +35,7 @@ fn restrict_sensitive_file(_path: impl AsRef<std::path::Path>) {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 加载 .env 文件（如存在）；系统环境变量优先级高于 .env。
-    // dotenvy 默认在当前目录及向上查找 .env 文件。
+    // 系统环境变量优先于 .env；dotenvy 从当前目录向上查找。
     let _ = dotenvy::dotenv();
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -94,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let driver_config = load_local_conf()?;
     let driver = OneBotDriver::new(driver_config);
 
-    // 由应用统一安装 tracing subscriber，Kovi 不再重复注册全局 logger。
+    // 应用已安装 tracing subscriber，关掉 Kovi 的全局 logger，避免重复注册。
     let kovi_config = kovi::load_local_conf()?;
     let mut bot = kovi::Bot::build(kovi_config, driver);
     let plugin_set = kovi::plugins!(

@@ -245,8 +245,7 @@ async fn fetch_living_status(uids: &[u64]) -> anyhow::Result<HashMap<u64, LiveRo
 mod tests {
     use kovi::tokio;
 
-    // 依赖公网网络 + B 站 API 实际响应，CI/本地都不稳定。
-    // 手动回归时 `cargo test -- --ignored` 跑。
+    // 依赖公网 B 站 API；本地用 `cargo test -- --ignored`。
     #[tokio::test]
     #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
     async fn test_check_uid() {

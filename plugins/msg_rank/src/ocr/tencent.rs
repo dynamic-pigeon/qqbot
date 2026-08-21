@@ -1,5 +1,4 @@
-// 腾讯云API签名v3 Rust实现
-// 本代码基于腾讯云API签名v3文档实现: https://cloud.tencent.com/document/product/213/30654
+// 腾讯云 API 签名 v3：https://cloud.tencent.com/document/product/213/30654
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -12,27 +11,23 @@ use crate::{HTTP_CLIENT, hex_encode};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 获取UTC日期字符串 (YYYY-MM-DD格式)
 fn get_date(timestamp: i64) -> String {
     let dt = DateTime::<Utc>::from_timestamp(timestamp, 0).unwrap();
     dt.format("%Y-%m-%d").to_string()
 }
 
-/// SHA256哈希并转换为十六进制字符串
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
     hex_encode(hasher.finalize().as_slice())
 }
 
-/// HMAC-SHA256计算
 fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
 
-/// 执行腾讯云OCR API调用
 pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     let config = super::ocr_config();
     let secret_id = config.secret_id.as_str();

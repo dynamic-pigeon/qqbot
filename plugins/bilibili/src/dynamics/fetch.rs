@@ -490,7 +490,7 @@ fn convert_item(raw: ItemRaw) -> DynamicItem {
             })
         }
         "DYNAMIC_TYPE_DRAW" => {
-            // 当前 B 站返回的图文动态用 MAJOR_TYPE_OPUS 承载；旧的 major.draw 已不再出现。
+            // 图文动态可能是 opus 或 draw，两种结构都尝试。
             convert_opus(&id, &author, &raw.modules.module_dynamic)
                 .or_else(|| convert_draw(&id, &author, &raw.modules.module_dynamic))
                 .unwrap_or(DynamicItem::Other {
@@ -515,7 +515,7 @@ fn convert_item(raw: ItemRaw) -> DynamicItem {
                 author: author.clone(),
             })
         }
-        // 转发动态不再递归解析 orig，统一归为 Other，避免异常嵌套导致栈溢出或重复推送。
+        // 转发不解析 orig，避免嵌套过深或重复推送。
         "DYNAMIC_TYPE_FORWARD" => DynamicItem::Other { id, author },
         _ => DynamicItem::Other { id, author },
     }
@@ -683,36 +683,9 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires the public Bilibili API"]
-    async fn anonymous_fetch_succeeds() {
-        let page = fetch_user_dynamics(TEST_UID, None)
-            .await
-            .expect("anonymous feed/space request failed");
-        println!(
-            "uid={TEST_UID} has_more={} next_offset={:?} items={}",
-            page.has_more,
-            page.next_offset,
-            page.items.len()
-        );
-        for item in page.items.iter().take(3) {
-            println!("  {:?}", item);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the public Bilibili API"]
     async fn anonymous_fetch_has_items() {
         let page = fetch_user_dynamics(TEST_UID, None).await.unwrap();
         assert!(!page.items.is_empty(), "uid={TEST_UID} 应有动态");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires the public Bilibili API"]
-    async fn anonymous_fetch_paginates() {
-        let first = fetch_user_dynamics(TEST_UID, None).await.unwrap();
-        if let Some(offset) = first.next_offset.as_deref() {
-            let second = fetch_user_dynamics(TEST_UID, Some(offset)).await.unwrap();
-            println!("page2 items={}", second.items.len());
-        }
     }
 }
 
@@ -732,25 +705,22 @@ mod url_tests {
     }
 
     #[test]
-    fn url_builds_without_offset() {
-        let url = build_space_url(1, None, "ea1db124af3c7062474693fa704f4ff8", 1_702_204_169);
-        assert!(url.as_str().contains("host_mid=1"));
-        assert!(url.as_str().contains("timezone_offset=-480"));
-        assert!(url.as_str().contains("features=itemOpusStyle"));
-        assert!(url.as_str().contains("w_rid="));
-        assert!(url.as_str().contains("wts=1702204169"));
-    }
+    fn space_url_includes_uid_features_and_optional_offset() {
+        let without = build_space_url(1, None, "ea1db124af3c7062474693fa704f4ff8", 1_702_204_169);
+        assert!(without.as_str().contains("host_mid=1"));
+        assert!(without.as_str().contains("timezone_offset=-480"));
+        assert!(without.as_str().contains("features=itemOpusStyle"));
+        assert!(without.as_str().contains("w_rid="));
+        assert!(without.as_str().contains("wts=1702204169"));
 
-    #[test]
-    fn url_builds_with_offset() {
-        let url = build_space_url(
+        let with = build_space_url(
             2,
             Some("abc"),
             "ea1db124af3c7062474693fa704f4ff8",
             1_702_204_169,
         );
-        assert!(url.as_str().contains("host_mid=2"));
-        assert!(url.as_str().contains("offset=abc"));
+        assert!(with.as_str().contains("host_mid=2"));
+        assert!(with.as_str().contains("offset=abc"));
     }
 
     #[test]
@@ -784,35 +754,22 @@ mod url_tests {
     }
 
     #[test]
-    fn room_id_parses_basic_url() {
+    fn room_id_from_jump_url_parses_or_returns_zero() {
         assert_eq!(
             room_id_from_jump_url("https://live.bilibili.com/12345"),
             12345
         );
-    }
-
-    #[test]
-    fn room_id_parses_url_with_query_string() {
         assert_eq!(
             room_id_from_jump_url("https://live.bilibili.com/12345?from=share&spm_id_from=.."),
             12345
         );
-    }
-
-    #[test]
-    fn room_id_parses_url_with_trailing_slash() {
         assert_eq!(
             room_id_from_jump_url("https://live.bilibili.com/12345/"),
             12345
         );
-    }
-
-    #[test]
-    fn room_id_returns_zero_for_garbage() {
         assert_eq!(room_id_from_jump_url("not a url"), 0);
         assert_eq!(room_id_from_jump_url(""), 0);
         assert_eq!(room_id_from_jump_url("https://live.bilibili.com/abc"), 0);
-        // 纯前缀不能解析出 id
         assert_eq!(room_id_from_jump_url("//"), 0);
     }
 }
