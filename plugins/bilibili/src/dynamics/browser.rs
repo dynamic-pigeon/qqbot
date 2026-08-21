@@ -60,6 +60,8 @@ impl BrowserManager {
             .arg("--mute-audio")
             .arg("--password-store=basic")
             .arg("--use-mock-keychain")
+            // B 站风控认 UA；headless 默认带 HeadlessChrome，和 HTTP 直连指纹不一致。
+            .arg(user_agent_arg(super::fetch::user_agent()))
             .build()
             .map_err(anyhow::Error::msg)?;
         let (browser, mut handler) =
@@ -95,6 +97,9 @@ async fn fetch_with_browser(browser: &Browser, uid: u64, offset: Option<&str>) -
     // 关闭 tab（chromiumoxide 的 Page 没有 Drop 自动关闭），否则风控期反复
     // 超时会在浏览器里累积僵尸 tab。
     let operation = tokio::time::timeout(BROWSER_REQUEST_TIMEOUT, async {
+        // 启动参数覆盖进程默认 UA；tab 上再 CDP override，保证 goto 发出的
+        // 空间页请求和 navigator.userAgent 都用同一份 BILIBILI_USER_AGENT。
+        page.set_user_agent(super::fetch::user_agent()).await?;
         for attempt in 0..2 {
             match capture_dynamic_body(&page, uid, offset).await {
                 Ok(body) => return Ok(body),
@@ -170,6 +175,12 @@ async fn capture_dynamic_body(
     anyhow::bail!("目标动态 API 响应未完成")
 }
 
+/// chromiumoxide 把 `From<&str>` 当成无值 flag（再拼一层 `--`），
+/// UA 必须用 key/value，否则 `--user-agent=...` 会变成非法启动参数。
+fn user_agent_arg(ua: &str) -> (&str, &str) {
+    ("user-agent", ua)
+}
+
 fn validate_api_url(observed: &str, uid: u64, offset: Option<&str>) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(observed).context("浏览器动态 API URL 无效")?;
     if url.scheme() != "https"
@@ -190,6 +201,12 @@ fn validate_api_url(observed: &str, uid: u64, offset: Option<&str>) -> Result<re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_agent_launch_arg_is_key_value() {
+        let ua = "Mozilla/5.0 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+        assert_eq!(user_agent_arg(ua), ("user-agent", ua));
+    }
 
     #[test]
     fn observed_url_rejects_unexpected_host() {
