@@ -1,5 +1,6 @@
 mod bounded_pool;
 pub mod command;
+pub mod config;
 mod markdown;
 mod rate_limit;
 mod rcu;

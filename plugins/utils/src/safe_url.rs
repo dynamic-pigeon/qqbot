@@ -34,19 +34,19 @@ static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
-    let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) else {
-        return false;
-    };
-
-    match parse_env_bool(&value) {
-        Some(enabled) => enabled,
-        None => {
-            tracing::warn!(
-                "{PRIVATE_NETWORK_PROTECTION_ENV}={value:?} 无效，私网保护保持关闭；可用值: true/false, 1/0, yes/no, on/off"
-            );
-            false
+    if let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) {
+        match parse_env_bool(&value) {
+            Some(enabled) => return enabled,
+            None => tracing::warn!(
+                "{PRIVATE_NETWORK_PROTECTION_ENV}={value:?} 无效，回退到 config.toml；可用值: true/false, 1/0, yes/no, on/off"
+            ),
         }
     }
+    crate::config::value()
+        .get("network")
+        .and_then(|v| v.get("private_network_protection"))
+        .and_then(crate::config::Value::as_bool)
+        .unwrap_or(false)
 });
 
 fn parse_env_bool(value: &str) -> Option<bool> {
@@ -57,7 +57,9 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
-/// 是否启用私网保护。默认关闭，可通过 `PRIVATE_NETWORK_PROTECTION=true` 启用。
+/// 是否启用私网保护。
+///
+/// 优先级：环境变量 `PRIVATE_NETWORK_PROTECTION` > 根目录 `config.toml` > 默认关闭。
 pub fn private_network_protection_enabled() -> bool {
     *PRIVATE_NETWORK_PROTECTION
 }
@@ -274,9 +276,9 @@ async fn resolve_public_addrs(url: &str) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-/// 异步校验图片 URL，私网保护策略由 `PRIVATE_NETWORK_PROTECTION` 决定。
+/// 异步校验图片 URL，私网保护策略由 `private_network_protection_enabled` 决定。
 ///
-/// 环境变量未设置时默认关闭私网地址校验和 DNS pinning。
+/// 未设置环境变量且 `config.toml` 未开启时，关闭私网地址校验和 DNS pinning。
 pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Result<()> {
     validate_image_url_async_with_options(url, allowed_hosts, private_network_protection_enabled())
         .await

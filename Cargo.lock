@@ -485,6 +485,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "utils",
  "wordle",
  "yu_gi_oh",
 ]
@@ -4501,8 +4502,10 @@ dependencies = [
  "kovi-onebot",
  "pulldown-cmark",
  "reqwest",
+ "serde",
  "thiserror 2.0.20",
  "tokio",
+ "toml",
  "tracing",
 ]
 

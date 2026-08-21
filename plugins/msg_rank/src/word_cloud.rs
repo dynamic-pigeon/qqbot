@@ -82,9 +82,8 @@ const WORDCLOUD_SCALE: u32 = 2;
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
 const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
-/// 词云生成全局串行：单次生成要加载词典和字体并布局整张画布，
-/// 并发生成会让内存峰值成倍叠加。
-static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(1));
+static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> =
+    LazyLock::new(|| utils::BoundedPool::new(crate::config::static_config().wordcloud_concurrency));
 
 /// Python wordcloud 默认 viridis 配色。
 const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
@@ -101,42 +100,28 @@ const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
 ];
 
 pub(crate) async fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
-    let bot_ = Arc::clone(&bot);
-    let path_ = Arc::clone(&path);
-    plugin::cron("0 21 * * *", move || {
-        let path = &path_;
-        let bot = &bot_;
-        let config = read_config();
-        let notify_group = &config.notify_group;
-
-        for &group_id in notify_group {
-            let bot = Arc::clone(bot);
-            let path = Arc::clone(path);
-            kovi::spawn(async move {
-                send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "今日词云").await;
-            });
-        }
-        async move {}
-    })
-    .unwrap();
-    let bot_ = Arc::clone(&bot);
-    let path_ = Arc::clone(&path);
-    plugin::cron("0 10 * * 6", move || {
-        let path = &path_;
-        let bot = &bot_;
-        let config = read_config();
-        let notify_group = &config.notify_group;
-
-        for &group_id in notify_group {
-            let bot = Arc::clone(bot);
-            let path = Arc::clone(path);
-            kovi::spawn(async move {
-                send_word_cloud(&bot, group_id, &path, chrono::Duration::days(7), "上周词云").await;
-            });
-        }
-        async move {}
-    })
-    .unwrap();
+    for schedule in &crate::config::static_config().wordcloud {
+        let bot = Arc::clone(&bot);
+        let path = Arc::clone(&path);
+        let days = schedule.days;
+        let title = schedule.title.clone();
+        plugin::cron(&schedule.cron, move || {
+            let path = &path;
+            let bot = &bot;
+            let config = read_config();
+            for &group_id in &config.notify_group {
+                let bot = Arc::clone(bot);
+                let path = Arc::clone(path);
+                let title = title.clone();
+                kovi::spawn(async move {
+                    send_word_cloud(&bot, group_id, &path, chrono::Duration::days(days), &title)
+                        .await;
+                });
+            }
+            async move {}
+        })
+        .unwrap();
+    }
     Ok(())
 }
 

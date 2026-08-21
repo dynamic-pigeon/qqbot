@@ -8,6 +8,7 @@ docs/superpowers/
 CLAUDE.md
 .env
 .env.local
+config.toml
 .DS_Store
 **/.DS_Store
 .cargo/
