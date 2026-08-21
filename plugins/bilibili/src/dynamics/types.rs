@@ -16,7 +16,7 @@ pub enum DynamicItem {
         summary: Option<RichText>,
         author: DynamicAuthor,
     },
-    /// 新版 B 站动态主体结构（`MAJOR_TYPE_OPUS`）。DRAW/Word 等图文动态目前都用这个。
+    /// 图文主体（`MAJOR_TYPE_OPUS`）；DRAW/Word 都走这个变体。
     Opus {
         id: String,
         title: String,
@@ -46,8 +46,7 @@ pub enum DynamicItem {
         room_id: i64,
         author: DynamicAuthor,
     },
-    /// B 站返回了不在已知类型表里的 major_type / dynamic_type（含转发动态）；
-    /// 保留动态 id + 作者供排查，不再递归解析内部内容。
+    /// 未知 `major_type` / `dynamic_type`（含转发）。只保留 id 和作者，避免解析未知结构时嵌套过深。
     Other { id: String, author: DynamicAuthor },
 }
 

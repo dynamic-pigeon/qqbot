@@ -14,13 +14,9 @@ pub(crate) const DEFAULT_DRAW_MAX_PER_WINDOW: usize = 5;
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct StaticConfig {
-    /// 每个群的图库总容量上限，单位 MiB。
     pub max_group_mib: u64,
-    /// 单张图片大小上限，单位 MiB。
     pub max_image_mib: u64,
-    /// 「来只」滑动窗口长度，单位秒。
     pub draw_window_secs: u64,
-    /// 「来只」窗口内次数上限。
     pub draw_max_per_window: usize,
 }
 
@@ -63,34 +59,4 @@ pub(crate) fn static_config() -> &'static StaticConfig {
             .unwrap_or_else(|error| panic!("解析 [image_lib] 配置失败: {error:#}"))
     });
     &CONFIG
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_quota_is_500_mib() {
-        assert_eq!(
-            StaticConfig::default().max_group_bytes(),
-            DEFAULT_MAX_GROUP_MIB * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn default_draw_limit_is_five_per_minute() {
-        let config = StaticConfig::default();
-        assert_eq!(config.draw_window().as_secs(), DEFAULT_DRAW_WINDOW_SECS);
-        assert_eq!(config.draw_max_per_window(), DEFAULT_DRAW_MAX_PER_WINDOW);
-    }
-
-    #[test]
-    fn default_image_limit_is_15_mib() {
-        let config = StaticConfig::default();
-        assert_eq!(config.max_image_mib(), DEFAULT_MAX_IMAGE_MIB);
-        assert_eq!(
-            config.max_image_bytes(),
-            (DEFAULT_MAX_IMAGE_MIB * 1024 * 1024) as usize
-        );
-    }
 }

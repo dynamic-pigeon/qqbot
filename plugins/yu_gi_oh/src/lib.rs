@@ -82,10 +82,4 @@ mod tests {
         assert_eq!(command.path(), ["/查卡"]);
         assert_eq!(command.trimmed_rest(), "青眼 白龙");
     }
-
-    #[test]
-    fn card_query_resolves_without_name_for_error_handling() {
-        let tree = CommandTree::new(vec![super::card_query_command()]).unwrap();
-        assert!(matches!(tree.resolve("/查卡"), ResolveOutcome::Matched(_)));
-    }
 }

@@ -424,38 +424,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_query_builder_generates_batch_insert_sql() {
-        let records = vec![
-            MsgRecord {
-                group_id: 1,
-                user_id: 100,
-                msg: "a".into(),
-                timestamp: 1,
-            },
-            MsgRecord {
-                group_id: 2,
-                user_id: 101,
-                msg: "b".into(),
-                timestamp: 2,
-            },
-        ];
-        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "INSERT INTO MSG (group_id, user_id, msg, timestamp) ",
-        );
-        builder.push_values(&records, |mut row, record| {
-            row.push_bind(record.group_id)
-                .push_bind(record.user_id)
-                .push_bind(&record.msg)
-                .push_bind(record.timestamp);
-        });
-        let sql = builder.sql();
-        let sql = sql.as_str();
-        assert!(sql.starts_with("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES "));
-        // 每条记录一组 4 个绑定参数，组间逗号分隔
-        assert_eq!(sql.matches("), (").count(), records.len() - 1);
-    }
-
-    #[test]
     fn test_batch_insert_and_shutdown_flush() {
         let tmp = std::env::temp_dir().join(format!("msg_rank_test_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&tmp);

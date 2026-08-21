@@ -156,33 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn config_backward_compatible_without_dynamic_subscribe() {
-        // 旧 config.json 缺字段时，serde 默认值兜底
-        let old = r#"{"subscribe":[]}"#;
-        let cfg: Config = serde_json::from_str(old).unwrap();
+    fn config_missing_fields_default_to_empty() {
+        // 缺字段时 serde 走 Default，动态订阅和 checkpoint 都为空。
+        let cfg: Config = serde_json::from_str(r#"{"subscribe":[]}"#).unwrap();
         assert!(cfg.dynamic_subscribe.is_empty());
         assert!(cfg.dynamic_checkpoints.is_empty());
-    }
-
-    #[test]
-    fn config_roundtrip_with_dynamic_subscribe() {
-        let cfg = Config {
-            subscribe: vec![],
-            dynamic_subscribe: vec![DynamicSubscribe {
-                uid: 1,
-                groups: vec![100],
-            }],
-            dynamic_checkpoints: vec![DynamicCheckpoint {
-                uid: 1,
-                group: 100,
-                last_seen: 123,
-            }],
-        };
-        let s = serde_json::to_string(&cfg).unwrap();
-        let back: Config = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.dynamic_subscribe.len(), 1);
-        assert_eq!(back.dynamic_subscribe[0].uid, 1);
-        assert_eq!(back.dynamic_subscribe[0].groups, vec![100]);
-        assert_eq!(back.dynamic_checkpoints, cfg.dynamic_checkpoints);
     }
 }

@@ -1,11 +1,9 @@
 use std::path::PathBuf;
 
-/// 生成把 KaTeX woff2 字体内联成 data URI 的 CSS。
+/// 把 KaTeX woff2 内联成 data URI。
 ///
-/// 原 `katex.min.css` 通过 `url(fonts/KaTeX_*.woff2)` 引用外部字体；在 CSP
-/// `font-src 'none'` 或 `about:blank` 相对路径下都无法加载，导致数学公式
-/// 渲染为缺失字形。构建时把 woff2 字体 base64 进 CSS，使字体自包含，只依赖
-/// `font-src 'self' data:`。
+/// 截图页 CSP 为 `font-src 'self' data:`，且 HTML 在 `about:blank` 打开，
+/// 外部 `url(fonts/KaTeX_*.woff2)` 无法加载。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR must be set")?);
     let manifest_dir = PathBuf::from(

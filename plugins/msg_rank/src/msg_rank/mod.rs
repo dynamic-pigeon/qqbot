@@ -58,7 +58,6 @@ fn today_time_range() -> (i64, i64) {
         .unwrap();
 
     let start_timestamp = today_start.timestamp();
-    // 其实用啥都行，反正只要能保证时间范围是24小时就行了
     let end_timestamp = start_timestamp + 24 * 3600;
 
     (start_timestamp, end_timestamp)
@@ -70,7 +69,6 @@ pub async fn gen_daily_rank_html(bot: &RuntimeBot, group_id: i64) -> Result<Stri
     gen_rank_html_with_time_range(bot, group_id, start_timestamp, end_timestamp, 5).await
 }
 
-/// 生成时间范围发言排行 HTML
 pub async fn gen_rank_html_with_time_range(
     bot: &RuntimeBot,
     group_id: i64,
@@ -98,7 +96,6 @@ pub async fn gen_rank_html_with_time_range(
                 Ok(info) => (info, cnt),
                 Err(e) => {
                     tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
-                    // 使用 user_id 作为昵称占位
                     (
                         user_info::UserInfo {
                             user_id,

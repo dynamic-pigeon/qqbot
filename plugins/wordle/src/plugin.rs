@@ -46,7 +46,6 @@ async fn word_list() -> Result<std::sync::Arc<WordList>, anyhow::Error> {
         .cloned()
 }
 
-/// 注册 /wordle 命令树（由 lib.rs 的插件入口调用）。
 pub async fn run() {
     let bot = plugin::get_runtime_bot();
     CommandRouter::new("wordle", bot)
@@ -91,7 +90,6 @@ async fn handle_start(ctx: CommandContext) -> CommandResult {
         return Err(CommandError::user("本群已有一局进行中，先把它猜完吧"));
     }
     let game = if hard {
-        // 严格模式：答案池作为候选，答案随猜测动态变化。
         Game::new_adversarial(words.answers.clone())
     } else {
         Game::new(pick_answer(&words.answers, rand::random()).to_owned())

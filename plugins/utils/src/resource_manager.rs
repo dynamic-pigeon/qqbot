@@ -87,8 +87,6 @@ impl<T: Send + Sync + 'static> Clone for ResourceManager<T> {
 }
 
 impl<T: Send + Sync + 'static> ResourceManager<T> {
-    /// 创建资源管理器。
-    ///
     /// `builder` 仅在缓存中没有资源时执行；构建失败不会被缓存，后续调用会重试。
     /// `idle_timeout` 从最后一个 lease 释放时开始计算。
     pub fn new<B, Fut>(idle_timeout: Duration, builder: B) -> Self
@@ -559,7 +557,7 @@ mod tests {
         let new_lease = manager.replace(old).await.unwrap();
 
         assert_eq!(*new_lease, 42);
-        // 销毁回调在 replace 返回前已完成，而不是异步触发后无人等待。
+        // replace 返回时销毁回调已跑完。
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
         assert!(manager.is_initialized());
     }

@@ -188,13 +188,12 @@ mod tests {
         let img = image::load_from_memory(&render_board_png(&started_game()))
             .unwrap()
             .to_rgba8();
-        // 已猜行应存在白色字母像素（背景是色块，白色只可能来自字母）
+        // 已猜行的白色像素只可能来自字母（底是色块）。
         assert!(count_pixels(&img, WHITE) > 0, "应绘制白色字母");
-        // 空盘无任何白色像素（纯白背景的格子 + 灰边框，中央无字母）
         let empty = image::load_from_memory(&render_board_png(&Game::new("crane".to_owned())))
             .unwrap()
             .to_rgba8();
-        // 空盘里 WHITE 像素当然大量存在（背景），改用中心点判断：空盘格子中心应仍是白（无字母）
+        // 空盘格子中心是白底，没有字母笔画。
         assert_eq!(center_color(&empty, 0, 0), WHITE);
     }
 }

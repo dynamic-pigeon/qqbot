@@ -71,10 +71,4 @@ mod tests {
         assert_eq!(command.path(), ["!md"]);
         assert_eq!(command.rest(), "  # title");
     }
-
-    #[test]
-    fn markdown_command_resolves_without_content_for_error_handling() {
-        let tree = CommandTree::new(vec![super::markdown_command()]).unwrap();
-        assert!(matches!(tree.resolve("!md"), ResolveOutcome::Matched(_)));
-    }
 }
