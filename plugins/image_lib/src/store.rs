@@ -12,12 +12,14 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-pub const MAX_GROUP_BYTES: u64 = 500 * 1024 * 1024;
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("本群图库容量不足")]
-    QuotaExceeded { used: u64, additional: u64 },
+    QuotaExceeded {
+        used: u64,
+        additional: u64,
+        limit: u64,
+    },
     #[error("库不存在")]
     LibraryMissing,
     #[error("没有这张图")]
@@ -80,10 +82,10 @@ pub struct PreparedImage {
 
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
-        Self::open_with_quota(root, MAX_GROUP_BYTES)
+        Self::open_with_quota(root, crate::config::static_config().max_group_bytes())
     }
 
-    fn open_with_quota(root: PathBuf, max_group_bytes: u64) -> Result<Self> {
+    pub(crate) fn open_with_quota(root: PathBuf, max_group_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("创建图库目录失败: {}", root.display()))?;
         Ok(Self {
@@ -92,6 +94,10 @@ impl Store {
             locks: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn max_group_bytes(&self) -> u64 {
+        self.max_group_bytes
     }
 
     fn group_lock(&self, group_id: i64) -> Arc<kovi::tokio::sync::Mutex<()>> {
@@ -274,6 +280,7 @@ impl Store {
                         return Err(StoreError::QuotaExceeded {
                             used: used.saturating_sub(created_bytes),
                             additional: created_bytes,
+                            limit: max_group_bytes,
                         });
                     }
 
@@ -640,7 +647,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("image_lib_store_{}_{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        (Store::open(dir.clone()).unwrap(), dir)
+        (
+            Store::open_with_quota(
+                dir.clone(),
+                crate::config::DEFAULT_MAX_GROUP_MIB * 1024 * 1024,
+            )
+            .unwrap(),
+            dir,
+        )
     }
 
     fn png_like(tag: u8) -> Vec<u8> {

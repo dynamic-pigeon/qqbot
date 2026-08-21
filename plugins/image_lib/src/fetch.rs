@@ -7,7 +7,6 @@ use anyhow::{Context, Result, anyhow};
 use kovi::{Message, Segment};
 use serde_json::Value;
 
-pub const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 pub const MAX_ADD_IMAGES: usize = 10;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -30,8 +29,8 @@ pub enum FetchError {
     TooManyImages,
     #[error("请只回复一张图")]
     ExpectSingleImage,
-    #[error("单张图片不能超过 {} MiB", MAX_IMAGE_BYTES / 1024 / 1024)]
-    TooLarge,
+    #[error("单张图片不能超过 {limit_mib} MiB")]
+    TooLarge { limit_mib: u64 },
     #[error("有图片未能读取")]
     Unreadable,
 }
@@ -144,9 +143,19 @@ fn local_file_path(segment: &Segment) -> Option<PathBuf> {
     Some(path.to_path_buf())
 }
 
+fn max_image_bytes() -> usize {
+    crate::config::static_config().max_image_bytes()
+}
+
+fn too_large() -> FetchError {
+    FetchError::TooLarge {
+        limit_mib: crate::config::static_config().max_image_mib(),
+    }
+}
+
 async fn download_remote(url: &str) -> Result<Vec<u8>, FetchError> {
     let bytes =
-        utils::download_image_limited(url, ALLOWED_QQ_HOSTS, MAX_IMAGE_BYTES, DOWNLOAD_TIMEOUT)
+        utils::download_image_limited(url, ALLOWED_QQ_HOSTS, max_image_bytes(), DOWNLOAD_TIMEOUT)
             .await
             .map_err(map_download_error)?;
     ensure_image_bytes(&bytes)?;
@@ -156,27 +165,28 @@ async fn download_remote(url: &str) -> Result<Vec<u8>, FetchError> {
 fn map_download_error(error: anyhow::Error) -> FetchError {
     let text = error.to_string();
     if text.contains("超过大小上限") || text.contains("超过") {
-        FetchError::TooLarge
+        too_large()
     } else {
         FetchError::Unreadable
     }
 }
 
 async fn read_local_limited(path: &Path) -> Result<Vec<u8>, FetchError> {
+    let max_bytes = max_image_bytes();
     let meta = kovi::tokio::fs::metadata(path)
         .await
         .map_err(|_| FetchError::Unreadable)?;
     if !meta.is_file() {
         return Err(FetchError::Unreadable);
     }
-    if meta.len() > MAX_IMAGE_BYTES as u64 {
-        return Err(FetchError::TooLarge);
+    if meta.len() > max_bytes as u64 {
+        return Err(too_large());
     }
     let bytes = kovi::tokio::fs::read(path)
         .await
         .map_err(|_| FetchError::Unreadable)?;
-    if bytes.len() > MAX_IMAGE_BYTES {
-        return Err(FetchError::TooLarge);
+    if bytes.len() > max_bytes {
+        return Err(too_large());
     }
     ensure_image_bytes(&bytes)?;
     Ok(bytes)
