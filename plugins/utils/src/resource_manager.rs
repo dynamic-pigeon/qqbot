@@ -155,41 +155,12 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
         })
     }
 
-    /// 返回资源当前是否已构建且仍在缓存中。
-    pub fn is_initialized(&self) -> bool {
-        lock_state(&self.inner.state).resource.is_some()
-    }
-
-    /// 让指定 lease 对应的缓存实例失效。
-    ///
-    /// 已经取得该实例的 lease 可以继续使用；下次 [`get`](Self::get) 会自动构建新实例。
-    /// 失效实例会在最后一个 lease 释放后执行销毁回调。
-    pub fn invalidate(&self, resource: &ManagedResource<T>) -> bool {
-        let Some(resource) = resource.resource.as_ref() else {
-            return false;
-        };
-        let cached = {
-            let mut state = lock_state(&self.inner.state);
-            let Some(cached) = state.resource.as_ref() else {
-                return false;
-            };
-            if !Arc::ptr_eq(cached, resource) {
-                return false;
-            }
-            state.cancel_cleanup();
-            state.generation = state.generation.wrapping_add(1);
-            state.resource.take()
-        };
-        drop(cached);
-        true
-    }
-
     /// 让缓存实例失效、等旧实例销毁完成后构建新实例返回。
     ///
-    /// 与“先 [`invalidate`](Self::invalidate) 再 [`get`](Self::get) 不同：
-    /// 后者的销毁回调在最后一个 lease 释放时异步触发、无人等待，新实例可能在
-    /// 旧实例还没彻底销毁时就构建。对依赖独占外部资源（如浏览器 profile 锁）
-    /// 的实例，二者会互相冲突。本方法保证新实例一定在旧实例销毁完成后才构建。
+    /// 直接 drop 旧 lease 再 [`get`](Self::get) 时，销毁回调在最后一个 lease
+    /// 释放时异步触发、无人等待，新实例可能在旧实例还没彻底销毁时就构建。
+    /// 对依赖独占外部资源（如浏览器 profile 锁）的实例，二者会互相冲突。
+    /// 本方法保证新实例一定在旧实例销毁完成后才构建。
     pub async fn replace(&self, mut resource: ManagedResource<T>) -> Result<ManagedResource<T>> {
         // 从缓存取出旧实例；缓存为空或传入 lease 与缓存实例不一致时无法原地
         // 替换，退化为普通 get。std MutexGuard 非 Send，取出的动作放在独立块里，
@@ -389,7 +360,6 @@ mod tests {
             }
         });
 
-        assert!(!manager.is_initialized());
         let first = manager.get().await.unwrap();
         let second = manager.get().await.unwrap();
 
@@ -442,14 +412,12 @@ mod tests {
 
         let resource = manager.get().await.unwrap();
         tokio::time::advance(Duration::from_secs(20)).await;
-        assert!(manager.is_initialized());
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         drop(resource);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(10)).await;
         tokio::task::yield_now().await;
-        assert!(!manager.is_initialized());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
         let rebuilt = manager.get().await.unwrap();
@@ -459,7 +427,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reuse_restarts_the_idle_timeout() {
-        let manager = ResourceManager::new(Duration::from_secs(10), || async { Ok(42) });
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        let manager =
+            ResourceManager::new_with_destructor(Duration::from_secs(10), || async { Ok(42) }, {
+                let destroyed = Arc::clone(&destroyed);
+                move |_| {
+                    let destroyed = Arc::clone(&destroyed);
+                    async move {
+                        destroyed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
 
         drop(manager.get().await.unwrap());
         tokio::task::yield_now().await;
@@ -469,11 +447,11 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
-        assert!(manager.is_initialized());
+        assert_eq!(destroyed.load(Ordering::SeqCst), 0);
 
         tokio::time::advance(Duration::from_secs(4)).await;
         tokio::task::yield_now().await;
-        assert!(!manager.is_initialized());
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -498,47 +476,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidated_resource_is_rebuilt_and_destroyed_after_last_lease() {
-        let builds = Arc::new(AtomicUsize::new(0));
-        let destroyed = Arc::new(AtomicUsize::new(0));
-        let manager = ResourceManager::new_with_destructor(
-            Duration::from_secs(10),
-            {
-                let builds = Arc::clone(&builds);
-                move || {
-                    let builds = Arc::clone(&builds);
-                    async move { Ok(builds.fetch_add(1, Ordering::SeqCst) + 1) }
-                }
-            },
-            {
-                let destroyed = Arc::clone(&destroyed);
-                move |_| {
-                    let destroyed = Arc::clone(&destroyed);
-                    async move {
-                        destroyed.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-            },
-        );
-
-        let old = manager.get().await.unwrap();
-        let old_second_lease = manager.get().await.unwrap();
-        assert!(manager.invalidate(&old));
-        assert!(!manager.invalidate(&old));
-
-        let current = manager.get().await.unwrap();
-        assert_eq!(*current, 2);
-        drop(old);
-        tokio::task::yield_now().await;
-        assert_eq!(destroyed.load(Ordering::SeqCst), 0);
-        drop(old_second_lease);
-        tokio::task::yield_now().await;
-
-        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
-        assert!(manager.is_initialized());
-    }
-
-    #[tokio::test]
     async fn replace_destroys_old_before_building_new() {
         let destroyed = Arc::new(AtomicUsize::new(0));
         let manager =
@@ -559,7 +496,6 @@ mod tests {
         assert_eq!(*new_lease, 42);
         // replace 返回时销毁回调已跑完。
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
-        assert!(manager.is_initialized());
     }
 
     #[tokio::test(start_paused = true)]
@@ -583,6 +519,5 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
-        assert!(!manager.is_initialized());
     }
 }

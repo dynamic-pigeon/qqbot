@@ -67,19 +67,3 @@ async fn main() {
         .install()
         .expect("注册 /查卡 命令失败");
 }
-
-#[cfg(test)]
-mod tests {
-    use utils::command::{CommandTree, ResolveOutcome};
-
-    #[test]
-    fn card_query_uses_trimmed_remaining_text() {
-        let tree = CommandTree::new(vec![super::card_query_command()]).unwrap();
-        let ResolveOutcome::Matched(command) = tree.resolve("/查卡   青眼 白龙  ") else {
-            panic!("expected /查卡 to resolve");
-        };
-
-        assert_eq!(command.path(), ["/查卡"]);
-        assert_eq!(command.trimmed_rest(), "青眼 白龙");
-    }
-}

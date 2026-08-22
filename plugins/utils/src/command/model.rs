@@ -23,13 +23,13 @@ pub enum MessageScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MessageSource {
+pub(crate) enum MessageSource {
     Group,
     Private,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum AccessError {
+pub(crate) enum AccessError {
     #[error("此命令只能在群聊中使用")]
     GroupOnly,
     #[error("此命令只能在私聊中使用")]
@@ -38,7 +38,7 @@ pub enum AccessError {
     PermissionDenied,
 }
 
-pub fn check_access(
+pub(crate) fn check_access(
     scope: MessageScope,
     permission: Permission,
     source: MessageSource,
@@ -81,7 +81,7 @@ impl CommandError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandArguments {
+pub(crate) struct CommandArguments {
     args: Vec<String>,
     rest: String,
 }
@@ -130,7 +130,7 @@ impl CommandArguments {
     }
 }
 
-pub fn render_command_error(error: &CommandError, usage: &str) -> String {
+pub(crate) fn render_command_error(error: &CommandError, usage: &str) -> String {
     let message = match error {
         CommandError::MissingArgument { name } => format!("缺少参数 `{name}`"),
         CommandError::InvalidArgument { name } => format!("参数 `{name}` 格式错误"),
