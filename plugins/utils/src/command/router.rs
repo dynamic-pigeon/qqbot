@@ -81,7 +81,7 @@ impl CommandRouter {
     }
 }
 
-pub fn extract_command_text(message: &Message) -> Option<String> {
+pub(crate) fn extract_command_text(message: &Message) -> Option<String> {
     // 每条消息都会经过这里：单 text 段直接 clone，多段才拼合，
     // 避免为最常见的单段消息分配临时 Vec。
     let mut parts = message

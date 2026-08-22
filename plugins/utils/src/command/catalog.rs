@@ -5,7 +5,7 @@ use std::sync::{LazyLock, RwLock};
 use super::{Command, CommandRegistrationError, CommandTree, MessageScope, Permission};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandMetadata {
+pub(crate) struct CommandMetadata {
     pub owner: String,
     pub path: Vec<String>,
     pub aliases: Vec<String>,
@@ -16,13 +16,13 @@ pub struct CommandMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommandHelp {
+pub(crate) struct CommandHelp {
     pub command: CommandMetadata,
     pub children: Vec<CommandMetadata>,
 }
 
 #[derive(Default)]
-pub struct CatalogStore {
+pub(crate) struct CatalogStore {
     roots: BTreeMap<String, CatalogRoot>,
 }
 

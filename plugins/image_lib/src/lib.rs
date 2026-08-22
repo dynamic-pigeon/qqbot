@@ -30,7 +30,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use utils::command::{CatalogStore, CommandTree, ResolveOutcome};
+    use utils::command::{CommandTree, ResolveOutcome};
 
     use super::*;
     use crate::commands::format_bytes;
@@ -104,30 +104,6 @@ mod tests {
         };
         assert_eq!(list.path(), ["图库"]);
         assert!(list.args().is_empty());
-    }
-
-    #[test]
-    fn help_lists_only_the_parent_root() {
-        let tree = command_tree();
-        let mut catalog = CatalogStore::default();
-        catalog.register("image_lib", &tree).unwrap();
-
-        assert_eq!(catalog.roots().len(), 1);
-        assert_eq!(catalog.roots()[0].path, ["图库"]);
-        let roots = catalog.render_help(&[]);
-        assert!(roots.contains("`图库`: 管理本群图库"));
-        assert!(!roots.contains("`添加`"));
-
-        let parent = catalog.render_help(&["图库"]);
-        assert!(parent.contains("`添加`: 回复一张或多张图，写入本群指定图库"));
-        assert!(parent.contains("`来只`:"));
-        assert!(parent.contains("`删除`:"));
-        assert!(parent.contains("`别名`:"));
-        assert!(parent.contains("`取消别名`:"));
-
-        let add = catalog.find(&["添加"]).unwrap();
-        assert_eq!(add.command.path, ["图库", "添加"]);
-        assert!(catalog.render_help(&["添加"]).contains("用法: 添加 <库名>"));
     }
 
     #[test]

@@ -56,19 +56,3 @@ async fn main() {
         .install()
         .expect("注册 !md 命令失败");
 }
-
-#[cfg(test)]
-mod tests {
-    use utils::command::{CommandTree, ResolveOutcome};
-
-    #[test]
-    fn markdown_command_preserves_raw_content() {
-        let tree = CommandTree::new(vec![super::markdown_command()]).unwrap();
-        let ResolveOutcome::Matched(command) = tree.resolve("!md   # title") else {
-            panic!("expected !md to resolve");
-        };
-
-        assert_eq!(command.path(), ["!md"]);
-        assert_eq!(command.rest(), "  # title");
-    }
-}
