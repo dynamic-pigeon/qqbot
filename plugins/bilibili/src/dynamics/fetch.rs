@@ -396,6 +396,9 @@ async fn fetch_page_with_browser(
     let body = super::browser::fetch_space_body(uid, offset)
         .await
         .map_err(DynamicsError::Browser)?;
+
+    tracing::debug!("Bilibili Chromium 后备动态响应: {body}");
+    
     let api: ApiResponse<SpaceData> = serde_json::from_str(&body)?;
     if api.code != 0 {
         return Err(DynamicsError::Api(api.code, api.message));

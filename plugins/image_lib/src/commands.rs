@@ -175,6 +175,9 @@ async fn handle_draw(
     if let Err(hit) = limiter.check(&group_id) {
         return Err(rate_limited(hit));
     }
+
+    tracing::debug!("图库 draw group_id={} hash={}", group_id, hash);
+
     let bytes = store
         .read_blob(group_id, &hash)
         .await
