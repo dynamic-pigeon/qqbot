@@ -1,23 +1,5 @@
 use std::time::Duration;
 
-pub fn retry<F, T, E>(mut f: F, retries: usize) -> Result<T, E>
-where
-    F: FnMut() -> Result<T, E>,
-{
-    let mut attempts = 0;
-    loop {
-        match f() {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                attempts += 1;
-                if attempts > retries {
-                    return Err(err);
-                }
-            }
-        }
-    }
-}
-
 pub async fn retry_async<F, Fut, T, E>(mut f: F, retries: usize) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -43,38 +25,6 @@ where
 fn backoff_delay(attempt: usize, base: Duration, max: Duration) -> Duration {
     let multiplier = 2_u32.saturating_pow(attempt.min(31) as u32);
     base.saturating_mul(multiplier).min(max)
-}
-
-/// 带指数退避的同步重试。
-///
-/// 首次调用失败后，第 `n` 次重试前会等待 `min(base * 2^n, max)` 时长，
-/// 以缓解服务端瞬时压力或网络抖动造成的连续失败。
-///
-/// 注意：本函数使用 `std::thread::sleep` 阻塞当前线程，不要在 async runtime
-/// 的工作线程上直接调用，否则会阻塞 tokio executor。异步场景请使用
-/// [`retry_async_with_backoff`]。
-pub fn retry_with_backoff<F, T, E>(
-    mut f: F,
-    retries: usize,
-    base_delay: Duration,
-    max_delay: Duration,
-) -> Result<T, E>
-where
-    F: FnMut() -> Result<T, E>,
-{
-    let mut attempts = 0;
-    loop {
-        match f() {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                attempts += 1;
-                if attempts > retries {
-                    return Err(err);
-                }
-                std::thread::sleep(backoff_delay(attempts - 1, base_delay, max_delay));
-            }
-        }
-    }
 }
 
 /// 带指数退避的异步重试。
