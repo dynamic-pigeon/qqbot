@@ -51,15 +51,19 @@ impl BrowserManager {
     async fn launch_browser() -> Result<Browser> {
         let config = BrowserConfig::builder()
             .window_size(1920, 1080)
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-default-apps")
-            .arg("--disable-extensions")
-            .arg("--disable-sync")
-            .arg("--disable-translate")
-            .arg("--no-first-run")
-            .arg("--mute-audio")
-            .arg("--password-store=basic")
-            .arg("--use-mock-keychain")
+            .args([
+                "disable-gpu",
+                "disable-dev-shm-usage",
+                "disable-extensions",
+                "disable-blink-features=AutomationControlled",
+                "allow-running-insecure-content",
+                "disable-plugins",
+                "disable-images",
+                "disable-web-security",
+                "mute-audio",
+                "no-first-run",
+                "no-default-browser-check",
+            ])
             // B 站风控认 UA；headless 默认带 HeadlessChrome，和 HTTP 直连指纹不一致。
             .arg(user_agent_arg(super::fetch::user_agent()))
             .build()
@@ -97,9 +101,6 @@ async fn fetch_with_browser(browser: &Browser, uid: u64, offset: Option<&str>) -
     // 关闭 tab（chromiumoxide 的 Page 没有 Drop 自动关闭），否则风控期反复
     // 超时会在浏览器里累积僵尸 tab。
     let operation = tokio::time::timeout(BROWSER_REQUEST_TIMEOUT, async {
-        // 启动参数覆盖进程默认 UA；tab 上再 CDP override，保证 goto 发出的
-        // 空间页请求和 navigator.userAgent 都用同一份 BILIBILI_USER_AGENT。
-        page.set_user_agent(super::fetch::user_agent()).await?;
         for attempt in 0..2 {
             match capture_dynamic_body(&page, uid, offset).await {
                 Ok(body) => return Ok(body),

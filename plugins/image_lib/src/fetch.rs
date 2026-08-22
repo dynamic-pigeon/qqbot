@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use kovi::{Message, Segment};
 use serde_json::Value;
 
-pub const MAX_ADD_IMAGES: usize = 10;
+pub const MAX_ADD_IMAGES: usize = 25;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// QQ 图床域名。只列图片 CDN，不用整个 `qq.com`，避免任意子域过白名单。
