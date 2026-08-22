@@ -10,7 +10,7 @@ mod screen_shot;
 pub mod retry;
 pub mod safe_url;
 
-pub use bounded_pool::{BoundedPool, BoundedResourcePool, ResourceGuard};
+pub use bounded_pool::BoundedPool;
 pub use markdown::md_to_html;
 pub use markdown::md_to_img;
 pub use rate_limit::{RateLimitHit, RateLimiter};

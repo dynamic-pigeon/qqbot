@@ -1,16 +1,16 @@
 use kovi::Message;
 use kovi_onebot::MessageRegistrar as _;
-use utils::command::{
-    AccessError, CatalogStore, Command, CommandArguments, CommandError, CommandRegistrationError,
-    CommandTree, MessageScope, MessageSource, Permission, ResolveOutcome, RouteError, check_access,
-    extract_command_text, render_command_error,
-};
+
+use super::catalog::CatalogStore;
+use super::model::CommandArguments;
+use super::router::extract_command_text;
+use super::*;
 
 fn endpoint(name: &str) -> Command {
     Command::new(name).handler(|_| async { Ok(()) })
 }
 
-fn path(command: &utils::command::ResolvedCommand) -> Vec<&str> {
+fn path(command: &ResolvedCommand) -> Vec<&str> {
     command.path().iter().map(String::as_str).collect()
 }
 
