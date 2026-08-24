@@ -37,9 +37,15 @@ Unix 上会把 `.env`、`kovi.conf.toml`、`config.toml`、插件 `config.json`�
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy -p utils --features markdown --all-targets --locked -- -D warnings
+cargo clippy -p wordle --all-features --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
+cargo test -p utils --features markdown --locked
+cargo test -p wordle --all-features --locked
 cargo audit
 ```
+
+`utils` 的 `markdown` / `screenshot` 与 Wordle 的 `cli` 不在默认 feature 里。单独检查这两个 crate 时要用上面的 `-p` 命令把对应模块编进来。Wordle 独立 CLI：`cargo run -p wordle --features cli`。
 
 依赖公网 API 或本机 Chrome 的测试标了 `ignored`：
 

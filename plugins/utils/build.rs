@@ -4,7 +4,12 @@ use std::path::PathBuf;
 ///
 /// 截图页 CSP 为 `font-src 'self' data:`，且 HTML 在 `about:blank` 打开，
 /// 外部 `url(fonts/KaTeX_*.woff2)` 无法加载。
+/// 仅 `markdown` feature 会编译模板，其它插件不必在构建期读字体。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("CARGO_FEATURE_MARKDOWN").is_none() {
+        return Ok(());
+    }
+
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or("OUT_DIR must be set")?);
     let manifest_dir = PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR must be set")?,
@@ -67,8 +72,7 @@ fn base64_encode(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     // 标准 base64 每 3 字节输入产生 4 字节输出，不足 3 字节也补齐到 4 字节。
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
-    let chunks = input.chunks_exact(3);
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = input.as_chunks::<3>();
     for chunk in chunks {
         let n = u32::from_be_bytes([0, chunk[0], chunk[1], chunk[2]]);
         out.push(TABLE[((n >> 18) & 0x3f) as usize]);
