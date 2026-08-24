@@ -6,7 +6,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::{
     EventLoadingFinished, EventResponseReceived, GetResponseBodyParams,
 };
-use futures::StreamExt as _;
+use kovi::futures_util::StreamExt as _;
 use kovi::tokio::{self, sync::OnceCell};
 
 const BROWSER_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);

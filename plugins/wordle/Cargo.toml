@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-# QQ 插件模式：启用 kovi 适配层与 PNG 渲染；CLI 模式不引入这些依赖。
+# QQ 插件：kovi 适配层与 PNG 渲染。
 qq = [
     "dep:ab_glyph",
     "dep:base64",
@@ -15,15 +15,14 @@ qq = [
     "dep:kovi-onebot",
     "dep:utils",
 ]
-# 独立 CLI 的日志与 runtime；QQ 插件走 kovi 的 runtime，不需要这些。
-cli = ["dep:tracing-subscriber", "dep:tokio", "tokio/macros", "tokio/rt"]
+# 独立 CLI 的日志；runtime 用 kovi 再导出的 tokio，和 bot 入口一致。
+cli = ["dep:tracing-subscriber", "dep:kovi"]
 
 [dependencies]
 anyhow.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 ab_glyph = { version = "0.2", optional = true }
 base64 = { workspace = true, optional = true }
@@ -34,7 +33,7 @@ kovi-onebot = { workspace = true, optional = true }
 utils = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+kovi.workspace = true
 
 [lib]
 name = "wordle"

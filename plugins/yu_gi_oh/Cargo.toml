@@ -14,4 +14,3 @@ bytes.workspace = true
 tracing.workspace = true
 urlencoding.workspace = true
 utils.workspace = true
-serde_json.workspace = true
