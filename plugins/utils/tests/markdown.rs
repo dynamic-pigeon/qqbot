@@ -1,3 +1,5 @@
+#![cfg(feature = "markdown")]
+
 use utils::md_to_html;
 
 #[test]

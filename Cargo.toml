@@ -59,9 +59,8 @@ base64 = "0.22"
 bytes = "1"
 askama = "0.16"
 moka = { version = "0.12", features = ["future"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 futures = "0.3"
-itertools = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
@@ -75,7 +74,6 @@ dotenvy = "0.15"
 pulldown-cmark = "0.13"
 regex = "1"
 urlencoding = "2"
-libc = "0.2"
 
 ammonia = "4"
 chrono = "0.4"

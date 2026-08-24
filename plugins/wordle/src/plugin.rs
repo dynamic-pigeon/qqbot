@@ -11,9 +11,8 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use kovi::{Message, PluginBuilder as plugin};
+use kovi::{Message, PluginBuilder as plugin, tokio::sync::OnceCell};
 use kovi_onebot::MessageRegistrar as _;
-use tokio::sync::OnceCell;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 use crate::game::{Game, SubmitError, WORD_LEN, pick_answer};
