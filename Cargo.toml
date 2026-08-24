@@ -51,7 +51,6 @@ help_msg = { path = "plugins/help_msg" }
 kovi = "0.13.4"
 kovi-onebot = "0.13.1"
 serde = { version = "1.0", features = ["derive"] }
-toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 anyhow = "1.0"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 utils = { path = "plugins/utils" }
@@ -60,7 +59,6 @@ bytes = "1"
 askama = "0.16"
 moka = { version = "0.12", features = ["future"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
-futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
@@ -76,14 +74,12 @@ regex = "1"
 urlencoding = "2"
 
 ammonia = "4"
-chrono = "0.4"
 chromiumoxide = "0.9"
 hmac = "0.13"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 jieba-rs = "0.10"
 md-5 = "0.11"
 rand = "0.10"
-serde_json = "1.0"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt"] }
 wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs" }

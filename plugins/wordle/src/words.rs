@@ -175,6 +175,7 @@ fn is_valid_word(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kovi::tokio;
 
     fn write_words(dir: &Path, file: &str, words: impl IntoIterator<Item = impl AsRef<str>>) {
         let content: Vec<String> = words.into_iter().map(|w| w.as_ref().to_owned()).collect();
