@@ -110,9 +110,7 @@ async fn download_to_file(urls: &[&str], path: &Path) -> anyhow::Result<()> {
 }
 
 async fn download_one(client: &reqwest::Client, url: &str, path: &Path) -> anyhow::Result<()> {
-    use futures::StreamExt;
-
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
@@ -127,9 +125,11 @@ async fn download_one(client: &reqwest::Client, url: &str, path: &Path) -> anyho
 
     // 流式读取并逐块检查上限，chunked 响应同样受保护。
     let mut body = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("读取 {url} 响应失败"))?;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("读取 {url} 响应失败"))?
+    {
         body.extend_from_slice(&chunk);
         if body.len() as u64 > MAX_DOWNLOAD_BYTES {
             bail!("{url} 响应体过大（{} 字节）", body.len());
@@ -194,8 +194,8 @@ mod tests {
         remove_dir(&dir);
     }
 
-    #[test]
-    fn load_reads_cached_files_without_download() {
+    #[tokio::test]
+    async fn load_reads_cached_files_without_download() {
         let dir = tempfile_dir();
         let word_dir = dir.join("wordle");
         fs::create_dir_all(&word_dir).unwrap();
@@ -207,8 +207,7 @@ mod tests {
         write_words(&word_dir, ANSWERS_FILE, &answers);
         write_words(&word_dir, ALLOWED_FILE, &allowed);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let list = rt.block_on(load_or_download(&dir)).unwrap();
+        let list = load_or_download(&dir).await.unwrap();
         assert!(list.answers.len() >= MIN_ANSWERS);
         assert!(list.allowed.len() >= MIN_ALLOWED);
         for a in &list.answers {
@@ -217,16 +216,15 @@ mod tests {
         remove_dir(&dir);
     }
 
-    #[test]
-    fn rejects_corrupt_word_lists() {
+    #[tokio::test]
+    async fn rejects_corrupt_word_lists() {
         let dir = tempfile_dir();
         let word_dir = dir.join("wordle");
         fs::create_dir_all(&word_dir).unwrap();
         write_words(&word_dir, ANSWERS_FILE, ["abcde"]);
         write_words(&word_dir, ALLOWED_FILE, ["abcde"]);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(load_or_download(&dir)).unwrap_err();
+        let err = load_or_download(&dir).await.unwrap_err();
         assert!(err.to_string().contains("答案池过小"), "{err:#}");
         remove_dir(&dir);
     }

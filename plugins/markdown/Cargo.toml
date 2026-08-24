@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 kovi.workspace = true
 kovi-onebot.workspace = true
-utils.workspace = true
+utils = { workspace = true, features = ["markdown"] }
 base64.workspace = true
 tracing.workspace = true
