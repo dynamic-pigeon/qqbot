@@ -2,6 +2,7 @@ use std::{fmt::Display, sync::LazyLock, time::Duration};
 
 use anyhow::Result;
 use bytes::Bytes;
+use kovi::serde_json;
 
 const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;

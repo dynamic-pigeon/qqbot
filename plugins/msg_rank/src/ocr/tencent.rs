@@ -2,8 +2,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use kovi::chrono::{DateTime, Utc};
 use kovi::serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 

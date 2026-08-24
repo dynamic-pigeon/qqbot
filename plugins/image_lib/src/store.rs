@@ -640,6 +640,7 @@ fn restrict_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kovi::tokio;
 
     fn temp_store() -> (Store, PathBuf) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

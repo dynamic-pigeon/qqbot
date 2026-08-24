@@ -4,7 +4,7 @@ use anyhow::Result;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
 use chromiumoxide::page::ScreenshotParams;
-use futures::StreamExt;
+use kovi::futures_util::StreamExt;
 use kovi::tokio::{self, sync::OnceCell};
 use tracing::{debug, error, info};
 
