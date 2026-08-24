@@ -2,9 +2,10 @@
 
 use std::sync::LazyLock;
 
+use kovi::toml;
 use serde::de::DeserializeOwned;
 
-pub use toml::Value;
+pub use kovi::toml::Value;
 
 /// 根目录 `config.toml`。找不到文件时为空表。
 pub fn value() -> &'static Value {

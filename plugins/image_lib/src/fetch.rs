@@ -4,8 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use kovi::{Message, Segment};
-use serde_json::Value;
+use kovi::{Message, Segment, serde_json::Value};
 
 pub const MAX_ADD_IMAGES: usize = 25;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -61,7 +60,7 @@ pub fn parse_message_segments(data: &Value) -> Result<Vec<Segment>> {
     let message = data
         .get("message")
         .ok_or_else(|| anyhow!("get_msg 返回缺少 message"))?;
-    serde_json::from_value(message.clone()).context("解析引用消息段失败")
+    kovi::serde_json::from_value(message.clone()).context("解析引用消息段失败")
 }
 
 pub fn image_segments(segments: &[Segment]) -> Vec<&Segment> {
@@ -211,9 +210,8 @@ fn is_supported_image(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use kovi::Message;
+    use kovi::{Message, serde_json::json};
     use kovi_onebot::MessageRegistrar as _;
-    use serde_json::json;
 
     use super::*;
 

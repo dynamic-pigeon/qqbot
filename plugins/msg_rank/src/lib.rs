@@ -3,8 +3,7 @@ use std::{
     time::Duration,
 };
 
-use futures::future::join_all;
-use kovi::{Message, PluginBuilder as plugin, tokio};
+use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all, tokio};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 use utils::command::CommandRouter;
 

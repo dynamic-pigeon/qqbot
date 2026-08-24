@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
+use kovi::tokio;
 use wordle::game::{Game, MAX_GUESSES, SubmitError, Tile, WORD_LEN, pick_answer};
 use wordle::words::load_or_download;
 

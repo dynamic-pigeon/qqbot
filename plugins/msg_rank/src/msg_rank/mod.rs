@@ -3,8 +3,9 @@ use std::{sync::LazyLock, time::Duration};
 use anyhow::Result;
 use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::TimeZone as _;
 use kovi::RuntimeBot;
+use kovi::chrono;
+use kovi::chrono::TimeZone as _;
 use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
@@ -91,7 +92,7 @@ pub async fn gen_rank_html_with_time_range(
     // 每个用户都要走群成员 API + 头像下载且各自带重试，串行拉取会让
     // 命令响应时间叠加上去，并行后总耗时约等于最慢的一个用户。
     let entries: Vec<(user_info::UserInfo, u32)> =
-        futures::future::join_all(top.into_iter().map(|(user_id, cnt)| async move {
+        kovi::futures_util::future::join_all(top.into_iter().map(|(user_id, cnt)| async move {
             match user_info::get_user_info(bot, group_id, user_id).await {
                 Ok(info) => (info, cnt),
                 Err(e) => {
