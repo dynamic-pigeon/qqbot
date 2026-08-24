@@ -1,3 +1,5 @@
+#![cfg(feature = "screenshot")]
+
 // 所有场景放在同一个 #[tokio::test] 里串行跑：全局 ScreenshotManager 是进程级
 // 单例，若分到多个 #[tokio::test]，首个用例的 runtime 退出时会 abort 掉 chromiumoxide
 // 的 handler task，导致共享浏览器变僵尸，后续用例拿到失效连接并误触发浏览器重启。
