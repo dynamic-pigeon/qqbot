@@ -3,7 +3,10 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicI64, Ordering},
+    },
     time::Duration,
 };
 
@@ -99,24 +102,39 @@ const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
     Rgba([92, 38, 134, 255]),
 ];
 
+/// Kovi cron 会在目标秒前被唤醒；间隔不足 2 秒视为同一次触发。
+fn mark_cron_fire(last_fire_ts: &AtomicI64, now_ts: i64) -> bool {
+    let prev = last_fire_ts.swap(now_ts, Ordering::Relaxed);
+    now_ts.saturating_sub(prev) >= 2
+}
+
 pub(crate) async fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
     for schedule in &crate::config::static_config().wordcloud {
         let bot = Arc::clone(&bot);
         let path = Arc::clone(&path);
         let days = schedule.days;
         let title = schedule.title.clone();
+        let last_fire_ts = AtomicI64::new(0);
         plugin::cron(&schedule.cron, move || {
             let path = &path;
             let bot = &bot;
-            let config = read_config();
-            for &group_id in &config.notify_group {
-                let bot = Arc::clone(bot);
-                let path = Arc::clone(path);
-                let title = title.clone();
-                kovi::spawn(async move {
-                    send_word_cloud(&bot, group_id, &path, chrono::Duration::days(days), &title)
+            if mark_cron_fire(&last_fire_ts, chrono::Local::now().timestamp()) {
+                let config = read_config();
+                for &group_id in &config.notify_group {
+                    let bot = Arc::clone(bot);
+                    let path = Arc::clone(path);
+                    let title = title.clone();
+                    kovi::spawn(async move {
+                        send_word_cloud(
+                            &bot,
+                            group_id,
+                            &path,
+                            chrono::Duration::days(days),
+                            &title,
+                        )
                         .await;
-                });
+                    });
+                }
             }
             async move {}
         })
@@ -504,6 +522,15 @@ mod tests {
                 .pixels()
                 .any(|pixel| *pixel != Rgba([255, 255, 255, 255]))
         );
+    }
+
+    #[test]
+    fn mark_cron_fire_skips_within_two_seconds() {
+        let last_fire_ts = AtomicI64::new(0);
+        assert!(mark_cron_fire(&last_fire_ts, 1_000));
+        assert!(!mark_cron_fire(&last_fire_ts, 1_000));
+        assert!(!mark_cron_fire(&last_fire_ts, 1_001));
+        assert!(mark_cron_fire(&last_fire_ts, 1_003));
     }
 
     #[test]
