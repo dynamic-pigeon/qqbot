@@ -33,7 +33,9 @@ fn restrict_sensitive_file(path: impl AsRef<std::path::Path>) {
 #[cfg(not(unix))]
 fn restrict_sensitive_file(_path: impl AsRef<std::path::Path>) {}
 
-#[tokio::main]
+// 事件入口是单条 WebSocket，词云/sqlite 等重活已在 spawn_blocking 或连接线程上；
+// current_thread 只占一条异步线程，避免按 CPU 数拉 worker 抬高空闲 RSS。
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 系统环境变量优先于 .env；dotenvy 从当前目录向上查找。
     let _ = dotenvy::dotenv();
@@ -95,19 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 应用已安装 tracing subscriber，关掉 Kovi 的全局 logger，避免重复注册。
     let kovi_config = kovi::load_local_conf()?;
-    let mut bot = kovi::Bot::build(kovi_config, driver);
-    let plugin_set = kovi::plugins!(
-        kovi_plugin_cmd,
-        msg_rank,
-        help_msg,
-        markdown,
-        yu_gi_oh,
-        bilibili,
-        wordle,
-        image_lib
-    );
-    bot.mount_plugin_set(plugin_set);
-    bot.set_plugin_startup_use_file_ref();
+    let bot = bot::build_bot(kovi_config, driver);
 
     bot.run().await;
     Ok(())
