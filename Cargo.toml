@@ -34,6 +34,12 @@ tracing.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
 mimalloc = { version = "0.1", optional = true }
 
+[dev-dependencies]
+kovi.workspace = true
+kovi-onebot.workspace = true
+tokio-tungstenite = "0.26"
+utils.workspace = true
+
 [workspace]
 members = [
     "plugins/help_msg",
