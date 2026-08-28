@@ -478,6 +478,7 @@ dependencies = [
  "mimalloc",
  "msg_rank",
  "tikv-jemallocator",
+ "tokio-tungstenite",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

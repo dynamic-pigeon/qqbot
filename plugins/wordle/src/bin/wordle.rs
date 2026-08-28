@@ -8,7 +8,7 @@ use kovi::tokio;
 use wordle::game::{Game, MAX_GUESSES, SubmitError, Tile, WORD_LEN, pick_answer};
 use wordle::words::load_or_download;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
