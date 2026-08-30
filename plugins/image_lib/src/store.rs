@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("本群图库容量不足")]
@@ -321,6 +323,7 @@ impl Store {
                 && let Ok(path) = blob_file(&blobs, hash)
             {
                 let _ = kovi::tokio::fs::remove_file(path).await;
+                delete_fingerprint(&pool, hash).await?;
             }
             Ok(libraries)
         })
@@ -349,6 +352,7 @@ impl Store {
                     && let Ok(path) = blob_file(&blobs, &hash)
                 {
                     let _ = kovi::tokio::fs::remove_file(path).await;
+                    delete_fingerprint(&pool, &hash).await?;
                 }
             }
             Ok(canonical)
@@ -463,11 +467,79 @@ impl Store {
         .await
     }
 
+    pub async fn resolve_name(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
+        self.with_group(group_id, |pool| async move {
+            let library = resolve_library(&pool, name).await?;
+            if !library_exists(&pool, &library).await? {
+                return Err(StoreError::LibraryMissing);
+            }
+            Ok(library)
+        })
+        .await
+    }
+
     pub async fn read_blob(&self, group_id: i64, hash: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(group_id, hash)?;
         kovi::tokio::fs::read(&path)
             .await
             .with_context(|| format!("读取图片失败: {}", path.display()))
+    }
+
+    /// 解析库名（含别名），补齐缺失的感知哈希后返回可比较的图。
+    pub async fn fingerprints_for_library(
+        &self,
+        group_id: i64,
+        name: &str,
+    ) -> Result<(String, Vec<HashedImage>), StoreError> {
+        let blobs = self.blobs_dir(group_id);
+        self.with_group(group_id, |pool| async move {
+            let library = resolve_library(&pool, name).await?;
+            if !library_exists(&pool, &library).await? {
+                return Err(StoreError::LibraryMissing);
+            }
+            let hashes: Vec<String> = library_hashes(&pool, &library).await?.into_iter().collect();
+            let mut fingerprints = library_fingerprints(&pool, &library).await?;
+            let missing: Vec<(String, PathBuf)> = hashes
+                .iter()
+                .filter(|hash| !fingerprints.contains_key(*hash))
+                .filter_map(|hash| {
+                    blob_file(&blobs, hash)
+                        .ok()
+                        .map(|path| (hash.clone(), path))
+                })
+                .collect();
+
+            let computed = if missing.is_empty() {
+                Vec::new()
+            } else {
+                kovi::tokio::task::spawn_blocking(move || {
+                    missing
+                        .into_iter()
+                        .filter_map(|(hash, path)| {
+                            let bytes = std::fs::read(path).ok()?;
+                            Some((hash, fingerprint_bytes(&bytes)?))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))?
+            };
+            insert_fingerprints(&pool, &computed).await?;
+            for (hash, fingerprint) in computed {
+                fingerprints.insert(hash, fingerprint);
+            }
+
+            let images = hashes
+                .into_iter()
+                .filter_map(|hash| {
+                    fingerprints
+                        .remove(&hash)
+                        .map(|fingerprint| HashedImage { hash, fingerprint })
+                })
+                .collect();
+            Ok((library, images))
+        })
+        .await
     }
 }
 
@@ -496,6 +568,15 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_aliases_target ON aliases(target)")
         .execute(pool)
         .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS perceptual (
+            hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
+            dhash INTEGER NOT NULL,
+            phash INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -529,6 +610,55 @@ async fn hash_still_used(pool: &SqlitePool, hash: &str) -> Result<bool, StoreErr
         .fetch_optional(pool)
         .await?;
     Ok(found.is_some())
+}
+
+async fn insert_fingerprints(
+    pool: &SqlitePool,
+    fingerprints: &[(String, Fingerprint)],
+) -> Result<(), StoreError> {
+    for (hash, fingerprint) in fingerprints {
+        sqlx::query("INSERT OR IGNORE INTO perceptual (hash, dhash, phash) VALUES (?, ?, ?)")
+            .bind(hash)
+            .bind(fingerprint.dhash as i64)
+            .bind(fingerprint.phash as i64)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn delete_fingerprint(pool: &SqlitePool, hash: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM perceptual WHERE hash = ?")
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn library_fingerprints(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<HashMap<String, Fingerprint>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT p.hash AS hash, p.dhash AS dhash, p.phash AS phash
+         FROM perceptual p
+         INNER JOIN images i ON i.hash = p.hash
+         WHERE i.library = ?",
+    )
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    let mut found = HashMap::new();
+    for row in rows {
+        found.insert(
+            row.try_get::<String, _>("hash")?,
+            Fingerprint {
+                dhash: row.try_get::<i64, _>("dhash")? as u64,
+                phash: row.try_get::<i64, _>("phash")? as u64,
+            },
+        );
+    }
+    Ok(found)
 }
 
 async fn insert_images(
@@ -816,6 +946,46 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(leftover, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn patterned_png(seed: u32) -> Vec<u8> {
+        use image::{DynamicImage, Rgb, RgbImage};
+        let image = RgbImage::from_fn(48, 48, |x, y| {
+            let v = ((x.wrapping_mul(11) + y.wrapping_mul(5) + seed) % 256) as u8;
+            Rgb([v, v.wrapping_add(30), 200u8.wrapping_sub(v)])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn fingerprints_cover_library_and_skip_undecodable() {
+        let (store, dir) = temp_store();
+        let group = 11;
+        add_images(
+            &store,
+            group,
+            "猫",
+            vec![patterned_png(1), patterned_png(2)],
+        )
+        .await
+        .unwrap();
+        add_images(&store, group, "猫", vec![png_like(9)])
+            .await
+            .unwrap();
+
+        let (canonical, images) = store.fingerprints_for_library(group, "猫").await.unwrap();
+        assert_eq!(canonical, "猫");
+        assert_eq!(images.len(), 2);
+
+        store.set_alias(group, "喵", "猫").await.unwrap();
+        let (alias, again) = store.fingerprints_for_library(group, "喵").await.unwrap();
+        assert_eq!(alias, "猫");
+        assert_eq!(again.len(), 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
