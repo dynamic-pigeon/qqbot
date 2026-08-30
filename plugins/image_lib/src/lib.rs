@@ -8,6 +8,8 @@ mod commands;
 mod config;
 mod fetch;
 mod name;
+mod scan;
+mod similar;
 mod store;
 
 use commands::image_lib_command;
@@ -30,7 +32,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use utils::command::{CommandTree, ResolveOutcome};
+    use utils::command::{CommandTree, Permission, ResolveOutcome};
 
     use super::*;
     use crate::commands::format_bytes;
@@ -104,6 +106,34 @@ mod tests {
         };
         assert_eq!(list.path(), ["图库"]);
         assert!(list.args().is_empty());
+
+        let ResolveOutcome::Matched(scan) = tree.resolve("查重 猫") else {
+            panic!("expected 查重");
+        };
+        assert_eq!(scan.path(), ["图库", "查重"]);
+        assert_eq!(scan.args(), ["猫"]);
+        assert_eq!(scan.permission(), Permission::BotAdmin);
+
+        let ResolveOutcome::Matched(next) = tree.resolve("查重 猫 下一组") else {
+            panic!("expected 查重 下一组");
+        };
+        assert_eq!(next.args(), ["猫", "下一组"]);
+
+        let ResolveOutcome::Matched(jump) = tree.resolve("查重 猫 3") else {
+            panic!("expected 查重 3");
+        };
+        assert_eq!(jump.args(), ["猫", "3"]);
+
+        let ResolveOutcome::Matched(percent) = tree.resolve("查重 猫 90%") else {
+            panic!("expected 查重 with percent");
+        };
+        assert_eq!(percent.args(), ["猫", "90%"]);
+
+        let ResolveOutcome::Matched(nested) = tree.resolve("图库 查重 喵") else {
+            panic!("expected 图库 查重");
+        };
+        assert_eq!(nested.path(), ["图库", "查重"]);
+        assert_eq!(nested.args(), ["喵"]);
     }
 
     #[test]

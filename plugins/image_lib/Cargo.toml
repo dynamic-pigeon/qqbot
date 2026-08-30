@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
+image = { workspace = true, features = ["bmp", "gif", "webp"] }
 kovi.workspace = true
 kovi-onebot.workspace = true
 reqwest.workspace = true

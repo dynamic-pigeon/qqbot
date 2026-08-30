@@ -4,16 +4,24 @@ use base64::Engine as _;
 use kovi::{Message, Segment};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use utils::RateLimiter;
-use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
+use utils::command::{
+    Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
+};
 
 use crate::fetch::{
     FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes, parse_message_segments,
     select_images,
 };
 use crate::name::parse_library_name;
+use crate::scan::{
+    NEXT_PAGE_ARG, ScanAdvance, ScanKey, ScanSessions, group_title, packetize_images,
+    parse_group_index,
+};
+use crate::similar::{cluster, distance_from_percent};
 use crate::store::{Store, StoreError, sha256_hex};
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
+    let scans = Arc::new(ScanSessions::new());
     Command::new("图库")
         .description("管理本群图库")
         .usage("图库")
@@ -29,7 +37,8 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
         .subcommand(draw_command(Arc::clone(&store), limiter))
         .subcommand(delete_command(Arc::clone(&store)))
         .subcommand(alias_command(Arc::clone(&store)))
-        .subcommand(unalias_command(store))
+        .subcommand(unalias_command(Arc::clone(&store)))
+        .subcommand(scan_command(store, scans))
 }
 
 fn add_command(store: Arc<Store>) -> Command {
@@ -85,6 +94,19 @@ fn unalias_command(store: Arc<Store>) -> Command {
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_unalias(ctx, &store).await }
+        })
+}
+
+fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
+    Command::new("查重")
+        .description("扫指定图库的近重复，不删除")
+        .usage("查重 <库名> [组号|下一组|相似度%]")
+        .permission(Permission::BotAdmin)
+        .expose_as_root()
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            let scans = Arc::clone(&scans);
+            async move { handle_scan(ctx, &store, &scans).await }
         })
 }
 
@@ -235,6 +257,216 @@ async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) ->
     }
 }
 
+enum ScanOp<'a> {
+    Start { name: &'a str, percent: Option<u32> },
+    Next { name: &'a str },
+    Jump { name: &'a str, index: usize },
+}
+
+fn parse_percent_arg(raw: &str) -> Result<u32, CommandError> {
+    let number = raw
+        .strip_suffix('%')
+        .or_else(|| raw.strip_suffix('％'))
+        .ok_or_else(|| CommandError::InvalidArgument {
+            name: "相似度%".to_owned(),
+        })?;
+    let parsed: u32 = number.parse().map_err(|_| CommandError::InvalidArgument {
+        name: "相似度%".to_owned(),
+    })?;
+    if (1..=100).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(CommandError::user("相似度% 需要是 1 到 100 的整数"))
+    }
+}
+
+fn parse_scan_op(args: &[String]) -> Result<ScanOp<'_>, CommandError> {
+    let name = parse_library_name(args.first().map(String::as_str).unwrap_or(""))?;
+    let extra = args.get(1).map(String::as_str);
+    if extra.is_some() && args.len() > 2 {
+        return Err(CommandError::UnexpectedArgument);
+    }
+    match extra {
+        None => Ok(ScanOp::Start {
+            name,
+            percent: None,
+        }),
+        Some(arg) if arg == NEXT_PAGE_ARG => Ok(ScanOp::Next { name }),
+        Some(arg) if arg.bytes().all(|byte| byte.is_ascii_digit()) => {
+            let index =
+                parse_group_index(arg).ok_or_else(|| CommandError::user("组号从 1 开始"))?;
+            Ok(ScanOp::Jump { name, index })
+        }
+        Some(arg) => Ok(ScanOp::Start {
+            name,
+            percent: Some(
+                parse_percent_arg(arg)
+                    .map_err(|_| CommandError::user("第二参数是组号、下一组或相似度（如 90%）"))?,
+            ),
+        }),
+    }
+}
+
+fn missing_library(name: &str, error: StoreError) -> CommandError {
+    match error {
+        StoreError::LibraryMissing => CommandError::user(format!("「{name}」不存在")),
+        other => CommandError::internal(other),
+    }
+}
+
+async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -> CommandResult {
+    let op = parse_scan_op(ctx.args())?;
+    let group_id = group_id(&ctx)?;
+    let user_id = ctx.event().user_id;
+    match op {
+        ScanOp::Start { name, percent } => {
+            let (canonical, images) = store
+                .fingerprints_for_library(group_id, name)
+                .await
+                .map_err(|error| missing_library(name, error))?;
+            if images.len() < 2 {
+                ctx.reply(format!("「{canonical}」里没有相似的图"));
+                return Ok(());
+            }
+            let config = crate::config::static_config();
+            let duplicate = percent
+                .map(distance_from_percent)
+                .unwrap_or_else(|| config.duplicate_distance());
+            let groups = cluster(&images, duplicate, config.maybe_distance());
+            if groups.is_empty() {
+                ctx.reply(format!("「{canonical}」里没有相似的图"));
+                return Ok(());
+            }
+            let key = ScanKey {
+                group_id,
+                user_id,
+                library: canonical.clone(),
+            };
+            scans.start(key.clone(), groups);
+            show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, true).await
+        }
+        ScanOp::Next { name } => {
+            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
+            show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, false).await
+        }
+        ScanOp::Jump { name, index } => {
+            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
+            show_scan_group(
+                &ctx,
+                store,
+                scans,
+                group_id,
+                &canonical,
+                &key,
+                Some(index),
+                false,
+            )
+            .await
+        }
+    }
+}
+
+async fn open_scan_key(
+    store: &Store,
+    group_id: i64,
+    user_id: i64,
+    name: &str,
+) -> Result<(String, ScanKey), CommandError> {
+    let canonical = store
+        .resolve_name(group_id, name)
+        .await
+        .map_err(|error| missing_library(name, error))?;
+    Ok((
+        canonical.clone(),
+        ScanKey {
+            group_id,
+            user_id,
+            library: canonical,
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn show_scan_group(
+    ctx: &CommandContext,
+    store: &Store,
+    scans: &ScanSessions,
+    group_id: i64,
+    library: &str,
+    key: &ScanKey,
+    jump: Option<usize>,
+    starting: bool,
+) -> CommandResult {
+    loop {
+        let advance = match jump {
+            Some(index) => scans.jump(key, index),
+            None => scans.advance(key),
+        };
+        match advance {
+            None => {
+                return Err(CommandError::user(format!("请先发送「查重 {library}」")));
+            }
+            Some(ScanAdvance::Exhausted) => {
+                ctx.reply(if starting {
+                    format!("「{library}」里没有相似的图")
+                } else {
+                    "没有下一组了".to_owned()
+                });
+                return Ok(());
+            }
+            Some(ScanAdvance::OutOfRange { total }) => {
+                ctx.reply(if total == 0 {
+                    format!("「{library}」里没有相似的图")
+                } else {
+                    format!("只有 {total} 组")
+                });
+                return Ok(());
+            }
+            Some(ScanAdvance::Group {
+                group,
+                index,
+                total,
+            }) => {
+                let mut images = Vec::new();
+                for hash in &group.hashes {
+                    if let Ok(bytes) = store.read_blob(group_id, hash).await {
+                        images.push(bytes);
+                    }
+                }
+                if images.len() < 2 {
+                    if jump.is_some() {
+                        ctx.reply(format!("第 {index} 组不足两张，可能已经删过了"));
+                        return Ok(());
+                    }
+                    continue;
+                }
+                reply_group(
+                    ctx,
+                    group_title(group.kind, index, total, group.percent),
+                    images,
+                );
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn reply_group(ctx: &CommandContext, title: String, images: Vec<Vec<u8>>) {
+    let packets = packetize_images(images);
+    for (i, packet) in packets.into_iter().enumerate() {
+        let mut message = if i == 0 {
+            Message::new().add_text(&title)
+        } else {
+            Message::new().add_text("（续）")
+        };
+        for bytes in packet {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            message = message.add_image(&format!("base64://{encoded}"));
+        }
+        ctx.reply(message);
+    }
+}
+
 async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = group_id(&ctx)?;
@@ -349,5 +581,68 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB)
     } else {
         format!("{:.1} MiB", bytes as f64 / MIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn scan_op_parses_start_next_jump_and_percent() {
+        let start_args = args(&["猫"]);
+        assert!(matches!(
+            parse_scan_op(&start_args),
+            Ok(ScanOp::Start {
+                name: "猫",
+                percent: None
+            })
+        ));
+
+        let next_args = args(&["猫", "下一组"]);
+        assert!(matches!(parse_scan_op(&next_args), Ok(ScanOp::Next { .. })));
+
+        let jump_args = args(&["猫", "3"]);
+        assert!(matches!(
+            parse_scan_op(&jump_args),
+            Ok(ScanOp::Jump { index: 3, .. })
+        ));
+
+        let percent_args = args(&["猫", "90%"]);
+        assert!(matches!(
+            parse_scan_op(&percent_args),
+            Ok(ScanOp::Start {
+                percent: Some(90),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn scan_op_rejects_bad_percent_and_extra_args() {
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "foo"])),
+            Err(CommandError::User(_))
+        ));
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "第3组"])),
+            Err(CommandError::User(_))
+        ));
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "0"])),
+            Err(CommandError::User(_))
+        ));
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "下一组", "3"])),
+            Err(CommandError::UnexpectedArgument)
+        ));
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "3", "90%"])),
+            Err(CommandError::UnexpectedArgument)
+        ));
     }
 }

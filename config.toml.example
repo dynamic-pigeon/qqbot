@@ -32,3 +32,6 @@ max_image_mib = 15
 # 「来只」滑动窗口限流：窗口长度（秒）和窗口内最多抽取次数。
 draw_window_secs = 60
 draw_max_per_window = 5
+# 「查重」默认汉明距离（越小越像）。命令「查重 猫 90%」可按百分比覆盖重复阈值。
+duplicate_distance = 8
+maybe_distance = 16
