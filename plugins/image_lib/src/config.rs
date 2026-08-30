@@ -9,6 +9,10 @@ pub(crate) const DEFAULT_MAX_IMAGE_MIB: u64 = 15;
 pub(crate) const DEFAULT_DRAW_WINDOW_SECS: u64 = 60;
 /// 未配置时「来只」窗口内次数上限。
 pub(crate) const DEFAULT_DRAW_MAX_PER_WINDOW: usize = 5;
+/// 64-bit 感知哈希汉明距离：两路都不超过此值才算重复。
+pub(crate) const DEFAULT_DUPLICATE_DISTANCE: u32 = 8;
+/// 至少一路不超过此值、又没到重复阈值时，标成「也许像」。
+pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 16;
 
 /// 根目录 `config.toml` 的 `[image_lib]`。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -18,6 +22,8 @@ pub(crate) struct StaticConfig {
     pub max_image_mib: u64,
     pub draw_window_secs: u64,
     pub draw_max_per_window: usize,
+    pub duplicate_distance: u32,
+    pub maybe_distance: u32,
 }
 
 impl Default for StaticConfig {
@@ -27,6 +33,8 @@ impl Default for StaticConfig {
             max_image_mib: DEFAULT_MAX_IMAGE_MIB,
             draw_window_secs: DEFAULT_DRAW_WINDOW_SECS,
             draw_max_per_window: DEFAULT_DRAW_MAX_PER_WINDOW,
+            duplicate_distance: DEFAULT_DUPLICATE_DISTANCE,
+            maybe_distance: DEFAULT_MAYBE_DISTANCE,
         }
     }
 }
@@ -50,6 +58,14 @@ impl StaticConfig {
 
     pub fn draw_max_per_window(&self) -> usize {
         self.draw_max_per_window.max(1)
+    }
+
+    pub fn duplicate_distance(&self) -> u32 {
+        self.duplicate_distance.min(64)
+    }
+
+    pub fn maybe_distance(&self) -> u32 {
+        self.maybe_distance.min(64)
     }
 }
 
