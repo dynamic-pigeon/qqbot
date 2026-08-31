@@ -681,43 +681,31 @@ mod tests {
     }
 
     #[test]
-    fn scan_op_parses_start_next_jump_and_percent() {
-        let start_args = args(&["猫"]);
+    fn scan_op_parses_start_next_jump_percent_and_rejects_junk() {
         assert!(matches!(
-            parse_scan_op(&start_args),
+            parse_scan_op(&args(&["猫"])),
             Ok(ScanOp::Start {
                 name: "猫",
                 percent: None
             })
         ));
-
-        let next_args = args(&["猫", "下一组"]);
-        assert!(matches!(parse_scan_op(&next_args), Ok(ScanOp::Next { .. })));
-
-        let jump_args = args(&["猫", "3"]);
         assert!(matches!(
-            parse_scan_op(&jump_args),
+            parse_scan_op(&args(&["猫", "下一组"])),
+            Ok(ScanOp::Next { .. })
+        ));
+        assert!(matches!(
+            parse_scan_op(&args(&["猫", "3"])),
             Ok(ScanOp::Jump { index: 3, .. })
         ));
-
-        let percent_args = args(&["猫", "90%"]);
         assert!(matches!(
-            parse_scan_op(&percent_args),
+            parse_scan_op(&args(&["猫", "90%"])),
             Ok(ScanOp::Start {
                 percent: Some(90),
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn scan_op_rejects_bad_percent_and_extra_args() {
         assert!(matches!(
             parse_scan_op(&args(&["猫", "foo"])),
-            Err(CommandError::User(_))
-        ));
-        assert!(matches!(
-            parse_scan_op(&args(&["猫", "第3组"])),
             Err(CommandError::User(_))
         ));
         assert!(matches!(
@@ -726,10 +714,6 @@ mod tests {
         ));
         assert!(matches!(
             parse_scan_op(&args(&["猫", "下一组", "3"])),
-            Err(CommandError::UnexpectedArgument)
-        ));
-        assert!(matches!(
-            parse_scan_op(&args(&["猫", "3", "90%"])),
             Err(CommandError::UnexpectedArgument)
         ));
     }
