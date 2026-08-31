@@ -31,13 +31,13 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 dotenvy.workspace = true
 tracing.workspace = true
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
 mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 kovi.workspace = true
 kovi-onebot.workspace = true
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.30"
 utils.workspace = true
 
 [workspace]
@@ -54,13 +54,13 @@ members = [
 
 [workspace.dependencies]
 help_msg = { path = "plugins/help_msg" }
-kovi = "0.13.4"
-kovi-onebot = "0.13.1"
+kovi = "0.13.5"
+kovi-onebot = "0.13.2"
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 utils = { path = "plugins/utils" }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 askama = "0.16"
 moka = { version = "0.12", features = ["future"] }
