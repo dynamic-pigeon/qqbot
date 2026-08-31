@@ -134,6 +134,27 @@ mod tests {
         };
         assert_eq!(nested.path(), ["图库", "查重"]);
         assert_eq!(nested.args(), ["喵"]);
+
+        let ResolveOutcome::Matched(by_hash) = tree.resolve("哈希 abcdef") else {
+            panic!("expected 哈希");
+        };
+        assert_eq!(by_hash.path(), ["图库", "哈希"]);
+        assert_eq!(by_hash.args(), ["abcdef"]);
+        assert_eq!(by_hash.permission(), Permission::BotAdmin);
+
+        let ResolveOutcome::Matched(nested_hash) = tree.resolve("图库 哈希 abcdef") else {
+            panic!("expected 图库 哈希");
+        };
+        assert_eq!(nested_hash.path(), ["图库", "哈希"]);
+        assert_eq!(nested_hash.args(), ["abcdef"]);
+        assert_eq!(nested_hash.permission(), Permission::BotAdmin);
+
+        let ResolveOutcome::Matched(del_hash) = tree.resolve("删除哈希 abcdef") else {
+            panic!("expected 删除哈希");
+        };
+        assert_eq!(del_hash.path(), ["图库", "删除哈希"]);
+        assert_eq!(del_hash.args(), ["abcdef"]);
+        assert_eq!(del_hash.permission(), Permission::BotAdmin);
     }
 
     #[test]
