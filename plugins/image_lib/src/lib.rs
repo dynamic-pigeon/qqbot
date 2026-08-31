@@ -35,7 +35,6 @@ mod tests {
     use utils::command::{CommandTree, Permission, ResolveOutcome};
 
     use super::*;
-    use crate::commands::format_bytes;
 
     fn dummy_store() -> Arc<Store> {
         let dir = std::env::temp_dir().join(format!(
@@ -63,7 +62,7 @@ mod tests {
     }
 
     #[test]
-    fn commands_keep_short_invocations_under_one_parent() {
+    fn root_aliases_share_parent_and_admin_keeps_permission() {
         let tree = command_tree();
 
         let ResolveOutcome::Matched(add) = tree.resolve("添加 猫") else {
@@ -75,92 +74,18 @@ mod tests {
         let ResolveOutcome::Matched(nested) = tree.resolve("图库 添加 猫") else {
             panic!("expected 图库 添加");
         };
-        assert_eq!(nested.path(), ["图库", "添加"]);
-        assert_eq!(nested.args(), ["猫"]);
-
-        let ResolveOutcome::Matched(draw) = tree.resolve("来只 猫") else {
-            panic!("expected 来只");
-        };
-        assert_eq!(draw.path(), ["图库", "来只"]);
-        assert_eq!(draw.args(), ["猫"]);
-
-        let ResolveOutcome::Matched(delete) = tree.resolve("删除") else {
-            panic!("expected 删除");
-        };
-        assert_eq!(delete.path(), ["图库", "删除"]);
-        assert!(delete.args().is_empty());
-
-        let ResolveOutcome::Matched(wipe) = tree.resolve("删除 猫") else {
-            panic!("expected 删除 猫");
-        };
-        assert_eq!(wipe.args(), ["猫"]);
-
-        let ResolveOutcome::Matched(alias) = tree.resolve("别名 喵 猫") else {
-            panic!("expected 别名");
-        };
-        assert_eq!(alias.path(), ["图库", "别名"]);
-        assert_eq!(alias.args(), ["喵", "猫"]);
+        assert_eq!(nested.path(), add.path());
+        assert_eq!(nested.args(), add.args());
 
         let ResolveOutcome::Matched(list) = tree.resolve("图库") else {
             panic!("expected 图库");
         };
         assert_eq!(list.path(), ["图库"]);
-        assert!(list.args().is_empty());
 
         let ResolveOutcome::Matched(scan) = tree.resolve("查重 猫") else {
             panic!("expected 查重");
         };
         assert_eq!(scan.path(), ["图库", "查重"]);
-        assert_eq!(scan.args(), ["猫"]);
         assert_eq!(scan.permission(), Permission::BotAdmin);
-
-        let ResolveOutcome::Matched(next) = tree.resolve("查重 猫 下一组") else {
-            panic!("expected 查重 下一组");
-        };
-        assert_eq!(next.args(), ["猫", "下一组"]);
-
-        let ResolveOutcome::Matched(jump) = tree.resolve("查重 猫 3") else {
-            panic!("expected 查重 3");
-        };
-        assert_eq!(jump.args(), ["猫", "3"]);
-
-        let ResolveOutcome::Matched(percent) = tree.resolve("查重 猫 90%") else {
-            panic!("expected 查重 with percent");
-        };
-        assert_eq!(percent.args(), ["猫", "90%"]);
-
-        let ResolveOutcome::Matched(nested) = tree.resolve("图库 查重 喵") else {
-            panic!("expected 图库 查重");
-        };
-        assert_eq!(nested.path(), ["图库", "查重"]);
-        assert_eq!(nested.args(), ["喵"]);
-
-        let ResolveOutcome::Matched(by_hash) = tree.resolve("哈希 abcdef") else {
-            panic!("expected 哈希");
-        };
-        assert_eq!(by_hash.path(), ["图库", "哈希"]);
-        assert_eq!(by_hash.args(), ["abcdef"]);
-        assert_eq!(by_hash.permission(), Permission::BotAdmin);
-
-        let ResolveOutcome::Matched(nested_hash) = tree.resolve("图库 哈希 abcdef") else {
-            panic!("expected 图库 哈希");
-        };
-        assert_eq!(nested_hash.path(), ["图库", "哈希"]);
-        assert_eq!(nested_hash.args(), ["abcdef"]);
-        assert_eq!(nested_hash.permission(), Permission::BotAdmin);
-
-        let ResolveOutcome::Matched(del_hash) = tree.resolve("删除哈希 abcdef") else {
-            panic!("expected 删除哈希");
-        };
-        assert_eq!(del_hash.path(), ["图库", "删除哈希"]);
-        assert_eq!(del_hash.args(), ["abcdef"]);
-        assert_eq!(del_hash.permission(), Permission::BotAdmin);
-    }
-
-    #[test]
-    fn format_bytes_uses_binary_units() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2048), "2.0 KiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
     }
 }

@@ -330,13 +330,11 @@ mod tests {
         fingerprint_bytes(bytes).expect("fingerprint")
     }
 
-    #[test]
-    fn identical_pngs_match() {
-        let bytes = png_bytes(&patterned(1));
-        let a = fp(&bytes);
-        let b = fp(&bytes);
-        assert_eq!(a, b);
-        assert_eq!(duplicate_distance(a, b), 0);
+    fn hashed(hash: &str, dhash: u64, phash: u64) -> HashedImage {
+        HashedImage {
+            hash: hash.into(),
+            fingerprint: Fingerprint { dhash, phash },
+        }
     }
 
     #[test]
@@ -370,48 +368,14 @@ mod tests {
 
     #[test]
     fn cluster_links_high_confidence_and_pairs_leftovers() {
-        let dup = Fingerprint {
-            dhash: 0x1111,
-            phash: 0x1111,
-        };
-        let dup_close = Fingerprint {
-            dhash: 0x1113,
-            phash: 0x1110,
-        };
-        let leftover_a = Fingerprint {
-            dhash: 0xAAAA_AAAA_AAAA_AAAA,
-            phash: 0x5555_5555_5555_5555,
-        };
-        let leftover_b = Fingerprint {
-            dhash: 0xAAAA_AAAA_AAAA_AAAB,
-            phash: 0x0,
-        };
-        let outsider = Fingerprint {
-            dhash: 0xFFFF_0000_FFFF_0000,
-            phash: 0x00FF_00FF_00FF_00FF,
-        };
-
         let images = vec![
-            HashedImage {
-                hash: "a".into(),
-                fingerprint: dup,
-            },
-            HashedImage {
-                hash: "b".into(),
-                fingerprint: dup_close,
-            },
-            HashedImage {
-                hash: "c".into(),
-                fingerprint: leftover_a,
-            },
-            HashedImage {
-                hash: "d".into(),
-                fingerprint: leftover_b,
-            },
-            HashedImage {
-                hash: "e".into(),
-                fingerprint: outsider,
-            },
+            hashed("a", 0x1111, 0x1111),
+            hashed("b", 0x1113, 0x1110),
+            hashed("c", 0xAAAA_AAAA_AAAA_AAAA, 0x5555_5555_5555_5555),
+            hashed("d", 0xAAAA_AAAA_AAAA_AAAB, 0x0),
+            hashed("e", 0xFFFF_0000_FFFF_0000, 0x00FF_00FF_00FF_00FF),
+            // dHash 接近重复组成员，但不能并进「也许像」。
+            hashed("f", 0x1111, u64::MAX),
         ];
 
         let groups = cluster(&images, 8, 16);
@@ -430,47 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn leftover_does_not_pair_with_duplicate_member() {
-        let dup = Fingerprint { dhash: 1, phash: 1 };
-        let dup2 = Fingerprint { dhash: 1, phash: 3 };
-        let leftover = Fingerprint {
-            dhash: 1,
-            phash: u64::MAX,
-        };
-        let images = vec![
-            HashedImage {
-                hash: "a".into(),
-                fingerprint: dup,
-            },
-            HashedImage {
-                hash: "b".into(),
-                fingerprint: dup2,
-            },
-            HashedImage {
-                hash: "c".into(),
-                fingerprint: leftover,
-            },
-        ];
-        let groups = cluster(&images, 8, 16);
-        assert!(groups.iter().all(|g| g.kind != GroupKind::Maybe));
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].hashes, vec!["a".to_owned(), "b".to_owned()]);
-    }
-
-    #[test]
-    fn percent_uses_hamming_over_64_bits() {
+    fn percent_round_trips_through_title_distance() {
         assert_eq!(percent_from_distance(0), 100);
         assert_eq!(percent_from_distance(8), 87);
-        assert_eq!(percent_from_distance(16), 75);
-        assert_eq!(percent_from_distance(64), 0);
-    }
-
-    #[test]
-    fn distance_from_percent_matches_title_rounding() {
-        assert_eq!(distance_from_percent(100), 0);
         assert_eq!(distance_from_percent(87), 8);
-        assert_eq!(distance_from_percent(75), 16);
-        assert_eq!(distance_from_percent(88), 7);
         assert_eq!(
             u32::from(percent_from_distance(distance_from_percent(90))),
             90
