@@ -112,6 +112,10 @@ where
 
 pub fn write_config(config: &Config, path: impl AsRef<Path>) -> anyhow::Result<()> {
     let path = path.as_ref();
+    // 首次启动或 CI 干净工作区没有 data/<plugin>/，需要把目录建出来。
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     // 先写临时文件再 rename：checkpoint 每轮 poll 都会写盘，直接截断写一旦
     // 中途崩溃会留下半个 JSON。同目录 rename 是原子的。
     let tmp_path = path.with_extension("json.tmp");
@@ -126,6 +130,23 @@ pub fn write_config(config: &Config, path: impl AsRef<Path>) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_config_creates_missing_parent_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "bili_config_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        write_config(&Config::default(), &path).unwrap();
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn write_config_roundtrip_and_cleans_up_tmp() {

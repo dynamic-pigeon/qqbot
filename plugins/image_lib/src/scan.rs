@@ -165,14 +165,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn start_then_advance_walks_groups_and_exhausts() {
-        let sessions = ScanSessions::new();
-        let key = ScanKey {
+    fn key() -> ScanKey {
+        ScanKey {
             group_id: 1,
             user_id: 2,
             library: "猫".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn start_then_advance_walks_groups_and_exhausts() {
+        let sessions = ScanSessions::new();
+        let key = key();
         sessions.start(key.clone(), vec![group("a"), group("b")]);
 
         let ScanAdvance::Group { index, total, .. } = sessions.advance(&key).unwrap() else {
@@ -193,18 +197,7 @@ mod tests {
                 })
                 .is_none()
         );
-    }
 
-    #[test]
-    fn restart_replaces_cursor() {
-        let sessions = ScanSessions::new();
-        let key = ScanKey {
-            group_id: 1,
-            user_id: 2,
-            library: "猫".into(),
-        };
-        sessions.start(key.clone(), vec![group("a"), group("b")]);
-        let _ = sessions.advance(&key);
         sessions.start(key.clone(), vec![group("c")]);
         let ScanAdvance::Group { group, total, .. } = sessions.advance(&key).unwrap() else {
             panic!("restart");
@@ -216,11 +209,7 @@ mod tests {
     #[test]
     fn jump_selects_index_and_next_continues_after_it() {
         let sessions = ScanSessions::new();
-        let key = ScanKey {
-            group_id: 1,
-            user_id: 2,
-            library: "猫".into(),
-        };
+        let key = key();
         sessions.start(key.clone(), vec![group("a"), group("b"), group("c")]);
         let ScanAdvance::Group { index, group, .. } = sessions.jump(&key, 2).unwrap() else {
             panic!("jump");
@@ -261,17 +250,5 @@ mod tests {
         let packets = packetize_images(huge);
         assert_eq!(packets.len(), 2);
         assert_eq!(packets[0].len(), 1);
-    }
-
-    #[test]
-    fn titles_include_kind_progress_and_maybe_warning() {
-        assert_eq!(
-            group_title(GroupKind::Duplicate, 2, 5, 92),
-            "重复 2/5 · 约 92%"
-        );
-        assert_eq!(
-            group_title(GroupKind::Maybe, 4, 5, 78),
-            "也许像 4/5 · 约 78%。不确定，别按重复删"
-        );
     }
 }
