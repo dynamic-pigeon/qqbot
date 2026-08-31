@@ -38,6 +38,8 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
         .subcommand(delete_command(Arc::clone(&store)))
         .subcommand(alias_command(Arc::clone(&store)))
         .subcommand(unalias_command(Arc::clone(&store)))
+        .subcommand(send_hash_command(Arc::clone(&store)))
+        .subcommand(delete_hash_command(Arc::clone(&store)))
         .subcommand(scan_command(store, scans))
 }
 
@@ -97,6 +99,30 @@ fn unalias_command(store: Arc<Store>) -> Command {
         })
 }
 
+fn send_hash_command(store: Arc<Store>) -> Command {
+    Command::new("哈希")
+        .description("按内容哈希发送本群已存的图")
+        .usage("哈希 <哈希或前缀>")
+        .permission(Permission::BotAdmin)
+        .expose_as_root()
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            async move { handle_send_hash(ctx, &store).await }
+        })
+}
+
+fn delete_hash_command(store: Arc<Store>) -> Command {
+    Command::new("删除哈希")
+        .description("按内容哈希删除本群已存的图")
+        .usage("删除哈希 <哈希或前缀>")
+        .permission(Permission::BotAdmin)
+        .expose_as_root()
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            async move { handle_delete_hash(ctx, &store).await }
+        })
+}
+
 fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
     Command::new("查重")
         .description("扫指定图库的近重复，不删除")
@@ -108,6 +134,47 @@ fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
             let scans = Arc::clone(&scans);
             async move { handle_scan(ctx, &store, &scans).await }
         })
+}
+
+fn parse_hash_prefix(raw: &str) -> Result<String, CommandError> {
+    if raw.is_empty() {
+        return Err(CommandError::MissingArgument {
+            name: "哈希".to_owned(),
+        });
+    }
+    if !(1..=64).contains(&raw.len()) || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CommandError::user("哈希必须是 1 到 64 位十六进制"));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
+    let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
+    ctx.ensure_no_extra_args(1)?;
+    let group_id = group_id(&ctx)?;
+    let bytes = match store.load_by_hash_prefix(group_id, &prefix).await {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(map_store_user_error(error)),
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    ctx.reply(Message::new().add_image(&format!("base64://{encoded}")));
+    Ok(())
+}
+
+async fn handle_delete_hash(ctx: CommandContext, store: &Store) -> CommandResult {
+    let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
+    ctx.ensure_no_extra_args(1)?;
+    let group_id = group_id(&ctx)?;
+    match store.delete_by_hash_prefix(group_id, &prefix).await {
+        Ok(libraries) => {
+            ctx.reply(format!(
+                "已从{}删除这张图",
+                quoted_library_names(&libraries)
+            ));
+            Ok(())
+        }
+        Err(error) => Err(map_store_user_error(error)),
+    }
 }
 
 async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
@@ -244,12 +311,10 @@ async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) ->
     let hash = sha256_hex(&images[0]);
     match store.delete_hash(group_id, &hash).await {
         Ok(libraries) => {
-            let names = libraries
-                .iter()
-                .map(|name| format!("「{name}」"))
-                .collect::<Vec<_>>()
-                .join("");
-            ctx.reply(format!("已从{names}删除这张图"));
+            ctx.reply(format!(
+                "已从{}删除这张图",
+                quoted_library_names(&libraries)
+            ));
             Ok(())
         }
         Err(StoreError::ImageMissing) => Err(CommandError::user("没有这张图")),
@@ -537,6 +602,14 @@ async fn load_replied_images(
     Ok(loaded)
 }
 
+fn quoted_library_names(libraries: &[String]) -> String {
+    libraries
+        .iter()
+        .map(|name| format!("「{name}」"))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn map_store_user_error(error: StoreError) -> CommandError {
     match error {
         StoreError::QuotaExceeded { used, limit, .. } => CommandError::user(format!(
@@ -546,6 +619,7 @@ fn map_store_user_error(error: StoreError) -> CommandError {
         )),
         StoreError::LibraryMissing => CommandError::user("库不存在"),
         StoreError::ImageMissing => CommandError::user("没有这张图"),
+        StoreError::HashAmbiguous => CommandError::user("哈希前缀对应多张图，请写长一点"),
         StoreError::AliasToSelf
         | StoreError::NameIsLibrary(_)
         | StoreError::TargetMissing(_)
@@ -590,6 +664,20 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn hash_prefix_accepts_hex_and_rejects_empty_or_junk() {
+        assert_eq!(parse_hash_prefix("AbC").unwrap(), "abc");
+        assert_eq!(parse_hash_prefix("a").unwrap(), "a");
+        assert!(matches!(
+            parse_hash_prefix(""),
+            Err(CommandError::MissingArgument { .. })
+        ));
+        assert!(matches!(
+            parse_hash_prefix("xyz"),
+            Err(CommandError::User(_))
+        ));
     }
 
     #[test]

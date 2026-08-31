@@ -26,6 +26,8 @@ pub enum StoreError {
     LibraryMissing,
     #[error("没有这张图")]
     ImageMissing,
+    #[error("哈希前缀对应多张图")]
+    HashAmbiguous,
     #[error("库是空的")]
     LibraryEmpty,
     #[error("别名不能指向自己")]
@@ -467,6 +469,55 @@ impl Store {
         .await
     }
 
+    /// 本群已入库哈希：完整 64 位或能唯一确定一张图的前缀。
+    pub async fn resolve_group_hash(
+        &self,
+        group_id: i64,
+        prefix: &str,
+    ) -> Result<String, StoreError> {
+        let prefix = prefix.to_ascii_lowercase();
+        if !is_hash_prefix(&prefix) {
+            return Err(StoreError::ImageMissing);
+        }
+        self.with_group(group_id, |pool| async move {
+            let pattern = format!("{prefix}%");
+            let hashes = sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT hash FROM images WHERE hash LIKE ? ESCAPE '\\'",
+            )
+            .bind(&pattern)
+            .fetch_all(&pool)
+            .await?;
+            match hashes.as_slice() {
+                [hash] => Ok(hash.clone()),
+                [] => Err(StoreError::ImageMissing),
+                _ => Err(StoreError::HashAmbiguous),
+            }
+        })
+        .await
+    }
+
+    /// 解析前缀后读出 blob，供管理员按哈希发图。
+    pub async fn load_by_hash_prefix(
+        &self,
+        group_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        let hash = self.resolve_group_hash(group_id, prefix).await?;
+        self.read_blob(group_id, &hash)
+            .await
+            .map_err(StoreError::Other)
+    }
+
+    /// 解析前缀后从本群所有库删掉该图。
+    pub async fn delete_by_hash_prefix(
+        &self,
+        group_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let hash = self.resolve_group_hash(group_id, prefix).await?;
+        self.delete_hash(group_id, &hash).await
+    }
+
     pub async fn resolve_name(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
             let library = resolve_library(&pool, name).await?;
@@ -709,6 +760,11 @@ async fn dir_size(dir: &Path) -> u64 {
 
 fn is_blob_hash(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_hash_prefix(prefix: &str) -> bool {
+    let len = prefix.len();
+    (1..=64).contains(&len) && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -986,6 +1042,115 @@ mod tests {
         let (alias, again) = store.fingerprints_for_library(group, "喵").await.unwrap();
         assert_eq!(alias, "猫");
         assert_eq!(again.len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn unique_prefix(target: &str, others: &[String]) -> String {
+        for n in 1..=target.len() {
+            let prefix = &target[..n];
+            if others
+                .iter()
+                .all(|hash| hash == target || !hash.starts_with(prefix))
+            {
+                return prefix.to_owned();
+            }
+        }
+        target.to_owned()
+    }
+
+    fn shared_prefix(hashes: &[String]) -> Option<(&str, &str, &str)> {
+        for (i, left) in hashes.iter().enumerate() {
+            for right in hashes.iter().skip(i + 1) {
+                let n = left
+                    .bytes()
+                    .zip(right.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                if n >= 1 {
+                    return Some((&left[..n], left, right));
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn load_by_hash_prefix_full_unique_ambiguous_and_missing() {
+        let (store, dir) = temp_store();
+        let group = 21;
+        let blobs: Vec<Vec<u8>> = (1u8..=24).map(png_like).collect();
+        add_images(&store, group, "猫", blobs.clone())
+            .await
+            .unwrap();
+        let hashes: Vec<String> = blobs.iter().map(|bytes| sha256_hex(bytes)).collect();
+
+        let full = &hashes[0];
+        let got = store.load_by_hash_prefix(group, full).await.unwrap();
+        assert_eq!(got, blobs[0]);
+
+        let prefix = unique_prefix(full, &hashes);
+        let got = store.load_by_hash_prefix(group, &prefix).await.unwrap();
+        assert_eq!(got, blobs[0]);
+
+        let upper = prefix.to_ascii_uppercase();
+        let got = store.load_by_hash_prefix(group, &upper).await.unwrap();
+        assert_eq!(got, blobs[0]);
+
+        let (shared, left, right) = shared_prefix(&hashes).expect("need a shared hex prefix");
+        assert_ne!(left, right);
+        assert!(matches!(
+            store.load_by_hash_prefix(group, shared).await,
+            Err(StoreError::HashAmbiguous)
+        ));
+
+        assert!(matches!(
+            store
+                .load_by_hash_prefix(group, "ffffffffffffffffffffffffffffffff")
+                .await,
+            Err(StoreError::ImageMissing)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_by_hash_prefix_removes_unique_and_rejects_ambiguous() {
+        let (store, dir) = temp_store();
+        let group = 22;
+        let blobs: Vec<Vec<u8>> = (1u8..=24).map(png_like).collect();
+        add_images(&store, group, "猫", blobs.clone())
+            .await
+            .unwrap();
+        add_images(&store, group, "狗", vec![blobs[0].clone()])
+            .await
+            .unwrap();
+        let hashes: Vec<String> = blobs.iter().map(|bytes| sha256_hex(bytes)).collect();
+
+        let full = &hashes[0];
+        let prefix = unique_prefix(full, &hashes);
+        let libraries = store.delete_by_hash_prefix(group, &prefix).await.unwrap();
+        assert_eq!(libraries, vec!["狗".to_owned(), "猫".to_owned()]);
+        assert!(matches!(
+            store.load_by_hash_prefix(group, full).await,
+            Err(StoreError::ImageMissing)
+        ));
+        let other = store
+            .load_by_hash_prefix(group, &unique_prefix(&hashes[1], &hashes))
+            .await
+            .unwrap();
+        assert_eq!(other, blobs[1]);
+
+        let remaining: Vec<String> = hashes.iter().skip(1).cloned().collect();
+        let (shared, left, right) =
+            shared_prefix(&remaining).expect("need a shared hex prefix among leftovers");
+        assert_ne!(left, right);
+        assert!(matches!(
+            store.delete_by_hash_prefix(group, shared).await,
+            Err(StoreError::HashAmbiguous)
+        ));
+        assert!(matches!(
+            store.delete_by_hash_prefix(group, full).await,
+            Err(StoreError::ImageMissing)
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
