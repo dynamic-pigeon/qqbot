@@ -5,9 +5,8 @@
 
 use std::sync::LazyLock;
 
-use ab_glyph::{FontRef, PxScale};
-use image::{ImageFormat, Rgba, RgbaImage};
-use imageproc::drawing::{draw_hollow_rect_mut, draw_text_mut, text_size};
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+use image::{ImageFormat, Pixel, Rgba, RgbaImage};
 
 use crate::game::{Game, MAX_GUESSES, Tile, WORD_LEN};
 
@@ -90,23 +89,81 @@ fn draw_tile(
     }
     if tile.is_none() {
         for b in 0..BORDER_PX {
-            draw_hollow_rect_mut(
-                img,
-                imageproc::rect::Rect::at((x + b) as i32, (y + b) as i32)
-                    .of_size(TILE_PX - b * 2, TILE_PX - b * 2),
-                BORDER,
-            );
+            draw_hollow_rect(img, x + b, y + b, TILE_PX - b * 2, TILE_PX - b * 2, BORDER);
         }
     }
 
     if let Some(letter) = letter {
-        // 字母水平垂直居中：text_size 的宽高接近实际字形包围盒。
-        let text = letter.to_string();
-        let (tw, th) = text_size(scale, font, &text);
+        // 水平按 h_advance、垂直按 em 高居中，和字号定义一致。
+        let (tw, th) = glyph_size(font, scale, letter);
         let lx = x as i32 + (TILE_PX as i32 - tw as i32) / 2;
         let ly = y as i32 + (TILE_PX as i32 - th as i32) / 2;
-        draw_text_mut(img, WHITE, lx, ly, scale, font, &text);
+        draw_glyph(img, WHITE, lx, ly, scale, font, letter);
     }
+}
+
+fn draw_hollow_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x1 = x + w - 1;
+    let y1 = y + h - 1;
+    for px in x..=x1 {
+        img.put_pixel(px, y, color);
+        img.put_pixel(px, y1, color);
+    }
+    for py in y..=y1 {
+        img.put_pixel(x, py, color);
+        img.put_pixel(x1, py, color);
+    }
+}
+
+fn glyph_size(font: &FontRef<'_>, scale: PxScale, ch: char) -> (u32, u32) {
+    let scaled = font.as_scaled(scale);
+    let w = scaled.h_advance(scaled.glyph_id(ch)).ceil().max(0.0) as u32 + 1;
+    let h = scaled.height().ceil().max(0.0) as u32;
+    (w, h)
+}
+
+fn draw_glyph(
+    img: &mut RgbaImage,
+    color: Rgba<u8>,
+    x: i32,
+    y: i32,
+    scale: PxScale,
+    font: &FontRef<'_>,
+    ch: char,
+) {
+    let scaled = font.as_scaled(scale);
+    let glyph_id = scaled.glyph_id(ch);
+    let glyph = glyph_id.with_scale_and_position(scale, point(0.0, scaled.ascent()));
+    let Some(outlined) = font.outline_glyph(glyph) else {
+        return;
+    };
+    let bounds = outlined.px_bounds();
+    let x_shift = x + bounds.min.x.round() as i32;
+    let y_shift = y + bounds.min.y.round() as i32;
+    let width = img.width() as i32;
+    let height = img.height() as i32;
+    outlined.draw(|gx, gy, coverage| {
+        let px = gx as i32 + x_shift;
+        let py = gy as i32 + y_shift;
+        if !(0..width).contains(&px) || !(0..height).contains(&py) {
+            return;
+        }
+        let coverage = coverage.clamp(0.0, 1.0);
+        let px = px as u32;
+        let py = py as u32;
+        let mut pixel = *img.get_pixel(px, py);
+        let overlay = Rgba([
+            color[0],
+            color[1],
+            color[2],
+            (color[3] as f32 * coverage) as u8,
+        ]);
+        pixel.blend(&overlay);
+        img.put_pixel(px, py, pixel);
+    });
 }
 
 #[cfg(test)]

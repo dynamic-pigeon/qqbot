@@ -10,7 +10,6 @@ qq = [
     "dep:ab_glyph",
     "dep:base64",
     "dep:image",
-    "dep:imageproc",
     "dep:kovi",
     "dep:kovi-onebot",
     "dep:utils",
@@ -27,7 +26,6 @@ tracing-subscriber = { workspace = true, optional = true }
 ab_glyph = { version = "0.2", optional = true }
 base64 = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
-imageproc = { version = "0.25", optional = true }
 kovi = { workspace = true, optional = true }
 kovi-onebot = { workspace = true, optional = true }
 utils = { workspace = true, optional = true }
