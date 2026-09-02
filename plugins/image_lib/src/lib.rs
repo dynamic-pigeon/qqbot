@@ -9,6 +9,7 @@ mod config;
 mod fetch;
 mod name;
 mod scan;
+mod send;
 mod similar;
 mod store;
 

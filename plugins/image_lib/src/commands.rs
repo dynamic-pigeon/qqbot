@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use base64::Engine as _;
-use kovi::{Message, Segment};
-use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
+use kovi::Segment;
+use kovi_onebot::OnebotTrait;
 use utils::RateLimiter;
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
@@ -14,9 +13,10 @@ use crate::fetch::{
 };
 use crate::name::parse_library_name;
 use crate::scan::{
-    NEXT_PAGE_ARG, ScanAdvance, ScanKey, ScanSessions, group_title, packetize_images,
+    NEXT_PAGE_ARG, PackedImage, ScanAdvance, ScanKey, ScanSessions, group_title, packetize_images,
     parse_group_index,
 };
+use crate::send::{image_message, report_send_fail, send_group_wait};
 use crate::similar::{cluster, distance_from_percent};
 use crate::store::{Store, StoreError, sha256_hex};
 
@@ -156,8 +156,18 @@ async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
         Ok(bytes) => bytes,
         Err(error) => return Err(map_store_user_error(error)),
     };
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    ctx.reply(Message::new().add_image(&format!("base64://{encoded}")));
+    let hash = sha256_hex(&bytes);
+    let message = image_message(None, &[&bytes]);
+    if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
+        report_send_fail(
+            ctx.bot(),
+            format!("图库哈希发送失败 group={group_id}"),
+            &[hash],
+            &error,
+        )
+        .await;
+        return Err(CommandError::user("发送失败"));
+    }
     Ok(())
 }
 
@@ -275,8 +285,17 @@ async fn handle_draw(
         return Err(rate_limited(hit));
     }
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    ctx.reply(Message::new().add_image(&format!("base64://{encoded}")));
+    let message = image_message(None, &[&bytes]);
+    if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
+        report_send_fail(
+            ctx.bot(),
+            format!("图库来只发送失败 group={group_id} 库={name}"),
+            &[hash],
+            &error,
+        )
+        .await;
+        return Err(CommandError::user("发送失败"));
+    }
     Ok(())
 }
 
@@ -407,7 +426,7 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
                 user_id,
                 library: canonical.clone(),
             };
-            scans.start(key.clone(), groups);
+            scans.start(key.clone(), groups).await;
             show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, true).await
         }
         ScanOp::Next { name } => {
@@ -464,8 +483,8 @@ async fn show_scan_group(
 ) -> CommandResult {
     loop {
         let advance = match jump {
-            Some(index) => scans.jump(key, index),
-            None => scans.advance(key),
+            Some(index) => scans.jump(key, index).await,
+            None => scans.advance(key).await,
         };
         match advance {
             None => {
@@ -495,7 +514,10 @@ async fn show_scan_group(
                 let mut images = Vec::new();
                 for hash in &group.hashes {
                     if let Ok(bytes) = store.read_blob(group_id, hash).await {
-                        images.push(bytes);
+                        images.push(PackedImage {
+                            hash: hash.clone(),
+                            bytes,
+                        });
                     }
                 }
                 if images.len() < 2 {
@@ -505,31 +527,53 @@ async fn show_scan_group(
                     }
                     continue;
                 }
-                reply_group(
+                return reply_group(
                     ctx,
                     group_title(group.kind, index, total, group.percent),
                     images,
-                );
-                return Ok(());
+                    library,
+                    index,
+                    total,
+                )
+                .await;
             }
         }
     }
 }
 
-fn reply_group(ctx: &CommandContext, title: String, images: Vec<Vec<u8>>) {
+async fn reply_group(
+    ctx: &CommandContext,
+    title: String,
+    images: Vec<PackedImage>,
+    library: &str,
+    group_index: usize,
+    group_total: usize,
+) -> CommandResult {
+    let group_id = group_id(ctx)?;
     let packets = packetize_images(images);
-    for (i, packet) in packets.into_iter().enumerate() {
-        let mut message = if i == 0 {
-            Message::new().add_text(&title)
-        } else {
-            Message::new().add_text("（续）")
-        };
-        for bytes in packet {
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            message = message.add_image(&format!("base64://{encoded}"));
+    for (i, packet) in packets.iter().enumerate() {
+        let caption = if i == 0 { title.as_str() } else { "（续）" };
+        let bytes: Vec<&[u8]> = packet.iter().map(|image| image.bytes.as_slice()).collect();
+        let message = image_message(Some(caption), &bytes);
+        if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
+            let remaining: Vec<String> = packets[i..]
+                .iter()
+                .flat_map(|part| part.iter().map(|image| image.hash.clone()))
+                .collect();
+            report_send_fail(
+                ctx.bot(),
+                format!(
+                    "图库查重发送失败 group={group_id} 库={library} 组={group_index}/{group_total} 包={}",
+                    i + 1
+                ),
+                &remaining,
+                &error,
+            )
+            .await;
+            return Err(CommandError::user(format!("第 {} 包发送失败", i + 1)));
         }
-        ctx.reply(message);
     }
+    Ok(())
 }
 
 async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {

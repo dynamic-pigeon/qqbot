@@ -315,6 +315,26 @@ async fn fetch_mixin_key(cookie: &str) -> Result<String, DynamicsError> {
 }
 
 async fn web_session(force_refresh: bool) -> Result<WebSession, DynamicsError> {
+    if !force_refresh {
+        let state = WEB_SESSION.lock().await;
+        if let Some(session) = state.as_ref()
+            && session.expires_at > Instant::now()
+        {
+            return Ok(session.clone());
+        }
+    }
+
+    // cookie / mixin key 走 HTTP，不能占着会话锁，否则所有动态请求都堵在这一次刷新上。
+    let cookie = match COOKIE.as_ref() {
+        Some(cookie) => cookie.clone(),
+        None => bootstrap_guest_cookie().await?,
+    };
+    let fresh = WebSession {
+        mixin_key: fetch_mixin_key(&cookie).await?,
+        cookie,
+        expires_at: Instant::now() + SESSION_TTL,
+    };
+
     let mut state = WEB_SESSION.lock().await;
     if !force_refresh
         && let Some(session) = state.as_ref()
@@ -322,18 +342,8 @@ async fn web_session(force_refresh: bool) -> Result<WebSession, DynamicsError> {
     {
         return Ok(session.clone());
     }
-
-    let cookie = match COOKIE.as_ref() {
-        Some(cookie) => cookie.clone(),
-        None => bootstrap_guest_cookie().await?,
-    };
-    let session = WebSession {
-        mixin_key: fetch_mixin_key(&cookie).await?,
-        cookie,
-        expires_at: Instant::now() + SESSION_TTL,
-    };
-    *state = Some(session.clone());
-    Ok(session)
+    *state = Some(fresh.clone());
+    Ok(fresh)
 }
 
 async fn fetch_page(

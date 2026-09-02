@@ -2,10 +2,12 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+use kovi::tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -72,7 +74,8 @@ pub struct GroupStats {
 pub struct Store {
     root: PathBuf,
     max_group_bytes: u64,
-    locks: Mutex<HashMap<i64, Arc<kovi::tokio::sync::Mutex<()>>>>,
+    /// 群锁和连接池都在 async 路径上取，用 tokio Mutex 以免卡住 runtime。
+    locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     pools: Mutex<HashMap<i64, SqlitePool>>,
 }
 
@@ -104,12 +107,12 @@ impl Store {
         self.max_group_bytes
     }
 
-    fn group_lock(&self, group_id: i64) -> Arc<kovi::tokio::sync::Mutex<()>> {
+    async fn group_lock(&self, group_id: i64) -> Arc<Mutex<()>> {
         self.locks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .await
             .entry(group_id)
-            .or_insert_with(|| Arc::new(kovi::tokio::sync::Mutex::new(())))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
@@ -134,20 +137,15 @@ impl Store {
         F: FnOnce(SqlitePool) -> Fut,
         Fut: Future<Output = Result<T, StoreError>>,
     {
-        let lock = self.group_lock(group_id);
+        let lock = self.group_lock(group_id).await;
         let _guard = lock.lock().await;
         let pool = self.ensure_pool(group_id).await?;
         f(pool).await
     }
 
     async fn ensure_pool(&self, group_id: i64) -> Result<SqlitePool, StoreError> {
-        if let Some(pool) = self
-            .pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&group_id)
-        {
-            return Ok(pool.clone());
+        if let Some(pool) = self.pools.lock().await.get(&group_id).cloned() {
+            return Ok(pool);
         }
 
         let dir = self.group_dir(group_id);
@@ -167,10 +165,7 @@ impl Store {
             .await?;
         init_schema(&pool).await?;
         restrict_file_permissions(&db_path)?;
-        self.pools
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(group_id, pool.clone());
+        self.pools.lock().await.insert(group_id, pool.clone());
         Ok(pool)
     }
 
