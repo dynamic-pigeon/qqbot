@@ -54,10 +54,8 @@ where
                     Ok(Ok(_)) => Ok(Outcome::Sent),
                     Err(_) => Ok(Outcome::Timeout),
                     Ok(Err(error)) => Err(format!(
-                        "status={} retcode={} message={}",
-                        error.status,
-                        error.retcode,
-                        error.message.as_deref().unwrap_or("-")
+                        "status={} retcode={} message={:?} data={}",
+                        error.status, error.retcode, error.message, error.data
                     )),
                 }
             }
@@ -98,8 +96,8 @@ pub(crate) async fn report_send_fail(
         tracing::warn!("无法解析主管理员");
         return;
     };
-    let message = Message::new().add_text(&text);
-    if let Err(error) = send_wait(|| bot.send_private_msg_return(admin_id, message.clone())).await {
+    // send_private_msg_return 把参数原样 JSON 化，只有字符串会当成文本。
+    if let Err(error) = send_wait(|| bot.send_private_msg_return(admin_id, text.clone())).await {
         tracing::warn!("图库失败哈希私聊主管理员失败: {error:?}");
     }
 }
