@@ -175,25 +175,46 @@ impl CommandTree {
         let Some(root_span) = spans.first() else {
             return ResolveOutcome::Ignored;
         };
-        let root_name = &input[root_span.clone()];
-        let (mut node, mut path) =
-            if let Some(root) = self.roots.iter().find(|node| node.matches(root_name)) {
-                (root, vec![root.name.clone()])
-            } else if let Some(exposed) = find_exposed_root(&self.roots, root_name) {
-                exposed
-            } else {
-                return ResolveOutcome::Ignored;
-            };
+        let root_token = &input[root_span.clone()];
+        let Some(hit) = match_root_facing(&self.roots, root_token) else {
+            return ResolveOutcome::Ignored;
+        };
 
+        let mut node = hit.node;
+        let mut path = hit.path;
         let mut consumed = 1;
-        while let Some(span) = spans.get(consumed) {
-            let word = &input[span.clone()];
-            let Some(child) = node.children.iter().find(|child| child.matches(word)) else {
-                break;
-            };
-            node = child;
-            path.push(node.name.clone());
-            consumed += 1;
+        let mut glue: Option<(String, usize)> = None;
+
+        if hit.matched_len < root_token.len() {
+            glue = Some((
+                root_token[hit.matched_len..].to_owned(),
+                root_span.start + hit.matched_len,
+            ));
+        } else {
+            while let Some(span) = spans.get(consumed) {
+                let word = &input[span.clone()];
+                let Some((child, matched_len)) = match_siblings(&node.children, word) else {
+                    break;
+                };
+                node = child;
+                path.push(node.name.clone());
+                consumed += 1;
+                if matched_len < word.len() {
+                    glue = Some((word[matched_len..].to_owned(), span.start + matched_len));
+                    break;
+                }
+            }
+        }
+
+        // 有子命令时，对不上的下一个词（含粘连前缀剩下的部分）一律当未知子命令，
+        // 避免父节点默认 handler 把「图库 乱输」吃成参数过多。
+        if !node.children.is_empty() {
+            if let Some((suffix, _)) = glue.as_ref() {
+                return unknown_subcommand(node, path, suffix.clone());
+            }
+            if let Some(span) = spans.get(consumed) {
+                return unknown_subcommand(node, path, input[span.clone()].to_owned());
+            }
         }
 
         let Some(handler) = node.handler.clone() else {
@@ -224,11 +245,21 @@ impl CommandTree {
             };
         };
 
-        let args = spans[consumed..]
-            .iter()
-            .map(|span| input[span.clone()].to_owned())
-            .collect();
-        let rest = rest_after_path(input, &spans, consumed);
+        let (args, rest) = if let Some((suffix, rest_start)) = glue {
+            let mut args = vec![suffix];
+            args.extend(
+                spans[consumed..]
+                    .iter()
+                    .map(|span| input[span.clone()].to_owned()),
+            );
+            (args, input[rest_start..].to_owned())
+        } else {
+            let args = spans[consumed..]
+                .iter()
+                .map(|span| input[span.clone()].to_owned())
+                .collect();
+            (args, rest_after_path(input, &spans, consumed))
+        };
 
         ResolveOutcome::Matched(ResolvedCommand {
             path,
@@ -246,10 +277,98 @@ impl CommandTree {
     }
 }
 
-impl Command {
-    fn matches(&self, word: &str) -> bool {
-        self.name == word || self.aliases.iter().any(|alias| alias == word)
+fn token_match(command: &Command, token: &str) -> Option<usize> {
+    let mut best = None;
+    for name in std::iter::once(&command.name).chain(&command.aliases) {
+        let matched = if command.prefix_match {
+            !name.is_empty() && token.starts_with(name.as_str())
+        } else {
+            token == name
+        };
+        if matched {
+            best = Some(best.map_or(name.len(), |best: usize| best.max(name.len())));
+        }
     }
+    best
+}
+
+fn match_siblings<'a>(commands: &'a [Command], token: &str) -> Option<(&'a Command, usize)> {
+    let mut best: Option<(&Command, usize)> = None;
+    for command in commands {
+        if let Some(len) = token_match(command, token)
+            && best.is_none_or(|(_, best_len)| len > best_len)
+        {
+            best = Some((command, len));
+        }
+    }
+    best
+}
+
+struct RootHit<'a> {
+    node: &'a Command,
+    path: Vec<String>,
+    matched_len: usize,
+}
+
+fn match_root_facing<'a>(roots: &'a [Command], token: &str) -> Option<RootHit<'a>> {
+    let mut best: Option<RootHit<'a>> = None;
+
+    fn consider<'a>(
+        best: &mut Option<RootHit<'a>>,
+        node: &'a Command,
+        path: Vec<String>,
+        token: &str,
+    ) {
+        if let Some(len) = token_match(node, token)
+            && best
+                .as_ref()
+                .is_none_or(|current| len > current.matched_len)
+        {
+            *best = Some(RootHit {
+                node,
+                path,
+                matched_len: len,
+            });
+        }
+    }
+
+    fn walk_exposed<'a>(
+        best: &mut Option<RootHit<'a>>,
+        node: &'a Command,
+        path: &[String],
+        token: &str,
+    ) {
+        for child in &node.children {
+            let mut child_path = path.to_vec();
+            child_path.push(child.name.clone());
+            if child.expose_as_root {
+                consider(best, child, child_path.clone(), token);
+            }
+            walk_exposed(best, child, &child_path, token);
+        }
+    }
+
+    for root in roots {
+        let path = vec![root.name.clone()];
+        consider(&mut best, root, path.clone(), token);
+        walk_exposed(&mut best, root, &path, token);
+    }
+    best
+}
+
+fn unknown_subcommand(node: &Command, path: Vec<String>, subcommand: String) -> ResolveOutcome {
+    ResolveOutcome::Error(RouteError::UnknownSubcommand {
+        path,
+        subcommand,
+        usage: node.usage.clone(),
+        available: node
+            .children
+            .iter()
+            .map(|child| child.name.clone())
+            .collect(),
+        permission: node.permission.unwrap_or_default(),
+        scope: node.scope.unwrap_or_default(),
+    })
 }
 
 fn prepare_node(
@@ -287,30 +406,6 @@ fn prepare_node(
         prepare_node(child, permission, scope, &path)?;
     }
     Ok(())
-}
-
-fn find_exposed_root<'a>(roots: &'a [Command], name: &str) -> Option<(&'a Command, Vec<String>)> {
-    fn walk<'a>(node: &'a Command, name: &str, path: &mut Vec<String>) -> Option<&'a Command> {
-        for child in &node.children {
-            path.push(child.name.clone());
-            if child.expose_as_root && child.matches(name) {
-                return Some(child);
-            }
-            if let Some(found) = walk(child, name, path) {
-                return Some(found);
-            }
-            path.pop();
-        }
-        None
-    }
-
-    for root in roots {
-        let mut path = vec![root.name.clone()];
-        if let Some(found) = walk(root, name, &mut path) {
-            return Some((found, path));
-        }
-    }
-    None
 }
 
 fn validate_exposed_root_names(roots: &[Command]) -> Result<(), CommandRegistrationError> {

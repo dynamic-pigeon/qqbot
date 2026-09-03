@@ -56,6 +56,7 @@ impl CatalogStore {
             }
         }
 
+        self.roots.retain(|_, root| root.owner != owner);
         for root in tree.roots() {
             let mut entries = Vec::new();
             collect_entries(owner, root, &[], &[], &mut entries);

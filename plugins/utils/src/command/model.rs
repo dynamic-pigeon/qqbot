@@ -216,6 +216,30 @@ impl CommandContext {
         let message = Message::from(message);
         RepliableEvent::reply_and_quote::<Message>(self.event.as_ref(), message);
     }
+
+    pub fn group_id(&self) -> Result<i64, CommandError> {
+        self.event
+            .group_id
+            .ok_or_else(|| CommandError::internal(anyhow::anyhow!("群命令事件缺少 group_id")))
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.bot
+            .get_all_admin()
+            .unwrap_or_default()
+            .iter()
+            .any(|id| id.try_as_i64() == Some(self.event.user_id))
+    }
+
+    pub fn require_admin(&self) -> Result<(), CommandError> {
+        if self.is_admin() {
+            Ok(())
+        } else {
+            Err(CommandError::user(
+                AccessError::PermissionDenied.to_string(),
+            ))
+        }
+    }
 }
 
 pub struct Command {
@@ -228,6 +252,7 @@ pub struct Command {
     pub(crate) children: Vec<Command>,
     pub(crate) handler: Option<CommandHandler>,
     pub(crate) expose_as_root: bool,
+    pub(crate) prefix_match: bool,
 }
 
 impl Command {
@@ -242,6 +267,7 @@ impl Command {
             children: Vec::new(),
             handler: None,
             expose_as_root: false,
+            prefix_match: false,
         }
     }
 
@@ -279,6 +305,13 @@ impl Command {
     /// 帮助目录只展示父命令。
     pub fn expose_as_root(mut self) -> Self {
         self.expose_as_root = true;
+        self
+    }
+
+    /// 当前词以命令名为前缀即命中，词里剩下的部分当作第一个参数。
+    /// 默认仍按空白切开后精确匹配；需要 `来只猫` 这种粘连写法时再打开。
+    pub fn prefix_match(mut self) -> Self {
+        self.prefix_match = true;
         self
     }
 

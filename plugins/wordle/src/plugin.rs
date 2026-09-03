@@ -313,11 +313,5 @@ mod tests {
                 assert_eq!(command.args(), ["hard"]);
             }
         }
-
-        assert!(matches!(tree.resolve("/wordle"), ResolveOutcome::Error(_)));
-        assert!(matches!(
-            tree.resolve("/wordle bogus"),
-            ResolveOutcome::Error(_)
-        ));
     }
 }

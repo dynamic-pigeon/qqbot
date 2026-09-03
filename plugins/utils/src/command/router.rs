@@ -32,52 +32,57 @@ impl CommandRouter {
         let tree = Arc::new(CommandTree::new(self.commands)?);
         CommandCatalog::register(&self.owner, &tree)?;
 
+        // kovi 把 on_msg 记在当前插件的 listen 上，禁用插件会 clear。
+        // 分发必须跟命令所属插件同生共死，不能挂到第一个 install 的插件上。
         let bot = self.bot;
         plugin::on_msg(move |event| {
             let tree = Arc::clone(&tree);
             let bot = Arc::clone(&bot);
             async move {
-                let Some(text) = extract_command_text(&event.message) else {
-                    return;
-                };
-                let resolved = match tree.resolve(&text) {
-                    ResolveOutcome::Ignored => return,
-                    ResolveOutcome::Error(error) => {
-                        if let Err(access_error) =
-                            check_event_access(&event, &bot, error.scope(), error.permission())
-                        {
-                            reply_access_error(&event, access_error);
-                            return;
-                        }
-                        event.reply(error.to_string());
-                        return;
-                    }
-                    ResolveOutcome::Matched(resolved) => resolved,
-                };
-
-                let (path, arguments, usage, permission, scope, handler) =
-                    resolved.into_dispatch_parts();
-                if let Err(error) = check_event_access(&event, &bot, scope, permission) {
-                    reply_access_error(&event, error);
-                    return;
-                }
-
-                let context = CommandContext::new(Arc::clone(&event), Arc::clone(&bot), arguments);
-                if let Err(error) = handler(context).await {
-                    if let CommandError::Internal(internal) = &error {
-                        tracing::error!(
-                            command = %path.join(" "),
-                            user_id = event.user_id,
-                            group_id = event.group_id,
-                            error = ?internal,
-                            "命令执行失败"
-                        );
-                    }
-                    event.reply(render_command_error(&error, &usage));
-                }
+                dispatch_msg(tree, bot, event).await;
             }
         });
         Ok(())
+    }
+}
+
+async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<MsgEvent>) {
+    let Some(text) = extract_command_text(&event.message) else {
+        return;
+    };
+    let resolved = match tree.resolve(&text) {
+        ResolveOutcome::Ignored => return,
+        ResolveOutcome::Error(error) => {
+            if let Err(access_error) =
+                check_event_access(&event, &bot, error.scope(), error.permission())
+            {
+                reply_access_error(&event, access_error);
+                return;
+            }
+            event.reply(error.to_string());
+            return;
+        }
+        ResolveOutcome::Matched(resolved) => resolved,
+    };
+
+    let (path, arguments, usage, permission, scope, handler) = resolved.into_dispatch_parts();
+    if let Err(error) = check_event_access(&event, &bot, scope, permission) {
+        reply_access_error(&event, error);
+        return;
+    }
+
+    let context = CommandContext::new(Arc::clone(&event), Arc::clone(&bot), arguments);
+    if let Err(error) = handler(context).await {
+        if let CommandError::Internal(internal) = &error {
+            tracing::error!(
+                command = %path.join(" "),
+                user_id = event.user_id,
+                group_id = event.group_id,
+                error = ?internal,
+                "命令执行失败"
+            );
+        }
+        event.reply(render_command_error(&error, &usage));
     }
 }
 

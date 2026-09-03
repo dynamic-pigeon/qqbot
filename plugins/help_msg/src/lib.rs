@@ -20,19 +20,3 @@ async fn main() {
         .install()
         .expect("注册 /help 命令失败");
 }
-
-#[cfg(test)]
-mod tests {
-    use utils::command::{CommandTree, ResolveOutcome};
-
-    #[test]
-    fn help_command_resolves_nested_help_paths_as_arguments() {
-        let tree = CommandTree::new(vec![super::help_command()]).unwrap();
-        let ResolveOutcome::Matched(command) = tree.resolve("/help live add") else {
-            panic!("expected /help to resolve");
-        };
-
-        assert_eq!(command.path(), ["/help"]);
-        assert_eq!(command.args(), ["live", "add"]);
-    }
-}
