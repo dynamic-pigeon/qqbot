@@ -17,7 +17,6 @@ anyhow.workspace = true
 serde.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-arc-swap.workspace = true
 reqwest.workspace = true
 ammonia = { workspace = true, optional = true }
 askama = { workspace = true, optional = true }

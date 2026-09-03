@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
-use utils::{RcuCell, RcuReadGuard};
+use arc_swap::ArcSwap;
 
 /// 根目录 `config.toml` 的 `[msg_rank]`。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -49,7 +49,7 @@ pub(crate) fn static_config() -> &'static StaticConfig {
     &CONFIG
 }
 
-pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<RcuCell<Config>> =
+pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<ArcSwap<Config>> =
     kovi::tokio::sync::OnceCell::const_new();
 static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
@@ -77,8 +77,6 @@ impl Default for Config {
     }
 }
 
-pub(crate) type ConfigGuard<'a> = RcuReadGuard<'a, Config>;
-
 pub async fn init_config(path: PathBuf) -> Result<()> {
     let mut config: Config = kovi::utils::load_json_data(Default::default(), &path)
         .map_err(|e| anyhow::anyhow!("加载配置文件失败: {e}"))?;
@@ -87,10 +85,9 @@ pub async fn init_config(path: PathBuf) -> Result<()> {
         write_config(&config)?;
     }
     restrict_config_permissions(&config.path)?;
-    let rcu = RcuCell::new(config);
 
     CONFIG
-        .set(rcu)
+        .set(ArcSwap::from_pointee(config))
         .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
     Ok(())
 }
@@ -109,9 +106,8 @@ fn restrict_config_permissions(_path: &std::path::Path) -> Result<()> {
 }
 
 #[inline(always)]
-pub fn read_config() -> ConfigGuard<'static> {
-    let config = CONFIG.get().expect("配置未初始化");
-    config.read()
+pub fn read_config() -> Arc<Config> {
+    CONFIG.get().expect("配置未初始化").load_full()
 }
 
 #[cold]
@@ -124,11 +120,11 @@ where
     let _write_guard = CONFIG_WRITE_LOCK.lock().await;
 
     let cfg = CONFIG.get().unwrap();
-    let mut next = cfg.snapshot();
+    let mut next = cfg.load_full().as_ref().clone();
     f(&mut next);
     // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
     write_config(&next)?;
-    cfg.replace(next);
+    cfg.store(Arc::new(next));
     Ok(())
 }
 
