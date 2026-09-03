@@ -48,6 +48,7 @@ fn add_command(store: Arc<Store>) -> Command {
         .description("回复一张或多张图，写入本群指定图库")
         .usage("添加 <库名>")
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_add(ctx, &store).await }
@@ -59,6 +60,7 @@ fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
         .description("从本群指定图库随机发一张图")
         .usage("来只 <库名>")
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             let limiter = Arc::clone(&limiter);
@@ -71,6 +73,7 @@ fn delete_command(store: Arc<Store>) -> Command {
         .description("回复一张图删除该图；管理员删除库名或别名则清空整个库")
         .usage("删除\n删除 <库名或别名>")
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_delete(ctx, &store).await }
@@ -82,6 +85,7 @@ fn alias_command(store: Arc<Store>) -> Command {
         .description("给已有图库起别名，来只/添加/删除都走同一库")
         .usage("别名 <别名> <库名>")
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_alias(ctx, &store).await }
@@ -93,6 +97,7 @@ fn unalias_command(store: Arc<Store>) -> Command {
         .description("去掉一个图库别名，不删除图片")
         .usage("取消别名 <别名>")
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_unalias(ctx, &store).await }
@@ -105,6 +110,7 @@ fn send_hash_command(store: Arc<Store>) -> Command {
         .usage("哈希 <哈希或前缀>")
         .permission(Permission::BotAdmin)
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_send_hash(ctx, &store).await }
@@ -117,6 +123,7 @@ fn delete_hash_command(store: Arc<Store>) -> Command {
         .usage("删除哈希 <哈希或前缀>")
         .permission(Permission::BotAdmin)
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             async move { handle_delete_hash(ctx, &store).await }
@@ -129,6 +136,7 @@ fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
         .usage("查重 <库名> [组号|下一组|相似度%]")
         .permission(Permission::BotAdmin)
         .expose_as_root()
+        .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
             let scans = Arc::clone(&scans);
@@ -151,7 +159,7 @@ fn parse_hash_prefix(raw: &str) -> Result<String, CommandError> {
 async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
     let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     let bytes = match store.load_by_hash_prefix(group_id, &prefix).await {
         Ok(bytes) => bytes,
         Err(error) => return Err(map_store_user_error(error)),
@@ -174,7 +182,7 @@ async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_delete_hash(ctx: CommandContext, store: &Store) -> CommandResult {
     let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     match store.delete_by_hash_prefix(group_id, &prefix).await {
         Ok(libraries) => {
             ctx.reply(format!(
@@ -190,7 +198,7 @@ async fn handle_delete_hash(ctx: CommandContext, store: &Store) -> CommandResult
 async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     let name = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     let reply_id = extract_reply_id(&ctx.event().message)
         .ok_or_else(|| CommandError::user("请回复一张包含图片的消息后再添加"))?;
 
@@ -229,7 +237,7 @@ async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
     let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     let target = parse_library_name(ctx.arg(1).unwrap_or(""))?;
     ctx.ensure_no_extra_args(2)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     match store.set_alias(group_id, alias, target).await {
         Ok(canonical) => {
             ctx.reply(format!("「{alias}」现在是「{canonical}」的别名"));
@@ -242,7 +250,7 @@ async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_unalias(ctx: CommandContext, store: &Store) -> CommandResult {
     let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     match store.remove_alias(group_id, alias).await {
         Ok(()) => {
             ctx.reply(format!("已取消别名「{alias}」"));
@@ -259,7 +267,7 @@ async fn handle_draw(
 ) -> CommandResult {
     let name = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
 
     let hash = match store.pick_random(group_id, name).await {
         Ok(hash) => hash,
@@ -301,13 +309,11 @@ async fn handle_draw(
 
 async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
     ctx.ensure_no_extra_args(1)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     match ctx.arg(0) {
         None => delete_one_image(&ctx, store, group_id).await,
         Some(name) => {
-            if !is_bot_admin(&ctx) {
-                return Err(CommandError::user("管理员专用命令，普通用户无法使用"));
-            }
+            ctx.require_admin()?;
             let name = parse_library_name(name)?;
             match store.wipe_library(group_id, name).await {
                 Ok(canonical) => {
@@ -400,7 +406,7 @@ fn missing_library(name: &str, error: StoreError) -> CommandError {
 
 async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -> CommandResult {
     let op = parse_scan_op(ctx.args())?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     let user_id = ctx.event().user_id;
     match op {
         ScanOp::Start { name, percent } => {
@@ -549,7 +555,7 @@ async fn reply_group(
     group_index: usize,
     group_total: usize,
 ) -> CommandResult {
-    let group_id = group_id(ctx)?;
+    let group_id = ctx.group_id()?;
     let packets = packetize_images(images);
     for (i, packet) in packets.iter().enumerate() {
         let caption = if i == 0 { title.as_str() } else { "（续）" };
@@ -578,7 +584,7 @@ async fn reply_group(
 
 async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = group_id(&ctx)?;
+    let group_id = ctx.group_id()?;
     let stats = store
         .stats(group_id)
         .await
@@ -674,20 +680,6 @@ fn map_store_user_error(error: StoreError) -> CommandError {
 
 fn rate_limited(hit: utils::RateLimitHit) -> CommandError {
     CommandError::user(format!("请在 {} 秒后再试", hit.retry_after_secs()))
-}
-
-fn group_id(ctx: &CommandContext) -> Result<i64, CommandError> {
-    ctx.event()
-        .group_id
-        .ok_or_else(|| CommandError::user("此命令只能在群聊中使用"))
-}
-
-fn is_bot_admin(ctx: &CommandContext) -> bool {
-    ctx.bot()
-        .get_all_admin()
-        .unwrap_or_default()
-        .iter()
-        .any(|id| id.try_as_i64() == Some(ctx.event().user_id))
 }
 
 pub fn format_bytes(bytes: u64) -> String {

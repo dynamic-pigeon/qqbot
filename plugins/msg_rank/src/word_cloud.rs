@@ -181,7 +181,7 @@ pub(crate) fn wordcloud_command(path: Arc<PathBuf>) -> Command {
 
 async fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group_id = ctx.group_id()?;
     let bot = Arc::clone(ctx.bot());
     ctx.reply("⏳ 正在生成词云...");
     kovi::spawn(async move {
@@ -192,7 +192,7 @@ async fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResul
 
 async fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group_id = ctx.group_id()?;
     modify_config(|config| {
         if !config.notify_group.contains(&group_id) {
             config.notify_group.push(group_id);
@@ -206,7 +206,7 @@ async fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
 
 async fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group_id = ctx.group_id()?;
     modify_config(|config| {
         config.notify_group.retain(|&id| id != group_id);
     })
@@ -218,7 +218,7 @@ async fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
 
 async fn wordcloud_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group_id = ctx.group_id()?;
     let enabled = read_config().notify_group.contains(&group_id);
     ctx.reply(if enabled {
         "词云功能已启用"
@@ -472,7 +472,7 @@ async fn load_stop_words(path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use utils::command::{Permission, ResolveOutcome, RouteError};
+    use utils::command::{Permission, ResolveOutcome};
 
     #[test]
     fn command_tree_registers_admin_group_subcommands() {
@@ -489,11 +489,6 @@ mod tests {
             assert_eq!(command.permission(), Permission::BotAdmin);
             assert_eq!(command.scope(), utils::command::MessageScope::Group);
         }
-
-        assert!(matches!(
-            tree.resolve("/wordcloud"),
-            ResolveOutcome::Error(RouteError::MissingSubcommand { .. })
-        ));
     }
 
     #[test]

@@ -115,31 +115,6 @@ fn inherits_scope_and_permission_and_allows_tightening() {
 #[test]
 fn reports_missing_and_unknown_subcommands_at_the_deepest_node() {
     let tree = CommandTree::new(vec![
-        Command::new("/live")
-            .usage("/live <add|list>")
-            .subcommand(endpoint("add"))
-            .subcommand(endpoint("list")),
-    ])
-    .unwrap();
-
-    let ResolveOutcome::Error(RouteError::MissingSubcommand { path, .. }) = tree.resolve("/live")
-    else {
-        panic!("expected a missing-subcommand error");
-    };
-    assert_eq!(path, ["/live"]);
-
-    let ResolveOutcome::Error(error) = tree.resolve("/live nope") else {
-        panic!("expected an unknown-subcommand error");
-    };
-    assert_eq!(
-        error.to_string(),
-        "未知子命令 `nope`\n用法: /live <add|list>\n可用子命令: add | list"
-    );
-}
-
-#[test]
-fn route_errors_retain_the_deepest_nodes_access_rules() {
-    let tree = CommandTree::new(vec![
         Command::new("/admin")
             .scope(MessageScope::Group)
             .permission(Permission::BotAdmin)
@@ -147,12 +122,29 @@ fn route_errors_retain_the_deepest_nodes_access_rules() {
             .subcommand(endpoint("status")),
     ])
     .unwrap();
-    let ResolveOutcome::Error(error) = tree.resolve("/admin nope") else {
-        panic!("expected a route error");
-    };
 
-    assert_eq!(error.scope(), MessageScope::Group);
+    let ResolveOutcome::Error(RouteError::MissingSubcommand {
+        path,
+        permission,
+        scope,
+        ..
+    }) = tree.resolve("/admin")
+    else {
+        panic!("expected a missing-subcommand error");
+    };
+    assert_eq!(path, ["/admin"]);
+    assert_eq!(permission, Permission::BotAdmin);
+    assert_eq!(scope, MessageScope::Group);
+
+    let ResolveOutcome::Error(error) = tree.resolve("/admin nope") else {
+        panic!("expected an unknown-subcommand error");
+    };
+    assert_eq!(
+        error.to_string(),
+        "未知子命令 `nope`\n用法: /admin <status>\n可用子命令: status"
+    );
     assert_eq!(error.permission(), Permission::BotAdmin);
+    assert_eq!(error.scope(), MessageScope::Group);
 }
 
 #[test]
@@ -324,6 +316,55 @@ fn exposed_subcommands_resolve_without_parent_prefix() {
         panic!("expected parent handler to resolve");
     };
     assert_eq!(path(&parent), ["图库"]);
+
+    let ResolveOutcome::Error(RouteError::UnknownSubcommand { subcommand, .. }) =
+        tree.resolve("图库 乱输")
+    else {
+        panic!("expected unknown subcommand instead of parent args");
+    };
+    assert_eq!(subcommand, "乱输");
+}
+
+#[test]
+fn prefix_match_glues_the_rest_of_the_token_as_the_first_arg() {
+    let tree = CommandTree::new(vec![
+        Command::new("图库")
+            .handler(|_| async { Ok(()) })
+            .subcommand(endpoint("来只").expose_as_root().prefix_match())
+            .subcommand(endpoint("删除").expose_as_root().prefix_match())
+            .subcommand(endpoint("删除哈希").expose_as_root().prefix_match()),
+    ])
+    .unwrap();
+
+    let ResolveOutcome::Matched(glued) = tree.resolve("来只猫") else {
+        panic!("expected glued prefix match");
+    };
+    assert_eq!(path(&glued), ["图库", "来只"]);
+    assert_eq!(glued.args(), ["猫"]);
+    assert_eq!(glued.rest(), "猫");
+
+    let ResolveOutcome::Matched(nested) = tree.resolve("图库 来只猫") else {
+        panic!("expected nested glued child");
+    };
+    assert_eq!(path(&nested), ["图库", "来只"]);
+    assert_eq!(nested.args(), ["猫"]);
+
+    assert!(matches!(
+        tree.resolve("图库来只猫"),
+        ResolveOutcome::Ignored
+    ));
+
+    let ResolveOutcome::Matched(hash) = tree.resolve("删除哈希abc") else {
+        panic!("expected longest prefix 删除哈希");
+    };
+    assert_eq!(path(&hash), ["图库", "删除哈希"]);
+    assert_eq!(hash.args(), ["abc"]);
+
+    let ResolveOutcome::Matched(delete) = tree.resolve("删除abc") else {
+        panic!("expected shorter prefix 删除");
+    };
+    assert_eq!(path(&delete), ["图库", "删除"]);
+    assert_eq!(delete.args(), ["abc"]);
 }
 
 #[test]
@@ -368,32 +409,29 @@ fn catalog_groups_exposed_subcommands_under_parent_root() {
 }
 
 #[test]
-fn catalog_rejects_exposed_root_conflicts_between_plugins() {
+fn catalog_rejects_root_conflicts_between_plugins() {
     let grouped = CommandTree::new(vec![
         Command::new("图库")
             .handler(|_| async { Ok(()) })
             .subcommand(endpoint("添加").expose_as_root()),
     ])
     .unwrap();
-    let other = CommandTree::new(vec![endpoint("添加")]).unwrap();
     let mut catalog = CatalogStore::default();
     catalog.register("image_lib", &grouped).unwrap();
-
     assert!(matches!(
-        catalog.register("other", &other),
+        catalog.register("other", &CommandTree::new(vec![endpoint("添加")]).unwrap()),
         Err(CommandRegistrationError::RootConflict { ref root, .. }) if root == "添加"
     ));
-}
 
-#[test]
-fn catalog_rejects_root_alias_conflicts_between_plugins() {
-    let first = CommandTree::new(vec![endpoint("/first").alias("/shared")]).unwrap();
-    let second = CommandTree::new(vec![endpoint("/shared")]).unwrap();
     let mut catalog = CatalogStore::default();
-    catalog.register("first", &first).unwrap();
-
+    catalog
+        .register(
+            "first",
+            &CommandTree::new(vec![endpoint("/first").alias("/shared")]).unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
-        catalog.register("second", &second),
+        catalog.register("second", &CommandTree::new(vec![endpoint("/shared")]).unwrap()),
         Err(CommandRegistrationError::RootConflict { ref root, .. }) if root == "/shared"
     ));
 }

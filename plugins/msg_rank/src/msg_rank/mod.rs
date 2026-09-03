@@ -29,7 +29,7 @@ pub(crate) fn daily_rank_command() -> Command {
 
 async fn handle_daily_rank(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.event().group_id.expect("群命令已通过范围校验");
+    let group_id = ctx.group_id()?;
     if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
         return Err(CommandError::user(format!(
             "刚跑完，{} 秒后再试一次",
