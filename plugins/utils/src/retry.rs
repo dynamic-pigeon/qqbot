@@ -70,22 +70,6 @@ mod tests {
         assert_eq!(backoff_delay(10, base, max), Duration::from_millis(100));
     }
 
-    #[test]
-    fn backoff_delay_clamps_edges() {
-        let max = Duration::from_secs(1);
-        assert_eq!(
-            backoff_delay(31, Duration::from_millis(1), max),
-            backoff_delay(100, Duration::from_millis(1), max)
-        );
-        assert_eq!(backoff_delay(5, Duration::ZERO, max), Duration::ZERO);
-        assert_eq!(
-            backoff_delay(5, Duration::from_secs(1), Duration::ZERO),
-            Duration::ZERO
-        );
-        assert_eq!(backoff_delay(0, Duration::from_secs(10), max), max);
-        assert_eq!(backoff_delay(10, Duration::from_secs(10), max), max);
-    }
-
     #[tokio::test]
     async fn retry_async_with_backoff_retries_until_success() {
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

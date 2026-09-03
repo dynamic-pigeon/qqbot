@@ -2020,6 +2020,7 @@ name = "msg_rank"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "askama",
  "base64 0.23.1",
  "bytes",
@@ -3768,7 +3769,6 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "anyhow",
- "arc-swap",
  "askama",
  "chromiumoxide",
  "kovi",

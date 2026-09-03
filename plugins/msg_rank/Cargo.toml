@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 utils = { workspace = true, features = ["screenshot"] }
+arc-swap.workspace = true
 kovi.workspace = true
 kovi-onebot.workspace = true
 serde.workspace = true

@@ -2,7 +2,6 @@ mod bounded_pool;
 pub mod command;
 pub mod config;
 mod rate_limit;
-mod rcu;
 mod resource_manager;
 
 #[cfg(feature = "markdown")]
@@ -15,7 +14,6 @@ pub mod safe_url;
 
 pub use bounded_pool::BoundedPool;
 pub use rate_limit::{RateLimitHit, RateLimiter};
-pub use rcu::{RcuCell, RcuReadGuard};
 pub use resource_manager::{ManagedResource, ResourceManager};
 pub use safe_url::{
     PRIVATE_NETWORK_PROTECTION_ENV, download_image_limited, is_public_ip,
