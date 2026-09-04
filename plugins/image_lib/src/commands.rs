@@ -170,7 +170,8 @@ async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
         report_send_fail(
             ctx.bot(),
             format!("图库哈希发送失败 group={group_id}"),
-            &[hash],
+            std::slice::from_ref(&hash),
+            std::slice::from_ref(&bytes),
             &error,
         )
         .await;
@@ -298,7 +299,8 @@ async fn handle_draw(
         report_send_fail(
             ctx.bot(),
             format!("图库来只发送失败 group={group_id} 库={name}"),
-            &[hash],
+            std::slice::from_ref(&hash),
+            std::slice::from_ref(&bytes),
             &error,
         )
         .await;
@@ -566,6 +568,7 @@ async fn reply_group(
                 .iter()
                 .flat_map(|part| part.iter().map(|image| image.hash.clone()))
                 .collect();
+            let previews: Vec<Vec<u8>> = packet.iter().map(|image| image.bytes.clone()).collect();
             report_send_fail(
                 ctx.bot(),
                 format!(
@@ -573,6 +576,7 @@ async fn reply_group(
                     i + 1
                 ),
                 &remaining,
+                &previews,
                 &error,
             )
             .await;
