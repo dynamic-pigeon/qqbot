@@ -10,6 +10,7 @@ use std::{
 use kovi::tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -360,13 +361,30 @@ impl Store {
     pub async fn pick_random(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
             let library = resolve_library(&pool, name).await?;
-            let hash = sqlx::query_scalar::<_, String>(
-                "SELECT hash FROM images WHERE library = ? ORDER BY RANDOM() LIMIT 1",
+            let rows = sqlx::query("SELECT hash, draw_count FROM images WHERE library = ?")
+                .bind(&library)
+                .fetch_all(&pool)
+                .await?;
+            let items = rows
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>("hash")?,
+                        row.try_get::<i64, _>("draw_count")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()?;
+            let hash = pick_weighted(&items, &mut rand::rng())
+                .map(str::to_owned)
+                .ok_or(StoreError::LibraryEmpty)?;
+            sqlx::query(
+                "UPDATE images SET draw_count = draw_count + 1 WHERE library = ? AND hash = ?",
             )
             .bind(&library)
-            .fetch_optional(&pool)
+            .bind(&hash)
+            .execute(&pool)
             .await?;
-            hash.ok_or(StoreError::LibraryEmpty)
+            Ok(hash)
         })
         .await
     }
@@ -595,11 +613,13 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
             library TEXT NOT NULL,
             hash TEXT NOT NULL CHECK (length(hash) = 64),
             size INTEGER NOT NULL CHECK (size > 0),
+            draw_count INTEGER NOT NULL DEFAULT 0 CHECK (draw_count >= 0),
             PRIMARY KEY (library, hash)
         )",
     )
     .execute(pool)
     .await?;
+    ensure_draw_count_column(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS aliases (
             alias TEXT NOT NULL PRIMARY KEY,
@@ -624,6 +644,43 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn ensure_draw_count_column(pool: &SqlitePool) -> Result<(), StoreError> {
+    let rows = sqlx::query("PRAGMA table_info(images)")
+        .fetch_all(pool)
+        .await?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == "draw_count")
+    });
+    if !exists {
+        sqlx::query("ALTER TABLE images ADD COLUMN draw_count INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// 权重 `1 / (次数 - 库内最小次数 + 1)`，最少的那档永远是 1。
+fn pick_weighted<'a>(items: &'a [(String, i64)], rng: &mut impl RngExt) -> Option<&'a str> {
+    let min = items.iter().map(|(_, count)| *count).min()?;
+    let mut total = 0.0;
+    for (_, count) in items {
+        total += weight(*count, min);
+    }
+    let mut throw = rng.random::<f64>() * total;
+    for (hash, count) in items {
+        throw -= weight(*count, min);
+        if throw <= 0.0 {
+            return Some(hash);
+        }
+    }
+    items.last().map(|(hash, _)| hash.as_str())
+}
+
+fn weight(count: i64, min: i64) -> f64 {
+    1.0 / (count.saturating_sub(min) as f64 + 1.0)
 }
 
 async fn resolve_library(pool: &SqlitePool, name: &str) -> Result<String, StoreError> {
@@ -712,13 +769,23 @@ async fn insert_images(
     library: &str,
     images: &[(String, u64)],
 ) -> Result<(), StoreError> {
+    let draw_count = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MIN(draw_count) FROM images WHERE library = ?",
+    )
+    .bind(library)
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0);
     for (hash, size) in images {
-        sqlx::query("INSERT OR IGNORE INTO images (library, hash, size) VALUES (?, ?, ?)")
-            .bind(library)
-            .bind(hash)
-            .bind(*size as i64)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO images (library, hash, size, draw_count) VALUES (?, ?, ?, ?)",
+        )
+        .bind(library)
+        .bind(hash)
+        .bind(*size as i64)
+        .bind(draw_count)
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -1084,6 +1151,51 @@ mod tests {
 
         assert!(store.read_blob(group, "../passwd").await.is_err());
         assert!(store.read_blob(group, "zz").await.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn draw_counts(
+        store: &Store,
+        group_id: i64,
+        name: &str,
+    ) -> Result<Vec<(String, i64)>, StoreError> {
+        store
+            .with_group(group_id, |pool| async move {
+                let library = resolve_library(&pool, name).await?;
+                let rows = sqlx::query(
+                    "SELECT hash, draw_count FROM images WHERE library = ? ORDER BY hash",
+                )
+                .bind(&library)
+                .fetch_all(&pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok((
+                            row.try_get::<String, _>("hash")?,
+                            row.try_get::<i64, _>("draw_count")?,
+                        ))
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn new_images_start_at_library_min_and_pick_increments() {
+        let (store, dir) = temp_store();
+        let group = 31;
+        let a = png_like(1);
+        let b = png_like(2);
+        add_images(&store, group, "猫", vec![a.clone()])
+            .await
+            .unwrap();
+        store.pick_random(group, "猫").await.unwrap();
+        add_images(&store, group, "猫", vec![b.clone()])
+            .await
+            .unwrap();
+        let mut expected = vec![(sha256_hex(&a), 1), (sha256_hex(&b), 1)];
+        expected.sort();
+        assert_eq!(draw_counts(&store, group, "猫").await.unwrap(), expected);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
