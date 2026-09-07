@@ -8,8 +8,8 @@ use utils::command::{
 };
 
 use crate::fetch::{
-    FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes, parse_message_segments,
-    select_images,
+    AddImageSource, FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes,
+    parse_message_segments, resolve_add_source, select_images,
 };
 use crate::name::parse_library_name;
 use crate::scan::{
@@ -45,7 +45,7 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
 
 fn add_command(store: Arc<Store>) -> Command {
     Command::new("添加")
-        .description("回复一张或多张图，写入本群指定图库")
+        .description("把本条消息或回复里的图写入本群指定图库")
         .usage("添加 <库名>")
         .expose_as_root()
         .prefix_match()
@@ -200,10 +200,7 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     let name = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
     let group_id = ctx.group_id()?;
-    let reply_id = extract_reply_id(&ctx.event().message)
-        .ok_or_else(|| CommandError::user("请回复一张包含图片的消息后再添加"))?;
-
-    let segments = replied_image_segments(&ctx, reply_id, MAX_ADD_IMAGES, false).await?;
+    let segments = add_image_segments(&ctx).await?;
     let mut images = Vec::with_capacity(segments.len());
     for segment in &segments {
         let bytes = match load_image_bytes(segment).await {
@@ -620,6 +617,22 @@ async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
     }
     ctx.reply(lines.join("\n"));
     Ok(())
+}
+
+async fn add_image_segments(ctx: &CommandContext) -> Result<Vec<Segment>, CommandError> {
+    let message = &ctx.event().message;
+    match resolve_add_source(message) {
+        AddImageSource::Current => {
+            let images = select_images(message.iter(), MAX_ADD_IMAGES, false)?;
+            Ok(images.into_iter().cloned().collect())
+        }
+        AddImageSource::Reply(reply_id) => {
+            replied_image_segments(ctx, reply_id, MAX_ADD_IMAGES, false).await
+        }
+        AddImageSource::Missing => Err(CommandError::user(
+            "请在这条消息里带图，或回复一张包含图片的消息后再添加",
+        )),
+    }
 }
 
 async fn replied_image_segments(

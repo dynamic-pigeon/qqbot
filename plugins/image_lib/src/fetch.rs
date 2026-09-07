@@ -40,6 +40,23 @@ impl From<FetchError> for utils::command::CommandError {
     }
 }
 
+pub enum AddImageSource {
+    Current,
+    Reply(i32),
+    Missing,
+}
+
+/// 本条消息带了图就用这些图；否则用回复里的图。
+pub fn resolve_add_source(message: &Message) -> AddImageSource {
+    if message.iter().any(|segment| segment.kind == "image") {
+        AddImageSource::Current
+    } else if let Some(reply_id) = extract_reply_id(message) {
+        AddImageSource::Reply(reply_id)
+    } else {
+        AddImageSource::Missing
+    }
+}
+
 pub fn extract_reply_id(message: &Message) -> Option<i32> {
     for segment in message.iter() {
         if segment.kind != "reply" {
@@ -63,19 +80,19 @@ pub fn parse_message_segments(data: &Value) -> Result<Vec<Segment>> {
     kovi::serde_json::from_value(message.clone()).context("解析引用消息段失败")
 }
 
-pub fn image_segments(segments: &[Segment]) -> Vec<&Segment> {
+pub fn image_segments<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> Vec<&'a Segment> {
     segments
-        .iter()
+        .into_iter()
         .filter(|segment| segment.kind == "image")
         .collect()
 }
 
 /// 先数图再下载，避免引用了几十张图时先把内存打满再报「太多」。
-pub fn select_images(
-    segments: &[Segment],
+pub fn select_images<'a>(
+    segments: impl IntoIterator<Item = &'a Segment>,
     max: usize,
     single: bool,
-) -> Result<Vec<&Segment>, FetchError> {
+) -> Result<Vec<&'a Segment>, FetchError> {
     let images = image_segments(segments);
     if images.is_empty() {
         return Err(FetchError::NoImages);
@@ -214,6 +231,30 @@ mod tests {
     use kovi_onebot::MessageRegistrar as _;
 
     use super::*;
+
+    #[test]
+    fn prefers_current_message_images_over_reply() {
+        let with_image = Message::new()
+            .add_reply(1)
+            .add_image("https://gchat.qpic.cn/a.jpg")
+            .add_text("添加 猫");
+        assert!(matches!(
+            resolve_add_source(&with_image),
+            AddImageSource::Current
+        ));
+
+        let reply_only = Message::new().add_reply(1).add_text("添加 猫");
+        assert!(matches!(
+            resolve_add_source(&reply_only),
+            AddImageSource::Reply(1)
+        ));
+
+        let neither = Message::new().add_text("添加 猫");
+        assert!(matches!(
+            resolve_add_source(&neither),
+            AddImageSource::Missing
+        ));
+    }
 
     #[test]
     fn extracts_reply_id_from_string_or_number() {
