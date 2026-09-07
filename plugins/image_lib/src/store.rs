@@ -662,7 +662,7 @@ async fn ensure_draw_count_column(pool: &SqlitePool) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// 权重 `1 / (次数 - 库内最小次数 + 1)`，最少的那档永远是 1。
+/// 权重 `0.5^(次数 - 库内最小次数)`，最少的那档永远是 1。
 fn pick_weighted<'a>(items: &'a [(String, i64)], rng: &mut impl RngExt) -> Option<&'a str> {
     let min = items.iter().map(|(_, count)| *count).min()?;
     let mut total = 0.0;
@@ -680,7 +680,7 @@ fn pick_weighted<'a>(items: &'a [(String, i64)], rng: &mut impl RngExt) -> Optio
 }
 
 fn weight(count: i64, min: i64) -> f64 {
-    1.0 / (count.saturating_sub(min) as f64 + 1.0)
+    0.5f64.powi(count.saturating_sub(min) as i32)
 }
 
 async fn resolve_library(pool: &SqlitePool, name: &str) -> Result<String, StoreError> {
