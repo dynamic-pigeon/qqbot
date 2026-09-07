@@ -9,6 +9,7 @@ base64.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "webp"] }
 kovi.workspace = true
 kovi-onebot.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
