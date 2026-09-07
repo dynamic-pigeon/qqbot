@@ -267,6 +267,20 @@ async fn handle_draw(
     ctx.ensure_no_extra_args(1)?;
     let group_id = ctx.group_id()?;
 
+    match store.resolve_name(group_id, name).await {
+        Ok(_) => {}
+        Err(StoreError::LibraryMissing) => {
+            ctx.reply(format!("「{name}」里还没有图"));
+            return Ok(());
+        }
+        Err(error) => return Err(CommandError::internal(error)),
+    }
+
+    // 空库不占限流。先占名额再抽并计数，打满的请求不会把次数加上。
+    if let Err(hit) = limiter.try_acquire(group_id) {
+        return Err(rate_limited(hit));
+    }
+
     let hash = match store.pick_random(group_id, name).await {
         Ok(hash) => hash,
         Err(StoreError::LibraryMissing | StoreError::LibraryEmpty) => {
@@ -276,20 +290,12 @@ async fn handle_draw(
         Err(error) => return Err(CommandError::internal(error)),
     };
 
-    // 空库已经返回。先 peek 限流再读盘，避免打满后还读整张图。
-    if let Err(hit) = limiter.check(&group_id) {
-        return Err(rate_limited(hit));
-    }
-
     tracing::debug!("图库 draw group_id={} hash={}", group_id, hash);
 
     let bytes = store
         .read_blob(group_id, &hash)
         .await
         .map_err(|_| CommandError::user("读取图片失败，请再试一次"))?;
-    if let Err(hit) = limiter.try_acquire(group_id) {
-        return Err(rate_limited(hit));
-    }
 
     let message = image_message(None, &[&bytes]);
     if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
