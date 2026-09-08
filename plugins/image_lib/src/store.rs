@@ -662,25 +662,27 @@ async fn ensure_draw_count_column(pool: &SqlitePool) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// 权重 `0.5^(次数 - 库内最小次数)`，最少的那档永远是 1。
+/// 权重 `4096 >> (次数 - 库内最小次数)`，最少的那档是 4096，最多落后 12 次仍为 1。
 fn pick_weighted<'a>(items: &'a [(String, i64)], rng: &mut impl RngExt) -> Option<&'a str> {
     let min = items.iter().map(|(_, count)| *count).min()?;
-    let mut total = 0.0;
+    let mut total: u32 = 0;
     for (_, count) in items {
         total += weight(*count, min);
     }
-    let mut throw = rng.random::<f64>() * total;
+    let mut throw = rng.random_range(0..total);
     for (hash, count) in items {
-        throw -= weight(*count, min);
-        if throw <= 0.0 {
+        let w = weight(*count, min);
+        if throw < w {
             return Some(hash);
         }
+        throw -= w;
     }
     items.last().map(|(hash, _)| hash.as_str())
 }
 
-fn weight(count: i64, min: i64) -> f64 {
-    0.5f64.powi(count.saturating_sub(min) as i32)
+fn weight(count: i64, min: i64) -> u32 {
+    const MAX_WEIGHT: u32 = 1 << 12;
+    MAX_WEIGHT >> (count.saturating_sub(min) as u32).min(12)
 }
 
 async fn resolve_library(pool: &SqlitePool, name: &str) -> Result<String, StoreError> {
@@ -1197,5 +1199,14 @@ mod tests {
         expected.sort();
         assert_eq!(draw_counts(&store, group, "猫").await.unwrap(), expected);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn weight_halves_per_extra_draw() {
+        let min = 3;
+        assert_eq!(weight(min, min), 1 << 12);
+        assert_eq!(weight(min + 1, min), 1 << 11);
+        assert_eq!(weight(min + 12, min), 1);
+        assert_eq!(weight(min + 13, min), 1);
     }
 }
