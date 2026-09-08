@@ -48,9 +48,9 @@ async fn resource_manager(
                 move || {
                     let font_path = font_path.clone();
                     async move {
-                        tokio::task::spawn_blocking(move || load_word_cloud_resources(&font_path))
+                        load_word_cloud_resources(&font_path)
                             .await
-                            .map_err(|e| anyhow::anyhow!("词云资源加载任务失败: {e}"))?
+                            .map_err(|e| anyhow::anyhow!("词云资源加载任务失败: {e}"))
                     }
                 },
                 |resources| async move {
@@ -62,9 +62,9 @@ async fn resource_manager(
         .await
 }
 
-fn load_word_cloud_resources(font_path: &Path) -> Result<WordCloudResources> {
+async fn load_word_cloud_resources(font_path: &Path) -> Result<WordCloudResources> {
     info!("加载 jieba 词典与词云字体");
-    let font_bytes = match std::fs::read(font_path) {
+    let font_bytes = match tokio::fs::read(font_path).await {
         Ok(bytes) => Some(Arc::from(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -499,10 +499,12 @@ mod tests {
         assert_eq!(parse_background_color("#161628"), Rgba([22, 22, 40, 255]));
     }
 
-    #[test]
-    fn test_wordcloud_generate_direct() {
+    #[tokio::test]
+    async fn test_wordcloud_generate_direct() {
         let text = "rust rust rust rust wordcloud wordcloud layout";
-        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf")).unwrap();
+        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf"))
+            .await
+            .unwrap();
         let png =
             generate_word_cloud_image(&resources, Path::new("/nonexistent"), text, &[], "white")
                 .unwrap();
@@ -526,10 +528,12 @@ mod tests {
         assert!(mark_cron_fire(&last_fire_ts, 1_003));
     }
 
-    #[test]
-    fn test_wordcloud_no_usable_words_returns_empty() {
+    #[tokio::test]
+    async fn test_wordcloud_no_usable_words_returns_empty() {
         let stop_words = vec!["the".to_string()];
-        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf")).unwrap();
+        let resources = load_word_cloud_resources(Path::new("/nonexistent/font.otf"))
+            .await
+            .unwrap();
         let result = generate_word_cloud_image(
             &resources,
             Path::new("/nonexistent"),
