@@ -7,7 +7,7 @@ use super::router::extract_command_text;
 use super::*;
 
 fn endpoint(name: &str) -> Command {
-    Command::new(name).handler(|_| async { Ok(()) })
+    Command::new(name).sync_handler(|_| Ok(()))
 }
 
 fn path(command: &ResolvedCommand) -> Vec<&str> {
@@ -293,7 +293,7 @@ fn catalog_replaces_an_owners_root_and_resolves_alias_paths() {
 fn exposed_subcommands_resolve_without_parent_prefix() {
     let tree = CommandTree::new(vec![
         Command::new("图库")
-            .handler(|_| async { Ok(()) })
+            .sync_handler(|_| Ok(()))
             .subcommand(endpoint("添加").expose_as_root())
             .subcommand(endpoint("来只")),
     ])
@@ -329,7 +329,7 @@ fn exposed_subcommands_resolve_without_parent_prefix() {
 fn prefix_match_glues_the_rest_of_the_token_as_the_first_arg() {
     let tree = CommandTree::new(vec![
         Command::new("图库")
-            .handler(|_| async { Ok(()) })
+            .sync_handler(|_| Ok(()))
             .subcommand(endpoint("来只").expose_as_root().prefix_match())
             .subcommand(endpoint("删除").expose_as_root().prefix_match())
             .subcommand(endpoint("删除哈希").expose_as_root().prefix_match()),
@@ -372,7 +372,7 @@ fn rejects_exposed_root_name_conflicts_with_real_roots() {
     let conflict = CommandTree::new(vec![
         endpoint("添加"),
         Command::new("图库")
-            .handler(|_| async { Ok(()) })
+            .sync_handler(|_| Ok(()))
             .subcommand(endpoint("添加").expose_as_root()),
     ]);
     assert!(matches!(
@@ -386,7 +386,7 @@ fn catalog_groups_exposed_subcommands_under_parent_root() {
     let tree = CommandTree::new(vec![
         Command::new("图库")
             .description("管理本群图库")
-            .handler(|_| async { Ok(()) })
+            .sync_handler(|_| Ok(()))
             .subcommand(
                 endpoint("添加")
                     .description("写入图库")
@@ -412,7 +412,7 @@ fn catalog_groups_exposed_subcommands_under_parent_root() {
 fn catalog_rejects_root_conflicts_between_plugins() {
     let grouped = CommandTree::new(vec![
         Command::new("图库")
-            .handler(|_| async { Ok(()) })
+            .sync_handler(|_| Ok(()))
             .subcommand(endpoint("添加").expose_as_root()),
     ])
     .unwrap();

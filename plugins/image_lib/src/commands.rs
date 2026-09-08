@@ -437,7 +437,7 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
                 user_id,
                 library: canonical.clone(),
             };
-            scans.start(key.clone(), groups).await;
+            scans.start(key.clone(), groups);
             show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, true).await
         }
         ScanOp::Next { name } => {
@@ -494,8 +494,8 @@ async fn show_scan_group(
 ) -> CommandResult {
     loop {
         let advance = match jump {
-            Some(index) => scans.jump(key, index).await,
-            None => scans.advance(key).await,
+            Some(index) => scans.jump(key, index),
+            None => scans.advance(key),
         };
         match advance {
             None => {

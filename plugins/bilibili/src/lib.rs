@@ -46,7 +46,7 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 #[kovi::plugin]
 async fn main() {
-    config::init().await.unwrap();
+    config::init().unwrap();
     // 启动期强制解析硬编码 SPACE_FEED_URL，让 URL 被未来编辑损坏时立刻 panic，
     // 而不是等到第一次 /dynamic fetch / cron 才暴露。
     dynamics::warm_up();
@@ -58,8 +58,8 @@ async fn main() {
         .expect("注册 Bilibili 命令失败");
 
     plugin::on_group_msg(parse_bv);
-    living::init().await;
-    dynamics::init().await;
+    living::init();
+    dynamics::init();
 }
 
 fn live_command() -> Command {
@@ -80,7 +80,7 @@ fn live_command() -> Command {
                 .description("移除直播订阅")
                 .usage("/live rm <uid>")
                 .permission(Permission::BotAdmin)
-                .handler(live_remove),
+                .sync_handler(live_remove),
         )
         .subcommand(
             Command::new("list")
@@ -100,14 +100,14 @@ fn dynamic_command() -> Command {
                 .description("添加动态订阅")
                 .usage("/dynamic add <uid>")
                 .permission(Permission::BotAdmin)
-                .handler(dynamic_add),
+                .sync_handler(dynamic_add),
         )
         .subcommand(
             Command::new("rm")
                 .description("移除动态订阅")
                 .usage("/dynamic rm <uid>")
                 .permission(Permission::BotAdmin)
-                .handler(dynamic_remove),
+                .sync_handler(dynamic_remove),
         )
         .subcommand(
             Command::new("list")
@@ -144,13 +144,12 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
             });
         }
     })
-    .await
     .map_err(CommandError::internal)?;
     ctx.reply(format!("已为本群订阅 uid={uid}"));
     Ok(())
 }
 
-async fn live_remove(ctx: CommandContext) -> CommandResult {
+fn live_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
     let group = ctx.group_id()?;
@@ -163,7 +162,6 @@ async fn live_remove(ctx: CommandContext) -> CommandResult {
             }
         }
     })
-    .await
     .map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的订阅"));
     Ok(())
@@ -194,13 +192,11 @@ async fn live_list(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
-async fn dynamic_add(ctx: CommandContext) -> CommandResult {
+fn dynamic_add(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
     let group = ctx.group_id()?;
-    let added = dynamics::add_subscribe(uid, group)
-        .await
-        .map_err(CommandError::internal)?;
+    let added = dynamics::add_subscribe(uid, group).map_err(CommandError::internal)?;
     ctx.reply(if added {
         format!("已为本群订阅动态 uid={uid}")
     } else {
@@ -209,13 +205,11 @@ async fn dynamic_add(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
-async fn dynamic_remove(ctx: CommandContext) -> CommandResult {
+fn dynamic_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
     let group = ctx.group_id()?;
-    dynamics::remove_subscribe(uid, group)
-        .await
-        .map_err(CommandError::internal)?;
+    dynamics::remove_subscribe(uid, group).map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的动态订阅"));
     Ok(())
 }
@@ -223,7 +217,7 @@ async fn dynamic_remove(ctx: CommandContext) -> CommandResult {
 async fn dynamic_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group = ctx.group_id()?;
-    let entries = dynamics::list_subscribes(group).await;
+    let entries = dynamics::list_subscribes(group);
     if entries.is_empty() {
         ctx.reply("本群尚未订阅任何动态");
         return Ok(());

@@ -1,14 +1,14 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use kovi::{Message, PluginBuilder as plugin, serde_json::json, tokio::sync::Mutex};
+use kovi::{Message, PluginBuilder as plugin, serde_json::json};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use serde::Deserialize;
 use utils::retry::{retry_async, retry_async_with_backoff};
@@ -34,7 +34,7 @@ struct LiveRoom {
     cover_from_user: String,
 }
 
-pub async fn init() {
+pub fn init() {
     let bot = plugin::get_runtime_bot();
     let map = Arc::new(Mutex::new(HashMap::<u64, bool>::new()));
     let map_ = Arc::clone(&map);
@@ -49,7 +49,7 @@ pub async fn init() {
     plugin::cron("0 0 * * *", move || {
         let map = Arc::clone(&map_);
         async move {
-            let mut map = map.lock().await;
+            let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let cfg = config::read_config();
             let uids: HashSet<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
             map.retain(|&uid, _| uids.contains(&uid));
@@ -93,7 +93,7 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
 
     // 只在比对状态时短暂持锁，网络请求和消息发送都在锁外进行
     let (start, end) = {
-        let mut map = map.lock().await;
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // 响应缺失的 uid（已注销/封禁）不会再出现，直接清理，
         // 避免残留旧状态、等主播恢复后误报一次状态变更
         let present: HashSet<u64> = status.keys().copied().collect();

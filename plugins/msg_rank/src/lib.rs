@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all, tokio};
+use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 use utils::command::CommandRouter;
 
@@ -48,17 +48,15 @@ async fn main() {
     let path = Arc::new(bot.get_data_path());
 
     let config_path = path.join("config.json");
-    if let Err(e) = config::init_config(config_path).await {
+    if let Err(e) = config::init_config(config_path) {
         tracing::error!("初始化配置失败: {e}");
         return;
     }
 
     let db_path = path.join("msg.db");
     if !db_path.exists() {
-        tokio::fs::create_dir_all(db_path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::File::create(&db_path).await.unwrap();
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        std::fs::File::create(&db_path).unwrap();
     }
 
     db::init_db(&db_path).await.unwrap();
