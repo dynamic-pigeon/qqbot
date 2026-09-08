@@ -4,10 +4,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use kovi::{
-    PluginBuilder as plugin, serde_json,
-    tokio::{self, sync::OnceCell},
-};
+use kovi::{PluginBuilder as plugin, serde_json};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct Config {
@@ -37,14 +34,14 @@ pub struct DynamicCheckpoint {
     pub last_seen: i64,
 }
 
-static CONFIG: OnceCell<(ArcSwap<Config>, PathBuf)> = OnceCell::const_new();
+static CONFIG: std::sync::OnceLock<(ArcSwap<Config>, PathBuf)> = std::sync::OnceLock::new();
 
-pub async fn init() -> anyhow::Result<()> {
+pub fn init() -> anyhow::Result<()> {
     let bot = plugin::get_runtime_bot();
     let path = bot.get_data_path();
     let config_path = path.join("config.json");
     let config = if config_path.exists() {
-        let data = tokio::fs::read(&config_path).await?;
+        let data = std::fs::read(&config_path)?;
         match serde_json::from_slice(&data) {
             Ok(config) => config,
             Err(error) => {
@@ -55,7 +52,7 @@ pub async fn init() -> anyhow::Result<()> {
                     "bilibili 配置解析失败: {error}，备份到 {} 并回退空配置",
                     backup.display()
                 );
-                if let Err(error) = tokio::fs::rename(&config_path, &backup).await {
+                if let Err(error) = std::fs::rename(&config_path, &backup) {
                     tracing::warn!("备份损坏的配置文件失败: {error}");
                 }
                 Config::default()
@@ -95,12 +92,12 @@ pub fn read_config() -> Arc<Config> {
 
 #[cold]
 #[inline(never)]
-pub async fn modify_config<F>(mut f: F) -> anyhow::Result<()>
+pub fn modify_config<F>(mut f: F) -> anyhow::Result<()>
 where
     F: FnMut(&mut Config),
 {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _guard = LOCK.lock().await;
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let config = CONFIG.get().expect("配置未初始化");
     let mut new_config = config.0.load_full().as_ref().clone();
     f(&mut new_config);

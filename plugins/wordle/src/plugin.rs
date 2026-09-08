@@ -73,7 +73,7 @@ fn wordle_command() -> Command {
             Command::new("status")
                 .description("查看当前局面的网格图")
                 .usage("/wordle status")
-                .handler(handle_status),
+                .sync_handler(handle_status),
         )
 }
 
@@ -166,7 +166,7 @@ fn submit_guess(
     Ok((png, note))
 }
 
-async fn handle_status(ctx: CommandContext) -> CommandResult {
+fn handle_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let key = session_key(&ctx);
     // 渲染与次数统计在同一把锁内完成，避免两次加锁之间会话被

@@ -125,7 +125,7 @@ async fn fetch_member_with_retry(
         }
 
         match bot.get_group_member_info(group_id, user_id, false).await {
-            Ok(resp) => match parse_member_info(resp).await {
+            Ok(resp) => match parse_member_info(resp) {
                 Ok(info) => return Ok(info),
                 Err(e) => {
                     tracing::warn!("解析群成员信息失败 (attempt {}): {}", attempt + 1, e);
@@ -146,7 +146,7 @@ async fn fetch_member_with_retry(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("获取用户 {} 信息失败", user_id)))
 }
 
-async fn parse_member_info(resp: kovi::ApiReturn) -> Result<(i64, String)> {
+fn parse_member_info(resp: kovi::ApiReturn) -> Result<(i64, String)> {
     if resp.status != "ok" {
         anyhow::bail!("API请求失败: {:?}", resp);
     }

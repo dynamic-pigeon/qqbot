@@ -26,7 +26,7 @@ use crate::config;
 
 static POLL_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
-pub async fn init() {
+pub fn init() {
     let bot = plugin::get_runtime_bot();
     plugin::cron("*/10 * * * *", move || {
         let bot = std::sync::Arc::clone(&bot);
@@ -130,8 +130,7 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
                         });
                 }
             }
-        })
-        .await?;
+        })?;
     }
     Ok(())
 }
@@ -207,7 +206,7 @@ pub async fn fetch_recent(uid: u64, count: usize) -> anyhow::Result<Vec<DynamicI
     Ok(all)
 }
 
-pub async fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
+pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
     let mut changed = false;
     config::modify_config(|cfg| {
         if let Some(s) = cfg.dynamic_subscribe.iter_mut().find(|s| s.uid == uid) {
@@ -222,12 +221,11 @@ pub async fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
             });
             changed = true;
         }
-    })
-    .await?;
+    })?;
     Ok(changed)
 }
 
-pub async fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
+pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
     config::modify_config(|cfg| {
         if let Some(idx) = cfg.dynamic_subscribe.iter().position(|s| s.uid == uid) {
             let s = &mut cfg.dynamic_subscribe[idx];
@@ -239,10 +237,9 @@ pub async fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
         cfg.dynamic_checkpoints
             .retain(|checkpoint| checkpoint.uid != uid || checkpoint.group != group);
     })
-    .await
 }
 
-pub async fn list_subscribes(group: i64) -> Vec<(u64, String)> {
+pub fn list_subscribes(group: i64) -> Vec<(u64, String)> {
     let cfg = config::read_config();
     cfg.dynamic_subscribe
         .iter()
