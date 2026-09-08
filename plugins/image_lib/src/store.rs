@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use kovi::tokio::sync::Mutex;
+use kovi::tokio::sync::{Mutex, mpsc};
 
 use anyhow::{Context, Result};
 use rand::RngExt;
@@ -183,23 +183,19 @@ impl Store {
         kovi::tokio::fs::create_dir_all(&blobs)
             .await
             .context("创建图片目录失败")?;
-        kovi::tokio::task::spawn_blocking(move || {
-            let hash = sha256_hex(&bytes);
-            let path = blob_file(&blobs, &hash)?;
-            let created_path = if path.exists() {
-                None
-            } else {
-                write_blob_atomic(&path, &bytes)?;
-                Some(path)
-            };
-            Ok(PreparedImage {
-                hash,
-                size: bytes.len() as u64,
-                created_path,
-            })
+        let hash = sha256_hex(&bytes);
+        let path = blob_file(&blobs, &hash)?;
+        let created_path = if kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            None
+        } else {
+            write_blob_atomic(&path, &bytes).await?;
+            Some(path)
+        };
+        Ok(PreparedImage {
+            hash,
+            size: bytes.len() as u64,
+            created_path,
         })
-        .await
-        .map_err(|e| StoreError::Other(anyhow::anyhow!("写图片失败: {e}")))?
     }
 
     /// 删除尚未入库的新建 blob。索引里已有的同 hash 文件会保留。
@@ -573,21 +569,7 @@ impl Store {
                 })
                 .collect();
 
-            let computed = if missing.is_empty() {
-                Vec::new()
-            } else {
-                kovi::tokio::task::spawn_blocking(move || {
-                    missing
-                        .into_iter()
-                        .filter_map(|(hash, path)| {
-                            let bytes = std::fs::read(path).ok()?;
-                            Some((hash, fingerprint_bytes(&bytes)?))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await
-                .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))?
-            };
+            let computed = fingerprint_missing(missing).await?;
             insert_fingerprints(&pool, &computed).await?;
             for (hash, fingerprint) in computed {
                 fingerprints.insert(hash, fingerprint);
@@ -605,6 +587,38 @@ impl Store {
         })
         .await
     }
+}
+
+/// 读盘走 async，解码只占一条 blocking 线程。
+/// 通道容量 1：进行中和解码排队的各一张，峰值大约两张 blob。
+async fn fingerprint_missing(
+    missing: Vec<(String, PathBuf)>,
+) -> Result<Vec<(String, Fingerprint)>, StoreError> {
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (tx, mut rx) = mpsc::channel::<(String, Vec<u8>)>(1);
+    let worker = kovi::tokio::task::spawn_blocking(move || {
+        let mut computed = Vec::new();
+        while let Some((hash, bytes)) = rx.blocking_recv() {
+            if let Some(fingerprint) = fingerprint_bytes(&bytes) {
+                computed.push((hash, fingerprint));
+            }
+        }
+        computed
+    });
+    for (hash, path) in missing {
+        let Ok(bytes) = kovi::tokio::fs::read(path).await else {
+            continue;
+        };
+        if tx.send((hash, bytes)).await.is_err() {
+            break;
+        }
+    }
+    drop(tx);
+    worker
+        .await
+        .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))
 }
 
 async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
@@ -841,7 +855,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
-fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+async fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(
@@ -849,14 +863,15 @@ fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let write = (|| {
-        std::fs::write(&tmp, bytes)?;
+    let write = async {
+        kovi::tokio::fs::write(&tmp, bytes).await?;
         restrict_file_permissions(&tmp)?;
-        std::fs::rename(&tmp, path)?;
+        kovi::tokio::fs::rename(&tmp, path).await?;
         Ok(())
-    })();
+    }
+    .await;
     if write.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = kovi::tokio::fs::remove_file(&tmp).await;
     }
     write
 }
