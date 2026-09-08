@@ -77,19 +77,19 @@ impl BufferState {
 }
 
 pub(crate) async fn init_db(path: &Path) -> Result<()> {
-    restrict_database_permissions(path).await?;
+    restrict_database_permissions(path)?;
     SQLITE_POOL
         .get_or_try_init(async || build_pool(path))
         .await?;
 
     init_table().await?;
-    restrict_database_permissions(path).await?;
+    restrict_database_permissions(path)?;
     init_buffer();
     Ok(())
 }
 
 #[cfg(unix)]
-async fn restrict_database_permissions(path: &Path) -> Result<()> {
+fn restrict_database_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut paths = vec![path.to_path_buf()];
@@ -100,15 +100,14 @@ async fn restrict_database_permissions(path: &Path) -> Result<()> {
     }
     for candidate in paths {
         if candidate.exists() {
-            kovi::tokio::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))
-                .await?;
+            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))?;
         }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn restrict_database_permissions(_path: &Path) -> Result<()> {
+fn restrict_database_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -154,32 +154,32 @@ pub(crate) fn wordcloud_command(path: Arc<PathBuf>) -> Command {
             Command::new("once")
                 .description("立即生成一次今日词云")
                 .usage("/wordcloud once")
-                .handler(move |ctx| {
+                .sync_handler(move |ctx| {
                     let path = Arc::clone(&once_path);
-                    async move { wordcloud_once(ctx, path).await }
+                    wordcloud_once(ctx, path)
                 }),
         )
         .subcommand(
             Command::new("enable")
                 .description("启用本群词云")
                 .usage("/wordcloud enable")
-                .handler(wordcloud_enable),
+                .sync_handler(wordcloud_enable),
         )
         .subcommand(
             Command::new("disable")
                 .description("停用本群词云")
                 .usage("/wordcloud disable")
-                .handler(wordcloud_disable),
+                .sync_handler(wordcloud_disable),
         )
         .subcommand(
             Command::new("status")
                 .description("查看本群词云状态")
                 .usage("/wordcloud status")
-                .handler(wordcloud_status),
+                .sync_handler(wordcloud_status),
         )
 }
 
-async fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
+fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     let bot = Arc::clone(ctx.bot());
@@ -190,7 +190,7 @@ async fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResul
     Ok(())
 }
 
-async fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
+fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     modify_config(|config| {
@@ -198,25 +198,23 @@ async fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
             config.notify_group.push(group_id);
         }
     })
-    .await
     .map_err(CommandError::internal)?;
     ctx.reply("启用成功");
     Ok(())
 }
 
-async fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
+fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     modify_config(|config| {
         config.notify_group.retain(|&id| id != group_id);
     })
-    .await
     .map_err(CommandError::internal)?;
     ctx.reply("停用成功");
     Ok(())
 }
 
-async fn wordcloud_status(ctx: CommandContext) -> CommandResult {
+fn wordcloud_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     let enabled = read_config().notify_group.contains(&group_id);
@@ -287,7 +285,7 @@ async fn make_word_cloud(
         return Ok(Vec::new());
     }
 
-    let stop_words = load_stop_words(path).await;
+    let stop_words = load_stop_words(path);
     let background = {
         let config = read_config();
         config.wordcloud_background.clone()
@@ -451,12 +449,12 @@ fn parse_background_color(color: &str) -> Rgba<u8> {
     Rgba([parse(1..3), parse(3..5), parse(5..7), 255])
 }
 
-async fn load_stop_words(path: &Path) -> Vec<String> {
+fn load_stop_words(path: &Path) -> Vec<String> {
     let stop_word_path = path.join("stopword.txt");
     if !stop_word_path.exists() {
         return Vec::new();
     }
-    match tokio::fs::read_to_string(&stop_word_path).await {
+    match std::fs::read_to_string(&stop_word_path) {
         Ok(content) => content
             .lines()
             .map(|s| s.trim().to_string())

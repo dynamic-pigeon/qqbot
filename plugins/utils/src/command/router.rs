@@ -3,6 +3,7 @@ use std::sync::Arc;
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
 use kovi_onebot::{EventRegistrar as _, MsgEvent};
 
+use super::model::CommandHandler;
 use super::{
     AccessError, Command, CommandCatalog, CommandContext, CommandError, CommandRegistrationError,
     CommandTree, MessageSource, Permission, ResolveOutcome, check_access, render_command_error,
@@ -72,7 +73,11 @@ async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<M
     }
 
     let context = CommandContext::new(Arc::clone(&event), Arc::clone(&bot), arguments);
-    if let Err(error) = handler(context).await {
+    let result = match handler {
+        CommandHandler::Sync(handler) => handler(context),
+        CommandHandler::Async(handler) => handler(context).await,
+    };
+    if let Err(error) = result {
         if let CommandError::Internal(internal) = &error {
             tracing::error!(
                 command = %path.join(" "),

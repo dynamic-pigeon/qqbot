@@ -1,9 +1,8 @@
 use std::{
     collections::HashMap,
+    sync::Mutex,
     time::{Duration, Instant},
 };
-
-use kovi::tokio::sync::Mutex;
 
 use crate::similar::{GroupKind, SimilarGroup};
 
@@ -36,7 +35,6 @@ struct ScanState {
 }
 
 pub struct ScanSessions {
-    /// 命令 handler 是 async 的，这里用 tokio Mutex，避免 std 锁卡住 runtime。
     inner: Mutex<HashMap<ScanKey, ScanState>>,
 }
 
@@ -60,8 +58,14 @@ impl ScanSessions {
         }
     }
 
-    pub async fn start(&self, key: ScanKey, groups: Vec<SimilarGroup>) {
-        let mut inner = self.inner.lock().await;
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ScanKey, ScanState>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn start(&self, key: ScanKey, groups: Vec<SimilarGroup>) {
+        let mut inner = self.lock();
         expire(&mut inner);
         inner.insert(
             key,
@@ -73,8 +77,8 @@ impl ScanSessions {
         );
     }
 
-    pub async fn advance(&self, key: &ScanKey) -> Option<ScanAdvance> {
-        let mut inner = self.inner.lock().await;
+    pub fn advance(&self, key: &ScanKey) -> Option<ScanAdvance> {
+        let mut inner = self.lock();
         expire(&mut inner);
         let state = inner.get_mut(key)?;
         state.last_used = Instant::now();
@@ -93,8 +97,8 @@ impl ScanSessions {
     }
 
     /// 跳到标题里的第 `index` 组（从 1 起）。随后「下一组」从它的下一组继续。
-    pub async fn jump(&self, key: &ScanKey, index: usize) -> Option<ScanAdvance> {
-        let mut inner = self.inner.lock().await;
+    pub fn jump(&self, key: &ScanKey, index: usize) -> Option<ScanAdvance> {
+        let mut inner = self.lock();
         expire(&mut inner);
         let state = inner.get_mut(key)?;
         state.last_used = Instant::now();
@@ -157,8 +161,6 @@ pub fn packetize_images(images: Vec<PackedImage>) -> Vec<Vec<PackedImage>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kovi::tokio;
-
     fn group(hash: &str) -> SimilarGroup {
         SimilarGroup {
             kind: GroupKind::Duplicate,
@@ -175,23 +177,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn start_then_advance_walks_groups_and_exhausts() {
+    #[test]
+    fn start_then_advance_walks_groups_and_exhausts() {
         let sessions = ScanSessions::new();
         let key = key();
-        sessions
-            .start(key.clone(), vec![group("a"), group("b")])
-            .await;
+        sessions.start(key.clone(), vec![group("a"), group("b")]);
 
-        let ScanAdvance::Group { index, total, .. } = sessions.advance(&key).await.unwrap() else {
+        let ScanAdvance::Group { index, total, .. } = sessions.advance(&key).unwrap() else {
             panic!("first");
         };
         assert_eq!((index, total), (1, 2));
-        let ScanAdvance::Group { index, .. } = sessions.advance(&key).await.unwrap() else {
+        let ScanAdvance::Group { index, .. } = sessions.advance(&key).unwrap() else {
             panic!("second");
         };
         assert_eq!(index, 2);
-        assert_eq!(sessions.advance(&key).await, Some(ScanAdvance::Exhausted));
+        assert_eq!(sessions.advance(&key), Some(ScanAdvance::Exhausted));
         assert!(
             sessions
                 .advance(&ScanKey {
@@ -199,41 +199,38 @@ mod tests {
                     user_id: 9,
                     library: "猫".into(),
                 })
-                .await
                 .is_none()
         );
 
-        sessions.start(key.clone(), vec![group("c")]).await;
-        let ScanAdvance::Group { group, total, .. } = sessions.advance(&key).await.unwrap() else {
+        sessions.start(key.clone(), vec![group("c")]);
+        let ScanAdvance::Group { group, total, .. } = sessions.advance(&key).unwrap() else {
             panic!("restart");
         };
         assert_eq!(total, 1);
         assert_eq!(group.hashes, ["c"]);
     }
 
-    #[tokio::test]
-    async fn jump_selects_index_and_next_continues_after_it() {
+    #[test]
+    fn jump_selects_index_and_next_continues_after_it() {
         let sessions = ScanSessions::new();
         let key = key();
-        sessions
-            .start(key.clone(), vec![group("a"), group("b"), group("c")])
-            .await;
-        let ScanAdvance::Group { index, group, .. } = sessions.jump(&key, 2).await.unwrap() else {
+        sessions.start(key.clone(), vec![group("a"), group("b"), group("c")]);
+        let ScanAdvance::Group { index, group, .. } = sessions.jump(&key, 2).unwrap() else {
             panic!("jump");
         };
         assert_eq!(index, 2);
         assert_eq!(group.hashes, ["b"]);
-        let ScanAdvance::Group { index, group, .. } = sessions.advance(&key).await.unwrap() else {
+        let ScanAdvance::Group { index, group, .. } = sessions.advance(&key).unwrap() else {
             panic!("after jump");
         };
         assert_eq!(index, 3);
         assert_eq!(group.hashes, ["c"]);
         assert!(matches!(
-            sessions.jump(&key, 9).await,
+            sessions.jump(&key, 9),
             Some(ScanAdvance::OutOfRange { total: 3 })
         ));
         assert!(matches!(
-            sessions.jump(&key, 0).await,
+            sessions.jump(&key, 0),
             Some(ScanAdvance::OutOfRange { total: 3 })
         ));
     }

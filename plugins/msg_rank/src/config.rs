@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -49,9 +49,8 @@ pub(crate) fn static_config() -> &'static StaticConfig {
     &CONFIG
 }
 
-pub(crate) static CONFIG: kovi::tokio::sync::OnceCell<ArcSwap<Config>> =
-    kovi::tokio::sync::OnceCell::const_new();
-static CONFIG_WRITE_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
+pub(crate) static CONFIG: OnceLock<ArcSwap<Config>> = OnceLock::new();
+static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
@@ -77,7 +76,7 @@ impl Default for Config {
     }
 }
 
-pub async fn init_config(path: PathBuf) -> Result<()> {
+pub fn init_config(path: PathBuf) -> Result<()> {
     let mut config: Config = kovi::utils::load_json_data(Default::default(), &path)
         .map_err(|e| anyhow::anyhow!("加载配置文件失败: {e}"))?;
     config.path = path;
@@ -112,12 +111,14 @@ pub fn read_config() -> Arc<Config> {
 
 #[cold]
 #[inline(never)]
-pub async fn modify_config<F>(f: F) -> Result<()>
+pub fn modify_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
     // 写路径串行化，避免并发写导致配置覆盖；读路径仍保持无锁快照读取。
-    let _write_guard = CONFIG_WRITE_LOCK.lock().await;
+    let _write_guard = CONFIG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let cfg = CONFIG.get().unwrap();
     let mut next = cfg.load_full().as_ref().clone();
