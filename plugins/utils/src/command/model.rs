@@ -5,7 +5,13 @@ use kovi_onebot::{MsgEvent, RepliableEvent};
 
 pub type CommandResult = Result<(), CommandError>;
 pub(crate) type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + Send>>;
-pub(crate) type CommandHandler = Arc<dyn Fn(CommandContext) -> CommandFuture + Send + Sync>;
+
+/// 同步命令直接调 `fn`，避免为 `/help` 这类叶子分配 boxed future。
+#[derive(Clone)]
+pub(crate) enum CommandHandler {
+    Sync(Arc<dyn Fn(CommandContext) -> CommandResult + Send + Sync>),
+    Async(Arc<dyn Fn(CommandContext) -> CommandFuture + Send + Sync>),
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Permission {
@@ -320,7 +326,17 @@ impl Command {
         F: Fn(CommandContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = CommandResult> + Send + 'static,
     {
-        self.handler = Some(Arc::new(move |context| Box::pin(handler(context))));
+        self.handler = Some(CommandHandler::Async(Arc::new(move |context| {
+            Box::pin(handler(context))
+        })));
+        self
+    }
+
+    pub fn sync_handler<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(CommandContext) -> CommandResult + Send + Sync + 'static,
+    {
+        self.handler = Some(CommandHandler::Sync(Arc::new(handler)));
         self
     }
 }
