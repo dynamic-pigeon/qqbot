@@ -1,8 +1,10 @@
 //! 用内存 OneBot V11 正向 WS 冒烟：current_thread 下各插件命令能否正常回复。
 //!
-//! 不改生产订阅配置。图库 sqlite 写在 `data/image_lib/<GROUP>`，用例结束会删掉。
+//! 数据写在临时目录，不改仓库 `data/` 里的订阅和图库。
+//! 词云读库依赖 msg_rank 5 秒刷盘，所以 `/wordcloud once` 前会等一拍。
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -31,8 +33,14 @@ const SLOW: Duration = Duration::from_secs(45);
 
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_commands_reply_on_mock_onebot() {
+    let repo = std::env::current_dir().expect("cwd");
+    let tree_png = repo.join("data/tree_image/qqbot_tree.png");
+    let mask_png = repo.join("data/msg_rank/mask.png");
+    assert!(tree_png.is_file(), "缺少 {tree_png:?}");
+    assert!(mask_png.is_file(), "缺少 {mask_png:?}");
+
+    let _iso = IsolatedCwd::enter(&repo);
     let _ = utils::config::value();
-    let _cleanup = GroupDataCleanup(format!("data/image_lib/{GROUP}"));
     let server = MockOneBot::start().await;
     let bot = build_bot(KoviConf::new(ID::new(ADMIN), None, false), server.driver());
     let run = tokio::spawn(bot.run());
@@ -50,12 +58,22 @@ async fn plugin_commands_reply_on_mock_onebot() {
     assert_contains(&server, "/help /wordle", "开始一局").await;
     assert_contains(&server, "/live list", "本群尚未订阅任何直播间").await;
     assert_contains(&server, "/dynamic list", "本群尚未订阅任何动态").await;
+    assert_contains(&server, "/dynamic add 1", "已为本群订阅").await;
+    assert_contains(&server, "/dynamic rm 1", "已取消").await;
     assert_contains(&server, "图库", "本群还没有图库").await;
     assert_contains(&server, "来只 猫", "「猫」里还没有图").await;
+    assert_contains(&server, "/wordcloud status", "词云功能已启用").await;
+    assert_contains(&server, "/wordcloud disable", "停用成功").await;
     assert_contains(&server, "/wordcloud status", "词云功能未启用").await;
+    assert_contains(&server, "/wordcloud enable", "启用成功").await;
+    assert_contains(&server, "/wordcloud status", "词云功能已启用").await;
     assert_contains(&server, "/查卡", "缺少参数 `卡片名称`").await;
     assert_contains(&server, "!md", "缺少参数 `Markdown 内容`").await;
-    assert_contains(&server, "#今日发言排行", "命令执行失败").await;
+    let rank = server.ask("#今日发言排行", SLOW).await;
+    assert!(
+        rank.has_image || rank.text.contains("命令执行失败") || rank.text.contains("刚跑完"),
+        "排行不应挂死: {rank:?}"
+    );
 
     let denied = server.ask_from(STRANGER, "/wordcloud status", REPLY).await;
     assert!(
@@ -71,6 +89,41 @@ async fn plugin_commands_reply_on_mock_onebot() {
         private.text
     );
 
+    let added = server
+        .ask_with_image(ADMIN, "添加 猫", &tree_png, REPLY)
+        .await
+        .expect("添加 猫 应回复");
+    assert!(
+        added.text.contains("添加") || added.text.contains("都已在"),
+        "添加失败: {added:?}"
+    );
+    let added_mask = server
+        .ask_with_image(ADMIN, "添加 猫", &mask_png, REPLY)
+        .await
+        .expect("添加 mask 应回复");
+    assert!(
+        added_mask.text.contains("添加") || added_mask.text.contains("都已在"),
+        "添加 mask 失败: {added_mask:?}"
+    );
+    assert_contains(&server, "图库", "猫").await;
+    assert_contains(&server, "别名 喵 猫", "别名").await;
+    let draw = server.ask("来只 喵", REPLY).await;
+    assert!(
+        draw.has_image || draw.text.contains("没有图") || draw.text.contains("频繁"),
+        "来只: {draw:?}"
+    );
+    let scan = server.ask("查重 猫", SLOW).await;
+    assert!(
+        !scan.text.is_empty() || scan.has_image,
+        "查重应有回复: {scan:?}"
+    );
+    let hashed = server.ask("哈希 aa", REPLY).await;
+    assert!(
+        hashed.text.contains("没有") || hashed.text.contains("哈希") || hashed.has_image,
+        "哈希: {hashed:?}"
+    );
+    assert_contains(&server, "取消别名 喵", "已取消别名").await;
+
     let start = server.ask("/wordle start", SLOW).await;
     assert!(
         start.has_image && start.text.contains("开局"),
@@ -82,6 +135,31 @@ async fn plugin_commands_reply_on_mock_onebot() {
         "wordle status 应带图: {status:?}"
     );
     assert_contains(&server, "/wordle guess qqqqq", "不在词表中").await;
+    let guess = server.ask("/wordle guess crane", SLOW).await;
+    assert!(
+        guess.has_image || guess.text.contains("猜"),
+        "wordle guess: {guess:?}"
+    );
+
+    for i in 0..8 {
+        server
+            .emit_group(ADMIN, &format!("闲聊消息 {i} 今天天气不错 词云测试"))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    server.drain_messages().await;
+    let pending = server.ask("/wordcloud once", REPLY).await;
+    assert!(
+        pending.text.contains("正在生成"),
+        "once 应先回正在生成: {pending:?}"
+    );
+    let cloud = timeout(SLOW, server.next_message())
+        .await
+        .unwrap_or_else(|_| panic!("/wordcloud once 在 {SLOW:?} 内没有发出词云图"));
+    assert!(
+        cloud.has_image && cloud.text.contains("临时词云"),
+        "once 应发出词云图: {cloud:?}"
+    );
 
     let md = server.ask("!md **hi**", SLOW).await;
     assert!(
@@ -122,14 +200,6 @@ async fn assert_contains(server: &MockOneBot, cmd: &str, needle: &str) {
         reply.text.contains(needle),
         "{cmd} 回复应含 {needle:?}，实际: {reply:?}"
     );
-}
-
-struct GroupDataCleanup(String);
-
-impl Drop for GroupDataCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<kovi::ExitEvent>);
@@ -243,6 +313,35 @@ impl MockOneBot {
         .unwrap_or_else(|_| panic!("私聊 {text} 在 {wait:?} 内没有 send_msg"))
     }
 
+    async fn emit_group(&self, user_id: i64, text: &str) {
+        self.send_event(group_message(user_id, text)).await;
+    }
+
+    async fn ask_with_image(
+        &self,
+        user_id: i64,
+        text: &str,
+        image: &Path,
+        wait: Duration,
+    ) -> Option<Reply> {
+        let file = format!("file://{}", image.display());
+        let event = group_event(
+            user_id,
+            json!([
+                {"type": "text", "data": {"text": text}},
+                {"type": "image", "data": {"file": file}},
+            ]),
+            text,
+        );
+        timeout(wait, async {
+            self.drain_messages().await;
+            self.send_event(event).await;
+            self.next_message().await
+        })
+        .await
+        .ok()
+    }
+
     async fn ask_inner(&self, user_id: i64, text: &str) -> Reply {
         self.drain_messages().await;
         self.send_event(group_message(user_id, text)).await;
@@ -332,6 +431,16 @@ impl MockOneBot {
                             "user_id": BOT_ID,
                             "nickname": "mock-bot"
                         }),
+                        "get_group_member_info" => {
+                            let user_id = req["params"]["user_id"].as_i64().unwrap_or(ADMIN);
+                            json!({
+                                "user_id": user_id,
+                                "nickname": "tester",
+                                "card": "tester",
+                                "role": "member",
+                                "group_id": GROUP,
+                            })
+                        }
                         "send_msg" | "send_group_msg" | "send_private_msg" => json!({
                             "message_id": self.next_message_id.fetch_add(1, Ordering::SeqCst)
                         }),
@@ -390,6 +499,14 @@ async fn run_ws_session(mut ws: WebSocketStream<TcpStream>, mut cmd_rx: mpsc::Re
 }
 
 fn group_message(user_id: i64, text: &str) -> Value {
+    group_event(
+        user_id,
+        json!([{"type": "text", "data": {"text": text}}]),
+        text,
+    )
+}
+
+fn group_event(user_id: i64, message: Value, raw: &str) -> Value {
     json!({
         "time": 1_700_000_000,
         "self_id": BOT_ID,
@@ -400,8 +517,8 @@ fn group_message(user_id: i64, text: &str) -> Value {
         "group_id": GROUP,
         "user_id": user_id,
         "anonymous": null,
-        "message": [{"type": "text", "data": {"text": text}}],
-        "raw_message": text,
+        "message": message,
+        "raw_message": raw,
         "font": 0,
         "sender": {
             "user_id": user_id,
@@ -410,6 +527,57 @@ fn group_message(user_id: i64, text: &str) -> Value {
             "role": "member"
         }
     })
+}
+
+struct IsolatedCwd {
+    previous: PathBuf,
+    root: PathBuf,
+}
+
+impl IsolatedCwd {
+    fn enter(repo: &Path) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "qqbot-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("data/wordle")).unwrap();
+        std::fs::create_dir_all(root.join("data/msg_rank")).unwrap();
+        std::fs::copy(repo.join("config.toml"), root.join("config.toml")).unwrap();
+        for name in ["answers.txt", "allowed.txt"] {
+            std::fs::copy(
+                repo.join("data/wordle").join(name),
+                root.join("data/wordle").join(name),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("data/msg_rank/config.json"),
+            format!(
+                r##"{{"notify_group":[{GROUP}],"tencent":null,"wordcloud_background":"#ffffff"}}"##
+            ),
+        )
+        .unwrap();
+        for name in ["font.otf", "mask.png"] {
+            let src = repo.join("data/msg_rank").join(name);
+            if src.is_file() {
+                std::os::unix::fs::symlink(&src, root.join("data/msg_rank").join(name)).unwrap();
+            }
+        }
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        Self { previous, root }
+    }
+}
+
+impl Drop for IsolatedCwd {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.previous);
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
 }
 
 fn private_message(user_id: i64, text: &str) -> Value {
