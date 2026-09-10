@@ -88,17 +88,11 @@ async fn ensure_file(path: &Path, urls: &[&str]) -> anyhow::Result<()> {
 /// 依次尝试各 URL，全部失败才报错；下载内容先写临时文件再原子改名，
 /// 避免下载中断留下半截文件被当作有效缓存。
 async fn download_to_file(urls: &[&str], path: &Path) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("wordle-cli")
-        .build()
-        .context("构建 HTTP 客户端失败")?;
-
+    let client = utils::http_client();
     let mut last_err: Option<anyhow::Error> = None;
     for url in urls {
         info!("下载词库: {url}");
-        match download_one(&client, url, path).await {
+        match download_one(client, url, path).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!("下载 {url} 失败: {err:#}");

@@ -23,15 +23,14 @@ use anyhow::Result;
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PRIVATE_NETWORK_PROTECTION_ENV: &str = "PRIVATE_NETWORK_PROTECTION";
 
-/// 全局共享的 HTTP client，复用连接池，避免每次下载都重新 TCP/TLS 握手。
-/// 仅在未开启私网保护时使用；开启后每次请求需要按本次校验结果做 DNS pinning，
-/// 必须构建带 `resolve_to_addrs` 的临时 client。
-static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("构建共享 reqwest client 失败")
-});
+/// QQ 图床域名。只列图片 CDN，不用整个 `qq.com`，避免任意子域过白名单。
+pub const QQ_IMAGE_HOSTS: &[&str] = &[
+    "multimedia.nt.qq.com.cn",
+    "gchat.qpic.cn",
+    "c2cpicdw.qpic.cn",
+    "gtimg.cn",
+    "qpic.cn",
+];
 
 static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
     if let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) {
@@ -181,7 +180,7 @@ pub async fn download_image_limited(
             .build()?;
         client.get(parsed).timeout(request_timeout).send().await?
     } else {
-        SHARED_CLIENT
+        crate::http_client()
             .get(parsed)
             .timeout(request_timeout)
             .send()

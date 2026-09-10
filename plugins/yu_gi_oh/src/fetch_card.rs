@@ -1,19 +1,12 @@
-use std::{fmt::Display, sync::LazyLock, time::Duration};
+use std::{fmt::Display, time::Duration};
 
 use anyhow::Result;
 use bytes::Bytes;
 use kovi::serde_json;
+use utils::http_client;
 
 const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
-
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("hardcoded reqwest client configuration must be valid")
-});
 
 #[derive(serde::Deserialize)]
 struct ApiRes {
@@ -56,7 +49,7 @@ pub async fn fetch_card(name: &str) -> Result<Option<Card>> {
         "https://ygocdb.com/api/v0/?search={}",
         urlencoding::encode(name)
     );
-    let response = HTTP_CLIENT.get(&url).send().await?.error_for_status()?;
+    let response = http_client().get(&url).send().await?.error_for_status()?;
     let body = utils::read_response_limited(response, MAX_API_RESPONSE_BYTES).await?;
     let resp: ApiRes = serde_json::from_slice(&body)?;
     Ok(resp.result.into_iter().next())

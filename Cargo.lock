@@ -316,7 +316,6 @@ name = "bilibili"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "base64 0.23.1",
  "bytes",
  "chromiumoxide",
@@ -1559,7 +1558,6 @@ dependencies = [
  "rand 0.10.2",
  "reqwest",
  "serde",
- "sha2 0.11.0",
  "sqlx",
  "thiserror 2.0.20",
  "tracing",
@@ -2021,7 +2019,6 @@ name = "msg_rank"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "askama",
  "base64 0.23.1",
  "bytes",
@@ -3770,6 +3767,7 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "anyhow",
+ "arc-swap",
  "askama",
  "chromiumoxide",
  "kovi",
@@ -3777,6 +3775,7 @@ dependencies = [
  "pulldown-cmark",
  "reqwest",
  "serde",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

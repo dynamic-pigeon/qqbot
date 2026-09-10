@@ -88,10 +88,7 @@ pub(crate) async fn init_db(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn restrict_database_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let mut paths = vec![path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = path.as_os_str().to_os_string();
@@ -100,14 +97,9 @@ fn restrict_database_permissions(path: &Path) -> Result<()> {
     }
     for candidate in paths {
         if candidate.exists() {
-            std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))?;
+            utils::restrict_mode_0600(&candidate)?;
         }
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_database_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
