@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Error, Result};
 use base64::{Engine, engine::general_purpose};
 use moka::future::Cache;
-use sha2::{Digest, Sha256};
 use tracing::debug;
 
 mod tencent;
@@ -37,17 +36,14 @@ fn ocr_config() -> &'static OcrConfig {
     &CONFIG
 }
 
-/// OCR 输入图片的 QQ CDN 域名白名单，用于 `validate_image_url_async` 的 SSRF 防御。
-pub const ALLOWED_QQ_HOSTS: &[&str] = &[
-    "multimedia.nt.qq.com.cn",
-    "gchat.qpic.cn",
-    "c2cpicdw.qpic.cn",
-    "txmov2.a.yximgs.com",
-    "yximgs.com",
-    "qq.com",
-    "gtimg.cn",
-    "qpic.cn",
-];
+fn ocr_image_hosts() -> &'static [&'static str] {
+    static HOSTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut hosts = utils::QQ_IMAGE_HOSTS.to_vec();
+        hosts.extend(["txmov2.a.yximgs.com", "yximgs.com", "qq.com"]);
+        hosts
+    });
+    HOSTS.as_slice()
+}
 
 static OCR_MEMORY: LazyLock<OcrMemory> = LazyLock::new(OcrMemory::new);
 static OCR_POOL: LazyLock<utils::BoundedPool> = LazyLock::new(|| utils::BoundedPool::new(4));
@@ -70,7 +66,7 @@ impl OcrMemory {
     }
 
     async fn get_or_insert(&self, key: bytes::Bytes) -> Result<Arc<String>> {
-        let key_sha256 = sha256_hex(&key);
+        let key_sha256 = utils::sha256_hex(&key);
         if let Some(value) = self.cache.get(&key_sha256).await {
             return Ok(value);
         }
@@ -119,16 +115,10 @@ pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
 async fn get_img_bytes_from_url(img_url: &str) -> Result<bytes::Bytes> {
     let bytes = utils::download_image_limited(
         img_url,
-        ALLOWED_QQ_HOSTS,
+        ocr_image_hosts(),
         MAX_OCR_IMAGE_BYTES,
         Duration::from_secs(10),
     )
     .await?;
     Ok(bytes::Bytes::from(bytes))
-}
-
-fn sha256_hex(data: &bytes::Bytes) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    crate::hex_encode(&hasher.finalize())
 }

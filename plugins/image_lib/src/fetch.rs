@@ -9,15 +9,6 @@ use kovi::{Message, Segment, serde_json::Value};
 pub const MAX_ADD_IMAGES: usize = 25;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// QQ 图床域名。只列图片 CDN，不用整个 `qq.com`，避免任意子域过白名单。
-const ALLOWED_QQ_HOSTS: &[&str] = &[
-    "multimedia.nt.qq.com.cn",
-    "gchat.qpic.cn",
-    "c2cpicdw.qpic.cn",
-    "gtimg.cn",
-    "qpic.cn",
-];
-
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("无法读取引用的消息")]
@@ -170,10 +161,14 @@ fn too_large() -> FetchError {
 }
 
 async fn download_remote(url: &str) -> Result<Vec<u8>, FetchError> {
-    let bytes =
-        utils::download_image_limited(url, ALLOWED_QQ_HOSTS, max_image_bytes(), DOWNLOAD_TIMEOUT)
-            .await
-            .map_err(map_download_error)?;
+    let bytes = utils::download_image_limited(
+        url,
+        utils::QQ_IMAGE_HOSTS,
+        max_image_bytes(),
+        DOWNLOAD_TIMEOUT,
+    )
+    .await
+    .map_err(map_download_error)?;
     ensure_image_bytes(&bytes)?;
     Ok(bytes)
 }
