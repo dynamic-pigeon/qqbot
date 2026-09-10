@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use kovi::Segment;
 use kovi_onebot::OnebotTrait;
-use utils::RateLimiter;
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
 };
+use utils::{RateLimiter, sha256_hex};
 
 use crate::fetch::{
     AddImageSource, FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes,
@@ -18,7 +18,7 @@ use crate::scan::{
 };
 use crate::send::{image_message, report_send_fail, send_group_wait};
 use crate::similar::{cluster, distance_from_percent};
-use crate::store::{Store, StoreError, sha256_hex};
+use crate::store::{Store, StoreError};
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     let scans = Arc::new(ScanSessions::new());

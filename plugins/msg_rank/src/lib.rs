@@ -1,7 +1,4 @@
-use std::{
-    sync::{Arc, LazyLock},
-    time::Duration,
-};
+use std::sync::Arc;
 
 use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
@@ -16,31 +13,6 @@ mod word_cloud;
 
 const MAX_OCR_IMAGES_PER_MESSAGE: usize = 3;
 const MAX_STORED_MESSAGE_BYTES: usize = 4 * 1024;
-
-/// 小写的十六进制编码。`hex::encode` 的极简内联实现，避免引入 hex crate。
-#[inline]
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
-}
-
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .pool_max_idle_per_host(16)
-        // 空闲连接定时归还，避免 keep-alive 的 TLS 连接无限期挂起。
-        .pool_idle_timeout(Duration::from_secs(90))
-        .timeout(Duration::from_secs(10))
-        // SSRF 防御：禁止跟随 redirect，防止 attacker 用公网域名 → 内网 IP 跳转
-        // 绕过 URL host 白名单。
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-});
 
 #[kovi::plugin]
 async fn main() {

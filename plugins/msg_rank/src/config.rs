@@ -1,8 +1,8 @@
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use utils::JsonStore;
 
 /// 根目录 `config.toml` 的 `[msg_rank]`。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -49,8 +49,7 @@ pub(crate) fn static_config() -> &'static StaticConfig {
     &CONFIG
 }
 
-pub(crate) static CONFIG: OnceLock<ArcSwap<Config>> = OnceLock::new();
-static CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static CONFIG: OnceLock<JsonStore<Config>> = OnceLock::new();
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
@@ -58,8 +57,6 @@ pub struct Config {
     /// 词云背景色，支持 #RRGGBB 和常见颜色名。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
-    #[serde(skip)]
-    pub path: PathBuf,
 }
 
 fn default_wordcloud_background() -> String {
@@ -71,70 +68,25 @@ impl Default for Config {
         Self {
             notify_group: vec![],
             wordcloud_background: default_wordcloud_background(),
-            path: PathBuf::new(),
         }
     }
 }
 
 pub fn init_config(path: PathBuf) -> Result<()> {
-    let mut config: Config = kovi::utils::load_json_data(Default::default(), &path)
-        .map_err(|e| anyhow::anyhow!("加载配置文件失败: {e}"))?;
-    config.path = path;
-    if !config.path.exists() {
-        write_config(&config)?;
-    }
-    restrict_config_permissions(&config.path)?;
-
+    let store = JsonStore::open(path)?;
     CONFIG
-        .set(ArcSwap::from_pointee(config))
+        .set(store)
         .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
     Ok(())
 }
 
-#[cfg(unix)]
-fn restrict_config_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_config_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
-}
-
-#[inline(always)]
 pub fn read_config() -> Arc<Config> {
-    CONFIG.get().expect("配置未初始化").load_full()
+    CONFIG.get().expect("配置未初始化").get()
 }
 
-#[cold]
-#[inline(never)]
 pub fn modify_config<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut Config),
 {
-    // 写路径串行化，避免并发写导致配置覆盖；读路径仍保持无锁快照读取。
-    let _write_guard = CONFIG_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let cfg = CONFIG.get().unwrap();
-    let mut next = cfg.load_full().as_ref().clone();
-    f(&mut next);
-    // 调用频率不高，直接每次修改都写入文件，保证配置的持久化
-    write_config(&next)?;
-    cfg.store(Arc::new(next));
-    Ok(())
-}
-
-pub fn write_config(config: &Config) -> Result<()> {
-    let config_path = &config.path;
-    match kovi::utils::save_json_data(config, config_path) {
-        Err(e) => {
-            anyhow::bail!("保存配置文件失败: {}", e);
-        }
-        Ok(_) => Ok(()),
-    }
+    CONFIG.get().expect("配置未初始化").modify(f)
 }

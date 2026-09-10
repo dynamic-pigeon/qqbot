@@ -11,11 +11,11 @@ use kovi::tokio::sync::{Mutex, mpsc};
 
 use anyhow::{Context, Result};
 use rand::RngExt;
-use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
+use utils::sha256_hex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -165,7 +165,7 @@ impl Store {
             .connect_with(options)
             .await?;
         init_schema(&pool).await?;
-        restrict_file_permissions(&db_path)?;
+        utils::restrict_mode_0600(&db_path).context("收紧图库数据库权限失败")?;
         self.pools.lock().await.insert(group_id, pool.clone());
         Ok(pool)
     }
@@ -845,16 +845,6 @@ fn is_hash_prefix(prefix: &str) -> bool {
     (1..=64).contains(&len) && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
 async fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -865,7 +855,7 @@ async fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     ));
     let write = async {
         kovi::tokio::fs::write(&tmp, bytes).await?;
-        restrict_file_permissions(&tmp)?;
+        utils::restrict_mode_0600(&tmp)?;
         kovi::tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
@@ -886,19 +876,6 @@ async fn remove_unindexed(
         }
         let _ = kovi::tokio::fs::remove_file(path).await;
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
