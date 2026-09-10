@@ -17,21 +17,15 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(unix)]
 fn restrict_sensitive_file(path: impl AsRef<std::path::Path>) {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let path = path.as_ref();
     if !path.exists() {
         return;
     }
-    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+    if let Err(error) = utils::restrict_mode_0600(path) {
         tracing::warn!(path = %path.display(), "无法收紧敏感文件权限: {error}");
     }
 }
-
-#[cfg(not(unix))]
-fn restrict_sensitive_file(_path: impl AsRef<std::path::Path>) {}
 
 // 事件入口是单条 WebSocket，词云/sqlite 等重活已在 spawn_blocking 或连接线程上；
 // current_thread 只占一条异步线程，避免按 CPU 数拉 worker 抬高空闲 RSS。

@@ -5,21 +5,15 @@ use anyhow::Result;
 use hmac::{Hmac, KeyInit, Mac};
 use kovi::chrono::{DateTime, Utc};
 use kovi::serde_json::{self, Value};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
-use crate::{HTTP_CLIENT, hex_encode};
+use utils::{hex_encode, http_client, sha256_hex};
 
 type HmacSha256 = Hmac<Sha256>;
 
 fn get_date(timestamp: i64) -> String {
     let dt = DateTime::<Utc>::from_timestamp(timestamp, 0).unwrap();
     dt.format("%Y-%m-%d").to_string()
-}
-
-fn sha256_hex(data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data.as_bytes());
-    hex_encode(hasher.finalize().as_slice())
 }
 
 fn hmac_sha256(key: &[u8], data: &str) -> Vec<u8> {
@@ -63,7 +57,7 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     })
     .to_string();
 
-    let hashed_request_payload = sha256_hex(&payload);
+    let hashed_request_payload = sha256_hex(payload.as_bytes());
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         http_request_method,
@@ -77,7 +71,7 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     let algorithm = "TC3-HMAC-SHA256";
     let request_timestamp = timestamp.to_string();
     let credential_scope = format!("{}/{}/tc3_request", date, service);
-    let hashed_canonical_request = sha256_hex(&canonical_request);
+    let hashed_canonical_request = sha256_hex(canonical_request.as_bytes());
     let string_to_sign = format!(
         "{}\n{}\n{}\n{}",
         algorithm, request_timestamp, credential_scope, hashed_canonical_request
@@ -95,7 +89,7 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
 
     let url = format!("https://{}", host);
 
-    let mut request = HTTP_CLIENT
+    let mut request = http_client()
         .post(&url)
         .header("Authorization", authorization)
         .header("Content-Type", "application/json; charset=utf-8")
