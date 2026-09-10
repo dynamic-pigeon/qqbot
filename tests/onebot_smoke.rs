@@ -1,6 +1,6 @@
 //! 用内存 OneBot V11 正向 WS 冒烟：current_thread 下各插件命令能否正常回复。
 //!
-//! 数据写在临时目录，不改仓库 `data/` 里的订阅和图库。
+//! 配置、词库和样图都写在临时目录，不读 gitignore 的 `data/` / `config.toml`。
 //! 词云读库依赖 msg_rank 5 秒刷盘，所以 `/wordcloud once` 前会等一拍。
 
 use std::net::SocketAddr;
@@ -33,13 +33,8 @@ const SLOW: Duration = Duration::from_secs(45);
 
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_commands_reply_on_mock_onebot() {
-    let repo = std::env::current_dir().expect("cwd");
-    let tree_png = repo.join("data/tree_image/qqbot_tree.png");
-    let mask_png = repo.join("data/msg_rank/mask.png");
-    assert!(tree_png.is_file(), "缺少 {tree_png:?}");
-    assert!(mask_png.is_file(), "缺少 {mask_png:?}");
-
-    let _iso = IsolatedCwd::enter(&repo);
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let iso = IsolatedCwd::enter(&repo);
     let _ = utils::config::value();
     let server = MockOneBot::start().await;
     let bot = build_bot(KoviConf::new(ID::new(ADMIN), None, false), server.driver());
@@ -90,7 +85,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     );
 
     let added = server
-        .ask_with_image(ADMIN, "添加 猫", &tree_png, REPLY)
+        .ask_with_image(ADMIN, "添加 猫", &iso.sample_a, REPLY)
         .await
         .expect("添加 猫 应回复");
     assert!(
@@ -98,12 +93,12 @@ async fn plugin_commands_reply_on_mock_onebot() {
         "添加失败: {added:?}"
     );
     let added_mask = server
-        .ask_with_image(ADMIN, "添加 猫", &mask_png, REPLY)
+        .ask_with_image(ADMIN, "添加 猫", &iso.sample_b, REPLY)
         .await
-        .expect("添加 mask 应回复");
+        .expect("添加第二张图应回复");
     assert!(
         added_mask.text.contains("添加") || added_mask.text.contains("都已在"),
-        "添加 mask 失败: {added_mask:?}"
+        "添加第二张图失败: {added_mask:?}"
     );
     assert_contains(&server, "图库", "猫").await;
     assert_contains(&server, "别名 喵 猫", "别名").await;
@@ -142,8 +137,12 @@ async fn plugin_commands_reply_on_mock_onebot() {
     );
 
     for i in 0..8 {
+        // 夹杂英文，词云在没有 CJK 字体时也能用内置英文字体画出图。
         server
-            .emit_group(ADMIN, &format!("闲聊消息 {i} 今天天气不错 词云测试"))
+            .emit_group(
+                ADMIN,
+                &format!("闲聊消息 {i} 今天天气不错 词云测试 weather wordcloud hello"),
+            )
             .await;
     }
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -532,6 +531,8 @@ fn group_event(user_id: i64, message: Value, raw: &str) -> Value {
 struct IsolatedCwd {
     previous: PathBuf,
     root: PathBuf,
+    sample_a: PathBuf,
+    sample_b: PathBuf,
 }
 
 impl IsolatedCwd {
@@ -546,14 +547,12 @@ impl IsolatedCwd {
         ));
         std::fs::create_dir_all(root.join("data/wordle")).unwrap();
         std::fs::create_dir_all(root.join("data/msg_rank")).unwrap();
-        std::fs::copy(repo.join("config.toml"), root.join("config.toml")).unwrap();
-        for name in ["answers.txt", "allowed.txt"] {
-            std::fs::copy(
-                repo.join("data/wordle").join(name),
-                root.join("data/wordle").join(name),
-            )
-            .unwrap();
-        }
+        std::fs::create_dir_all(root.join("fixtures")).unwrap();
+
+        let config_src = repo.join("config.toml.example");
+        assert!(config_src.is_file(), "缺少 {}", config_src.display());
+        std::fs::copy(&config_src, root.join("config.toml")).unwrap();
+        write_word_lists(&root.join("data/wordle"));
         std::fs::write(
             root.join("data/msg_rank/config.json"),
             format!(
@@ -561,15 +560,20 @@ impl IsolatedCwd {
             ),
         )
         .unwrap();
-        for name in ["font.otf", "mask.png"] {
-            let src = repo.join("data/msg_rank").join(name);
-            if src.is_file() {
-                std::os::unix::fs::symlink(&src, root.join("data/msg_rank").join(name)).unwrap();
-            }
-        }
+
+        let sample_a = root.join("fixtures/a.png");
+        let sample_b = root.join("fixtures/b.png");
+        std::fs::write(&sample_a, rgb_pattern_png(1)).unwrap();
+        std::fs::write(&sample_b, rgb_pattern_png(200)).unwrap();
+
         let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(&root).unwrap();
-        Self { previous, root }
+        Self {
+            previous,
+            root,
+            sample_a,
+            sample_b,
+        }
     }
 }
 
@@ -578,6 +582,102 @@ impl Drop for IsolatedCwd {
         let _ = std::env::set_current_dir(&self.previous);
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+fn write_word_lists(dir: &Path) {
+    let answers: Vec<String> = std::iter::once("crane".to_string())
+        .chain((0..2_000).map(fake_word))
+        .collect();
+    let allowed: Vec<String> = std::iter::once("crane".to_string())
+        .chain((0..12_000).map(fake_word))
+        .collect();
+    std::fs::write(dir.join("answers.txt"), answers.join("\n")).unwrap();
+    std::fs::write(dir.join("allowed.txt"), allowed.join("\n")).unwrap();
+}
+
+fn fake_word(mut i: usize) -> String {
+    let mut word = String::with_capacity(5);
+    for _ in 0..5 {
+        word.push((b'a' + (i % 26) as u8) as char);
+        i /= 26;
+    }
+    word
+}
+
+/// 16×16 带纹理的 RGB PNG。感知哈希会跳过纯色图，所以样图要有对比度。
+fn rgb_pattern_png(seed: u32) -> Vec<u8> {
+    const WIDTH: u32 = 16;
+    const HEIGHT: u32 = 16;
+    let mut raw = Vec::with_capacity(((1 + WIDTH * 3) * HEIGHT) as usize);
+    for y in 0..HEIGHT {
+        raw.push(0);
+        for x in 0..WIDTH {
+            let v = ((x.wrapping_mul(13) + y.wrapping_mul(7) + seed) % 256) as u8;
+            raw.push(v);
+            raw.push(v.wrapping_add(40));
+            raw.push(220u8.wrapping_sub(v));
+        }
+    }
+    encode_png(WIDTH, HEIGHT, &raw)
+}
+
+fn encode_png(width: u32, height: u32, raw: &[u8]) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    write_png_chunk(&mut out, b"IHDR", &ihdr);
+    write_png_chunk(&mut out, b"IDAT", &zlib_store(raw));
+    write_png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(tag);
+    out.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(tag);
+    crc_input.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn zlib_store(data: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(data.len()).expect("png raw fits one deflate block");
+    let mut out = Vec::with_capacity(6 + data.len() + 4);
+    out.extend_from_slice(&[0x78, 0x01]);
+    out.push(0x01);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut s1 = 1u32;
+    let mut s2 = 0u32;
+    for &byte in data {
+        s1 = (s1 + u32::from(byte)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    (s2 << 16) | s1
 }
 
 fn private_message(user_id: i64, text: &str) -> Value {
