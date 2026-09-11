@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use kovi::PluginBuilder as plugin;
 use utils::RateLimiter;
@@ -20,6 +21,14 @@ use store::Store;
 async fn main() {
     let bot = plugin::get_runtime_bot();
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));
+    let reconcile_store = Arc::clone(&store);
+    kovi::tokio::spawn(async move {
+        let mut interval = kovi::tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            reconcile_store.reconcile_all().await;
+        }
+    });
     let image_config = config::static_config();
     let limiter = Arc::new(RateLimiter::new(
         image_config.draw_window(),

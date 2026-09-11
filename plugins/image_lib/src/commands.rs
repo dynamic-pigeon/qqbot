@@ -203,19 +203,9 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     let segments = add_image_segments(&ctx).await?;
     let mut images = Vec::with_capacity(segments.len());
     for segment in &segments {
-        let bytes = match load_image_bytes(segment).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = store.discard_unindexed(group_id, &images).await;
-                return Err(error.into());
-            }
-        };
-        match store.write_blob(group_id, bytes).await {
-            Ok(image) => images.push(image),
-            Err(error) => {
-                let _ = store.discard_unindexed(group_id, &images).await;
-                return Err(CommandError::internal(error));
-            }
+        match load_image_bytes(segment).await {
+            Ok(bytes) => images.push(bytes),
+            Err(error) => return Err(error.into()),
         }
     }
     match store.add_images(group_id, name, images).await {
