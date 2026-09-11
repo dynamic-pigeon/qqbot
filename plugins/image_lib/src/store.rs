@@ -80,14 +80,6 @@ pub struct Store {
     pools: Mutex<HashMap<i64, SqlitePool>>,
 }
 
-/// 已哈希、必要时已写入 `blobs/{hash}` 的一张图。
-pub struct PreparedImage {
-    hash: String,
-    size: u64,
-    /// 本次新建的文件；提交失败时删掉。已存在的 blob 为 `None`。
-    created_path: Option<PathBuf>,
-}
-
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
         Self::open_with_quota(root, crate::config::static_config().max_group_bytes())
@@ -170,132 +162,74 @@ impl Store {
         Ok(pool)
     }
 
-    /// 算哈希；`blobs/{hash}` 不存在才写盘。
-    pub async fn write_blob(
-        &self,
-        group_id: i64,
-        bytes: Vec<u8>,
-    ) -> Result<PreparedImage, StoreError> {
-        if bytes.is_empty() {
-            return Err(StoreError::Other(anyhow::anyhow!("图片为空")));
-        }
-        let blobs = self.blobs_dir(group_id);
-        kovi::tokio::fs::create_dir_all(&blobs)
-            .await
-            .context("创建图片目录失败")?;
-        let hash = sha256_hex(&bytes);
-        let path = blob_file(&blobs, &hash)?;
-        let created_path = if kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            None
-        } else {
-            write_blob_atomic(&path, &bytes).await?;
-            Some(path)
-        };
-        Ok(PreparedImage {
-            hash,
-            size: bytes.len() as u64,
-            created_path,
-        })
-    }
-
-    /// 删除尚未入库的新建 blob。索引里已有的同 hash 文件会保留。
-    pub async fn discard_unindexed(
-        &self,
-        group_id: i64,
-        images: &[PreparedImage],
-    ) -> Result<(), StoreError> {
-        let orphans: Vec<(String, PathBuf)> = images
-            .iter()
-            .filter_map(|item| {
-                item.created_path
-                    .clone()
-                    .map(|path| (item.hash.clone(), path))
-            })
-            .collect();
-        if orphans.is_empty() {
-            return Ok(());
-        }
-        match self
-            .with_group(group_id, |pool| {
-                let orphans = &orphans;
-                async move { remove_unindexed(&pool, orphans).await }
-            })
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                for (_, path) in &orphans {
-                    let _ = kovi::tokio::fs::remove_file(path).await;
-                }
-                Ok(())
-            }
-        }
-    }
-
     pub async fn add_images(
         &self,
         group_id: i64,
         name: &str,
-        images: Vec<PreparedImage>,
+        images: Vec<Vec<u8>>,
     ) -> Result<AddResult, StoreError> {
         let blobs = self.blobs_dir(group_id);
         let max_group_bytes = self.max_group_bytes;
-        let result = self
-            .with_group(group_id, |pool| {
-                let images = &images;
-                async move {
-                    let library = resolve_library(&pool, name).await?;
-                    let existing = library_hashes(&pool, &library).await?;
+        self.with_group(group_id, |pool| {
+            let images = &images;
+            async move {
+                kovi::tokio::fs::create_dir_all(&blobs)
+                    .await
+                    .context("创建图片目录失败")?;
+                let library = resolve_library(&pool, name).await?;
+                let existing = library_hashes(&pool, &library).await?;
 
-                    let mut added_hashes = HashSet::new();
-                    let mut to_insert = Vec::new();
-                    let mut skipped_dup = 0usize;
-                    let mut created = Vec::new();
-                    let mut created_bytes = 0u64;
+                let mut added_hashes = HashSet::new();
+                let mut to_insert = Vec::new();
+                let mut skipped_dup = 0usize;
 
-                    for item in images {
-                        if existing.contains(&item.hash) || !added_hashes.insert(item.hash.clone())
-                        {
-                            skipped_dup += 1;
-                            continue;
-                        }
-                        let path = blob_file(&blobs, &item.hash)?;
-                        if !kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                            continue;
-                        }
-                        if let Some(created_path) = &item.created_path {
-                            created.push((item.hash.clone(), created_path.clone()));
-                            created_bytes += item.size;
-                        }
-                        to_insert.push((item.hash.clone(), item.size));
+                for bytes in images {
+                    if bytes.is_empty() {
+                        return Err(StoreError::Other(anyhow::anyhow!("图片为空")));
                     }
-
-                    let used = dir_size(&blobs).await;
-                    if used > max_group_bytes {
-                        remove_unindexed(&pool, &created).await?;
-                        return Err(StoreError::QuotaExceeded {
-                            used: used.saturating_sub(created_bytes),
-                            additional: created_bytes,
-                            limit: max_group_bytes,
-                        });
+                    let hash = sha256_hex(bytes);
+                    if existing.contains(&hash) || !added_hashes.insert(hash.clone()) {
+                        skipped_dup += 1;
+                        continue;
                     }
-
-                    if let Err(error) = insert_images(&pool, &library, &to_insert).await {
-                        let _ = remove_unindexed(&pool, &created).await;
-                        return Err(error);
-                    }
-
-                    Ok(AddResult {
-                        added: to_insert.len(),
-                        skipped_dup,
-                    })
+                    to_insert.push((hash, bytes.as_slice()));
                 }
-            })
-            .await;
-        if result.is_err() {
-            let _ = self.discard_unindexed(group_id, &images).await;
-        }
-        result
+
+                let additional = additional_unique_bytes(&pool, &to_insert).await?;
+                let used = unique_image_bytes(&pool).await?;
+                if used.saturating_add(additional) > max_group_bytes {
+                    return Err(StoreError::QuotaExceeded {
+                        used,
+                        additional,
+                        limit: max_group_bytes,
+                    });
+                }
+
+                let mut created = Vec::new();
+                for (hash, bytes) in &to_insert {
+                    let path = blob_file(&blobs, hash)?;
+                    if kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                        continue;
+                    }
+                    if let Err(error) = write_blob_atomic(&path, bytes).await {
+                        let _ = remove_unindexed(&pool, &created).await;
+                        return Err(error.into());
+                    }
+                    created.push((hash.clone(), path));
+                }
+
+                if let Err(error) = insert_images(&pool, &library, &to_insert).await {
+                    let _ = remove_unindexed(&pool, &created).await;
+                    return Err(error);
+                }
+
+                Ok(AddResult {
+                    added: to_insert.len(),
+                    skipped_dup,
+                })
+            }
+        })
+        .await
     }
 
     pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
@@ -331,22 +265,34 @@ impl Store {
             if !library_exists(&pool, &canonical).await? {
                 return Err(StoreError::LibraryMissing);
             }
-            let hashes = library_hashes(&pool, &canonical).await?;
+            let exclusive = hashes_only_in_library(&pool, &canonical).await?;
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "DELETE FROM perceptual WHERE hash IN (
+                     SELECT mine.hash FROM images AS mine
+                     WHERE mine.library = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM images AS other
+                           WHERE other.hash = mine.hash AND other.library != mine.library
+                       )
+                 )",
+            )
+            .bind(&canonical)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query("DELETE FROM images WHERE library = ?")
                 .bind(&canonical)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
             sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
                 .bind(&canonical)
                 .bind(&canonical)
-                .execute(&pool)
+                .execute(&mut *tx)
                 .await?;
-            for hash in hashes {
-                if !hash_still_used(&pool, &hash).await?
-                    && let Ok(path) = blob_file(&blobs, &hash)
-                {
+            tx.commit().await?;
+            for hash in exclusive {
+                if let Ok(path) = blob_file(&blobs, &hash) {
                     let _ = kovi::tokio::fs::remove_file(path).await;
-                    delete_fingerprint(&pool, &hash).await?;
                 }
             }
             Ok(canonical)
@@ -430,7 +376,6 @@ impl Store {
     }
 
     pub async fn stats(&self, group_id: i64) -> Result<GroupStats, StoreError> {
-        let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
             let rows = sqlx::query(
                 "SELECT library, COUNT(*) AS count, SUM(size) AS bytes
@@ -463,16 +408,11 @@ impl Store {
                 sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT hash) FROM images")
                     .fetch_one(&pool)
                     .await? as usize;
-            let unique_bytes = sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT SUM(size) FROM (SELECT hash, MAX(size) AS size FROM images GROUP BY hash)",
-            )
-            .fetch_one(&pool)
-            .await?
-            .unwrap_or(0) as u64;
+            let unique_bytes = unique_image_bytes(&pool).await?;
             Ok(GroupStats {
                 libraries,
                 unique_count,
-                unique_bytes: unique_bytes.max(dir_size(&blobs).await),
+                unique_bytes,
             })
         })
         .await
@@ -584,6 +524,89 @@ impl Store {
                 })
                 .collect();
             Ok((library, images))
+        })
+        .await
+    }
+
+    pub(crate) async fn reconcile_all(&self) {
+        let groups = match self.list_group_ids().await {
+            Ok(groups) => groups,
+            Err(error) => {
+                tracing::error!("列举图库群目录失败: {error}");
+                return;
+            }
+        };
+        for group_id in groups {
+            if let Err(error) = self.reconcile_group(group_id).await {
+                tracing::error!("图库对账失败 group_id={group_id}: {error}");
+            }
+        }
+    }
+
+    async fn list_group_ids(&self) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        let mut entries = kovi::tokio::fs::read_dir(&self.root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            if let Ok(id) = entry.file_name().to_string_lossy().parse::<i64>() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn reconcile_group(&self, group_id: i64) -> Result<(), StoreError> {
+        let blobs = self.blobs_dir(group_id);
+        self.with_group(group_id, |pool| async move {
+            let disk = blob_hashes_on_disk(&blobs).await?;
+
+            let indexed: HashSet<String> = sqlx::query_scalar("SELECT DISTINCT hash FROM images")
+                .fetch_all(&pool)
+                .await?
+                .into_iter()
+                .collect();
+
+            let mut removed_files = 0u64;
+            for hash in disk.difference(&indexed) {
+                if let Ok(path) = blob_file(&blobs, hash)
+                    && kovi::tokio::fs::remove_file(&path).await.is_ok()
+                {
+                    removed_files += 1;
+                }
+            }
+
+            let mut tx = pool.begin().await?;
+            let mut removed_rows = 0u64;
+            for hash in indexed.difference(&disk) {
+                let result = sqlx::query("DELETE FROM images WHERE hash = ?")
+                    .bind(hash)
+                    .execute(&mut *tx)
+                    .await?;
+                removed_rows += result.rows_affected();
+            }
+            if removed_rows > 0 {
+                sqlx::query(
+                    "DELETE FROM aliases WHERE target NOT IN (SELECT DISTINCT library FROM images)",
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "DELETE FROM perceptual WHERE hash NOT IN (SELECT DISTINCT hash FROM images)",
+            )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+
+            if removed_files > 0 || removed_rows > 0 {
+                tracing::info!(group_id, removed_files, removed_rows, "图库对账完成");
+            }
+            Ok(())
         })
         .await
     }
@@ -723,6 +746,63 @@ async fn library_hashes(pool: &SqlitePool, library: &str) -> Result<HashSet<Stri
     Ok(hashes.into_iter().collect())
 }
 
+async fn unique_image_bytes(pool: &SqlitePool) -> Result<u64, StoreError> {
+    let bytes = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(size) FROM (SELECT hash, MAX(size) AS size FROM images GROUP BY hash)",
+    )
+    .fetch_one(pool)
+    .await?
+    .unwrap_or(0);
+    Ok(bytes as u64)
+}
+
+async fn additional_unique_bytes(
+    pool: &SqlitePool,
+    to_insert: &[(String, &[u8])],
+) -> Result<u64, StoreError> {
+    if to_insert.is_empty() {
+        return Ok(0);
+    }
+    let mut builder =
+        sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT DISTINCT hash FROM images WHERE hash IN (");
+    {
+        let mut separated = builder.separated(", ");
+        for (hash, _) in to_insert {
+            separated.push_bind(hash);
+        }
+    }
+    builder.push(")");
+    let present: HashSet<String> = builder
+        .build_query_scalar()
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(to_insert
+        .iter()
+        .filter(|(hash, _)| !present.contains(hash))
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum())
+}
+
+async fn hashes_only_in_library(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<String>, StoreError> {
+    let hashes = sqlx::query_scalar::<_, String>(
+        "SELECT mine.hash FROM images AS mine
+         WHERE mine.library = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM images AS other
+               WHERE other.hash = mine.hash AND other.library != mine.library
+           )",
+    )
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    Ok(hashes)
+}
+
 async fn hash_still_used(pool: &SqlitePool, hash: &str) -> Result<bool, StoreError> {
     let found = sqlx::query_scalar::<_, i64>("SELECT 1 FROM images WHERE hash = ? LIMIT 1")
         .bind(hash)
@@ -783,7 +863,7 @@ async fn library_fingerprints(
 async fn insert_images(
     pool: &SqlitePool,
     library: &str,
-    images: &[(String, u64)],
+    images: &[(String, &[u8])],
 ) -> Result<(), StoreError> {
     let draw_count = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MIN(draw_count) FROM images WHERE library = ?",
@@ -792,13 +872,13 @@ async fn insert_images(
     .fetch_one(pool)
     .await?
     .unwrap_or(0);
-    for (hash, size) in images {
+    for (hash, bytes) in images {
         sqlx::query(
             "INSERT OR IGNORE INTO images (library, hash, size, draw_count) VALUES (?, ?, ?, ?)",
         )
         .bind(library)
         .bind(hash)
-        .bind(*size as i64)
+        .bind(bytes.len() as i64)
         .bind(draw_count)
         .execute(pool)
         .await?;
@@ -820,20 +900,27 @@ fn blob_file(blobs: &Path, hash: &str) -> Result<PathBuf> {
     Ok(blobs.join(hash))
 }
 
-async fn dir_size(dir: &Path) -> u64 {
-    let Ok(mut entries) = kovi::tokio::fs::read_dir(dir).await else {
-        return 0;
-    };
-    let mut total = 0u64;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.path().extension().is_some() {
+async fn blob_hashes_on_disk(blobs: &Path) -> Result<HashSet<String>, StoreError> {
+    let mut entries = kovi::tokio::fs::read_dir(blobs)
+        .await
+        .context("列出图片目录失败")?;
+    let mut disk = HashSet::new();
+    while let Some(entry) = entries.next_entry().await.context("列出图片目录失败")? {
+        let path = entry.path();
+        if let Some(ext) = path.extension() {
+            if ext == "tmp" {
+                let _ = kovi::tokio::fs::remove_file(&path).await;
+            }
             continue;
         }
-        if let Ok(meta) = entry.metadata().await {
-            total += meta.len();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_blob_hash(name) {
+            disk.insert(name.to_owned());
         }
     }
-    total
+    Ok(disk)
 }
 
 fn is_blob_hash(hash: &str) -> bool {
@@ -912,11 +999,7 @@ mod tests {
         name: &str,
         images: Vec<Vec<u8>>,
     ) -> Result<AddResult, StoreError> {
-        let mut prepared = Vec::with_capacity(images.len());
-        for bytes in images {
-            prepared.push(store.write_blob(group_id, bytes).await?);
-        }
-        store.add_images(group_id, name, prepared).await
+        store.add_images(group_id, name, images).await
     }
 
     #[tokio::test]

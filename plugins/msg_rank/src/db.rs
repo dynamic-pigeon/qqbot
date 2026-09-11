@@ -372,12 +372,10 @@ async fn delete_expired_messages() -> Result<u64> {
 }
 
 async fn init_table() -> Result<()> {
-    let conn = get_pool()?;
-
+    let pool = get_pool()?;
     sqlx::query(
         "
 CREATE TABLE IF NOT EXISTS MSG (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
     group_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     msg TEXT NOT NULL,
@@ -385,8 +383,10 @@ CREATE TABLE IF NOT EXISTS MSG (
 );
 ",
     )
-    .execute(conn)
+    .execute(pool)
     .await?;
+
+    rebuild_msg_without_id_column(pool).await?;
 
     sqlx::query(
         "
@@ -394,13 +394,62 @@ CREATE INDEX IF NOT EXISTS idx_msg_group_time_user
 ON MSG (group_id, timestamp, user_id);
 ",
     )
-    .execute(conn)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "
+CREATE INDEX IF NOT EXISTS idx_msg_timestamp
+ON MSG (timestamp);
+",
+    )
+    .execute(pool)
     .await?;
 
     sqlx::query("DROP INDEX IF EXISTS idx_msg_group_time;")
-        .execute(conn)
+        .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+async fn rebuild_msg_without_id_column(pool: &SqlitePool) -> Result<()> {
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('MSG')")
+        .fetch_all(pool)
+        .await?;
+    if !columns.iter().any(|name| name == "id") {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS MSG_new")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "
+CREATE TABLE MSG_new (
+    group_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    msg TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+);
+",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "
+INSERT INTO MSG_new (group_id, user_id, msg, timestamp)
+SELECT group_id, user_id, msg, timestamp FROM MSG;
+",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DROP TABLE MSG").execute(&mut *tx).await?;
+    sqlx::query("ALTER TABLE MSG_new RENAME TO MSG")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
