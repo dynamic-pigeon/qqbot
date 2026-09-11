@@ -239,10 +239,16 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
+        // 并行测试各自占用独立目录，避免互相删掉对方的词库缓存。
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "wordle-test-{}-{:?}",
+            "wordle-test-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
