@@ -50,7 +50,7 @@ pub fn init() {
         let map = Arc::clone(&map_);
         async move {
             let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            let cfg = config::read_config();
+            let cfg = config::CONFIG.get();
             let uids: HashSet<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
             map.retain(|&uid, _| uids.contains(&uid));
             tracing::info!("已清理直播订阅列表，当前订阅数: {}", map.len());
@@ -77,7 +77,7 @@ async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::Runt
     }
     let _guard = PollGuard;
 
-    let cfg = config::read_config();
+    let cfg = config::CONFIG.get();
 
     let uids: Vec<u64> = cfg.subscribe.iter().map(|s| s.uid).collect();
     if uids.is_empty() {
