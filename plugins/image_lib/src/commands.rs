@@ -13,10 +13,12 @@ use crate::fetch::{
 };
 use crate::name::parse_library_name;
 use crate::scan::{
-    NEXT_PAGE_ARG, PackedImage, ScanAdvance, ScanKey, ScanSessions, group_title, packetize_images,
-    parse_group_index,
+    GROUPS_PER_PAGE, NEXT_PAGE_ARG, PackedImage, ScanAdvance, ScanKey, ScanSessions,
+    chunk_forward_packets, group_node_name, group_title, packets_for_group, parse_group_index,
 };
-use crate::send::{image_message, report_send_fail, send_group_wait};
+use crate::send::{
+    forward_node, image_message, report_send_fail, send_group_forward_wait, send_group_wait,
+};
 use crate::similar::{cluster, distance_from_percent};
 use crate::store::{Store, StoreError};
 
@@ -132,7 +134,7 @@ fn delete_hash_command(store: Arc<Store>) -> Command {
 
 fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
     Command::new("查重")
-        .description("扫指定图库的近重复，不删除")
+        .description("扫指定图库的近重复，聊天记录每次最多 5 组")
         .usage("查重 <库名> [组号|下一组|相似度%]")
         .permission(Permission::BotAdmin)
         .expose_as_root()
@@ -471,6 +473,13 @@ async fn open_scan_key(
     ))
 }
 
+struct ScanPageGroup {
+    title: String,
+    name: String,
+    images: Vec<PackedImage>,
+    index: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn show_scan_group(
     ctx: &CommandContext,
@@ -479,39 +488,55 @@ async fn show_scan_group(
     group_id: i64,
     library: &str,
     key: &ScanKey,
-    jump: Option<usize>,
+    mut jump: Option<usize>,
     starting: bool,
 ) -> CommandResult {
+    let mut page = Vec::new();
+    let mut total = 0usize;
     loop {
-        let advance = match jump {
+        if page.len() >= GROUPS_PER_PAGE {
+            break;
+        }
+        let from_jump = jump.is_some();
+        let advance = match jump.take() {
             Some(index) => scans.jump(key, index),
             None => scans.advance(key),
         };
         match advance {
             None => {
-                return Err(CommandError::user(format!("请先发送「查重 {library}」")));
+                if page.is_empty() {
+                    return Err(CommandError::user(format!("请先发送「查重 {library}」")));
+                }
+                break;
             }
             Some(ScanAdvance::Exhausted) => {
-                ctx.reply(if starting {
-                    format!("「{library}」里没有相似的图")
-                } else {
-                    "没有下一组了".to_owned()
-                });
-                return Ok(());
+                if page.is_empty() {
+                    ctx.reply(if starting {
+                        format!("「{library}」里没有相似的图")
+                    } else {
+                        "没有下一组了".to_owned()
+                    });
+                    return Ok(());
+                }
+                break;
             }
             Some(ScanAdvance::OutOfRange { total }) => {
-                ctx.reply(if total == 0 {
-                    format!("「{library}」里没有相似的图")
-                } else {
-                    format!("只有 {total} 组")
-                });
-                return Ok(());
+                if page.is_empty() {
+                    ctx.reply(if total == 0 {
+                        format!("「{library}」里没有相似的图")
+                    } else {
+                        format!("只有 {total} 组")
+                    });
+                    return Ok(());
+                }
+                break;
             }
             Some(ScanAdvance::Group {
                 group,
                 index,
-                total,
+                total: group_total,
             }) => {
+                total = group_total;
                 let mut images = Vec::new();
                 for hash in &group.hashes {
                     if let Ok(bytes) = store.read_blob(group_id, hash).await {
@@ -522,50 +547,68 @@ async fn show_scan_group(
                     }
                 }
                 if images.len() < 2 {
-                    if jump.is_some() {
+                    if from_jump && page.is_empty() {
                         ctx.reply(format!("第 {index} 组不足两张，可能已经删过了"));
                         return Ok(());
                     }
                     continue;
                 }
-                return reply_group(
-                    ctx,
-                    group_title(group.kind, index, total, group.percent),
+                page.push(ScanPageGroup {
+                    title: group_title(group.kind, index, group_total, group.percent),
+                    name: group_node_name(group.kind, index, group_total, group.percent),
                     images,
-                    library,
                     index,
-                    total,
-                )
-                .await;
+                });
             }
         }
     }
+    reply_scan_page(ctx, library, page, total).await
 }
 
-async fn reply_group(
+async fn reply_scan_page(
     ctx: &CommandContext,
-    title: String,
-    images: Vec<PackedImage>,
     library: &str,
-    group_index: usize,
+    groups: Vec<ScanPageGroup>,
     group_total: usize,
 ) -> CommandResult {
     let group_id = ctx.group_id()?;
-    let packets = packetize_images(images);
-    for (i, packet) in packets.iter().enumerate() {
-        let caption = if i == 0 { title.as_str() } else { "（续）" };
-        let bytes: Vec<&[u8]> = packet.iter().map(|image| image.bytes.as_slice()).collect();
-        let message = image_message(Some(caption), &bytes);
-        if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
-            let remaining: Vec<String> = packets[i..]
+    let self_id = ctx.event().self_id;
+    let from = groups.first().map(|group| group.index).unwrap_or(1);
+    let to = groups.last().map(|group| group.index).unwrap_or(from);
+    let mut packets = Vec::new();
+    for group in groups {
+        packets.extend(packets_for_group(group.title, group.name, group.images));
+    }
+    let chunks = chunk_forward_packets(packets);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let nodes: Vec<_> = chunk
+            .iter()
+            .map(|packet| {
+                let bytes: Vec<&[u8]> = packet
+                    .images
+                    .iter()
+                    .map(|image| image.bytes.as_slice())
+                    .collect();
+                let message = image_message(Some(&packet.caption), &bytes);
+                forward_node(&packet.name, self_id, &message)
+            })
+            .collect();
+        if let Err(error) = send_group_forward_wait(ctx.bot(), group_id, &nodes).await {
+            let remaining: Vec<String> = chunks[i..]
                 .iter()
-                .flat_map(|part| part.iter().map(|image| image.hash.clone()))
+                .flat_map(|part| {
+                    part.iter()
+                        .flat_map(|packet| packet.images.iter().map(|image| image.hash.clone()))
+                })
                 .collect();
-            let previews: Vec<Vec<u8>> = packet.iter().map(|image| image.bytes.clone()).collect();
+            let previews: Vec<Vec<u8>> = chunk
+                .iter()
+                .flat_map(|packet| packet.images.iter().map(|image| image.bytes.clone()))
+                .collect();
             report_send_fail(
                 ctx.bot(),
                 format!(
-                    "图库查重发送失败 group={group_id} 库={library} 组={group_index}/{group_total} 包={}",
+                    "图库查重发送失败 group={group_id} 库={library} 组={from}-{to}/{group_total} 聊天记录={}",
                     i + 1
                 ),
                 &remaining,
@@ -573,7 +616,10 @@ async fn reply_group(
                 &error,
             )
             .await;
-            return Err(CommandError::user(format!("第 {} 包发送失败", i + 1)));
+            return Err(CommandError::user(format!(
+                "第 {} 条聊天记录发送失败",
+                i + 1
+            )));
         }
     }
     Ok(())
