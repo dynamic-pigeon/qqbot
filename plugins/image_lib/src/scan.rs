@@ -7,6 +7,8 @@ use std::{
 use crate::similar::{GroupKind, SimilarGroup};
 
 pub const NEXT_PAGE_ARG: &str = "下一组";
+/// 「查重」一次放进一条聊天记录的组数；「下一组」翻下一批。
+pub const GROUPS_PER_PAGE: usize = 5;
 
 /// 标题里的「2/5」对应组号 `2`。纯数字，避免和「90%」抢参数。
 pub fn parse_group_index(raw: &str) -> Option<usize> {
@@ -122,10 +124,18 @@ fn expire(sessions: &mut HashMap<ScanKey, ScanState>) {
 
 pub fn group_title(kind: GroupKind, index: usize, total: usize, percent: u8) -> String {
     match kind {
-        GroupKind::Duplicate => format!("重复 {index}/{total} · 约 {percent}%"),
+        GroupKind::Duplicate => group_node_name(kind, index, total, percent),
         GroupKind::Maybe => {
             format!("也许像 {index}/{total} · 约 {percent}%。不确定，别按重复删")
         }
+    }
+}
+
+/// 合并转发节点昵称。Maybe 组的警告放在正文里，避免昵称被截断。
+pub fn group_node_name(kind: GroupKind, index: usize, total: usize, percent: u8) -> String {
+    match kind {
+        GroupKind::Duplicate => format!("重复 {index}/{total} · 约 {percent}%"),
+        GroupKind::Maybe => format!("也许像 {index}/{total} · 约 {percent}%"),
     }
 }
 
@@ -156,6 +166,65 @@ pub fn packetize_images(images: Vec<PackedImage>) -> Vec<Vec<PackedImage>> {
         packets.push(current);
     }
     packets
+}
+
+pub struct ForwardPacket {
+    pub name: String,
+    pub caption: String,
+    pub images: Vec<PackedImage>,
+}
+
+impl ForwardPacket {
+    pub fn byte_len(&self) -> usize {
+        self.images.iter().map(|image| image.bytes.len()).sum()
+    }
+}
+
+/// 一组图可能拆成多条节点；第一条带标题，后续标「（续）」。
+pub fn packets_for_group(
+    title: String,
+    name: String,
+    images: Vec<PackedImage>,
+) -> Vec<ForwardPacket> {
+    let mut packets = packetize_images(images);
+    if packets.is_empty() {
+        return Vec::new();
+    }
+    let first = packets.remove(0);
+    let mut out = Vec::with_capacity(packets.len() + 1);
+    out.push(ForwardPacket {
+        name: name.clone(),
+        caption: title,
+        images: first,
+    });
+    out.extend(packets.into_iter().map(|images| ForwardPacket {
+        name: name.clone(),
+        caption: "（续）".to_owned(),
+        images,
+    }));
+    out
+}
+
+/// 一条聊天记录塞不下时拆开连发。整包超过字节上限时单独成条。
+pub fn chunk_forward_packets(packets: Vec<ForwardPacket>) -> Vec<Vec<ForwardPacket>> {
+    let mut chunks = Vec::new();
+    let mut current: Vec<ForwardPacket> = Vec::new();
+    let mut bytes = 0usize;
+    for packet in packets {
+        let size = packet.byte_len();
+        let would_overflow =
+            !current.is_empty() && bytes.saturating_add(size) > MAX_BYTES_PER_MESSAGE;
+        if would_overflow {
+            chunks.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+        current.push(packet);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 #[cfg(test)]
@@ -268,5 +337,41 @@ mod tests {
         let huge = packetize_images(packed(2, MAX_BYTES_PER_MESSAGE - 1));
         assert_eq!(huge.len(), 2);
         assert_eq!(huge[0].len(), 1);
+    }
+
+    #[test]
+    fn packets_for_group_marks_continuations() {
+        let packets = packets_for_group(
+            "重复 1/2 · 约 90%".into(),
+            "重复 1/2 · 约 90%".into(),
+            packed(10, 10),
+        );
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].caption, "重复 1/2 · 约 90%");
+        assert_eq!(packets[1].caption, "（续）");
+        assert_eq!(packets[0].images.len(), 9);
+        assert_eq!(packets[1].images.len(), 1);
+    }
+
+    #[test]
+    fn chunk_forward_splits_on_bytes() {
+        let group = packets_for_group(
+            "重复 1/2 · 约 90%".into(),
+            "重复 1/2 · 约 90%".into(),
+            packed(2, MAX_BYTES_PER_MESSAGE - 1),
+        );
+        let chunks = chunk_forward_packets(group);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks[1].len(), 1);
+    }
+
+    #[test]
+    fn maybe_node_name_drops_warning() {
+        assert_eq!(
+            group_node_name(GroupKind::Maybe, 2, 5, 80),
+            "也许像 2/5 · 约 80%"
+        );
+        assert!(group_title(GroupKind::Maybe, 2, 5, 80).contains("不确定"));
     }
 }
