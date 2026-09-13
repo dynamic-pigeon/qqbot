@@ -21,7 +21,7 @@ use utils::command::{
 };
 use wordcloud::{Mask, WordCloud, WordCloudError};
 
-use crate::config::{modify_config, read_config};
+use crate::config::CONFIG;
 
 static RESOURCE_MANAGER: tokio::sync::OnceCell<utils::ResourceManager<WordCloudResources>> =
     tokio::sync::OnceCell::const_new();
@@ -71,8 +71,12 @@ async fn load_word_cloud_resources(font_path: &Path) -> Result<WordCloudResource
             return Err(anyhow::anyhow!("读取字体失败 {}: {e}", font_path.display()));
         }
     };
+    // jieba 词典约 54MB，同步加载会卡住 current_thread runtime。
+    let jieba = tokio::task::spawn_blocking(jieba_rs::Jieba::new)
+        .await
+        .map_err(|e| anyhow::anyhow!("jieba 词典加载任务失败: {e}"))?;
     Ok(WordCloudResources {
-        jieba: Arc::new(jieba_rs::Jieba::new()),
+        jieba: Arc::new(jieba),
         font_bytes,
     })
 }
@@ -108,7 +112,7 @@ fn mark_cron_fire(last_fire_ts: &AtomicI64, now_ts: i64) -> bool {
     now_ts.saturating_sub(prev) >= 2
 }
 
-pub(crate) async fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
+pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
     for schedule in &crate::config::static_config().wordcloud {
         let bot = Arc::clone(&bot);
         let path = Arc::clone(&path);
@@ -119,7 +123,7 @@ pub(crate) async fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()>
             let path = &path;
             let bot = &bot;
             if mark_cron_fire(&last_fire_ts, chrono::Local::now().timestamp()) {
-                let config = read_config();
+                let config = CONFIG.get();
                 for &group_id in &config.notify_group {
                     let bot = Arc::clone(bot);
                     let path = Arc::clone(path);
@@ -193,12 +197,13 @@ fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
 fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    modify_config(|config| {
-        if !config.notify_group.contains(&group_id) {
-            config.notify_group.push(group_id);
-        }
-    })
-    .map_err(CommandError::internal)?;
+    CONFIG
+        .modify(|config| {
+            if !config.notify_group.contains(&group_id) {
+                config.notify_group.push(group_id);
+            }
+        })
+        .map_err(CommandError::internal)?;
     ctx.reply("启用成功");
     Ok(())
 }
@@ -206,10 +211,11 @@ fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
 fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    modify_config(|config| {
-        config.notify_group.retain(|&id| id != group_id);
-    })
-    .map_err(CommandError::internal)?;
+    CONFIG
+        .modify(|config| {
+            config.notify_group.retain(|&id| id != group_id);
+        })
+        .map_err(CommandError::internal)?;
     ctx.reply("停用成功");
     Ok(())
 }
@@ -217,7 +223,7 @@ fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
 fn wordcloud_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    let enabled = read_config().notify_group.contains(&group_id);
+    let enabled = CONFIG.get().notify_group.contains(&group_id);
     ctx.reply(if enabled {
         "词云功能已启用"
     } else {
@@ -287,7 +293,7 @@ async fn make_word_cloud(
 
     let stop_words = load_stop_words(path);
     let background = {
-        let config = read_config();
+        let config = CONFIG.get();
         config.wordcloud_background.clone()
     };
     let resources = resource_manager(path.join("font.otf")).await.get().await?;

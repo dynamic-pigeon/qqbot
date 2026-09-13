@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use arc_swap::ArcSwap;
@@ -9,45 +9,78 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::restrict_mode_0600;
 
-/// 运行时 JSON 配置：内存快照无锁读，写路径串行并原子落盘。
-pub struct JsonStore<T> {
+struct JsonStoreInner<T> {
     path: PathBuf,
     data: ArcSwap<T>,
     write_lock: Mutex<()>,
 }
 
+/// 运行时 JSON 配置：内存快照无锁读，写路径串行并原子落盘。
+///
+/// 可放进 `static`：`JsonStore::new()` 后再 [`init`](Self::init)。
+pub struct JsonStore<T> {
+    inner: OnceLock<JsonStoreInner<T>>,
+}
+
+impl<T> JsonStore<T> {
+    pub const fn new() -> Self {
+        Self {
+            inner: OnceLock::new(),
+        }
+    }
+}
+
+impl<T> Default for JsonStore<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> JsonStore<T>
 where
-    T: Serialize + DeserializeOwned + Default + Clone,
+    T: Serialize + DeserializeOwned + Default + Clone + Send + Sync,
 {
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let store = Self::new();
+        store.init(path)?;
+        Ok(store)
+    }
+
+    pub fn init(&self, path: impl Into<PathBuf>) -> anyhow::Result<()> {
         let path = path.into();
         let value = load_or_default(&path)?;
         persist_if_missing(&path, &value)?;
         restrict_mode_0600(&path)?;
-        Ok(Self {
-            path,
-            data: ArcSwap::from_pointee(value),
-            write_lock: Mutex::new(()),
-        })
+        self.inner
+            .set(JsonStoreInner {
+                path,
+                data: ArcSwap::from_pointee(value),
+                write_lock: Mutex::new(()),
+            })
+            .map_err(|_| anyhow::anyhow!("配置已初始化"))
+    }
+
+    fn inner(&self) -> &JsonStoreInner<T> {
+        self.inner.get().expect("配置未初始化")
     }
 
     pub fn get(&self) -> Arc<T> {
-        self.data.load_full()
+        self.inner().data.load_full()
     }
 
     pub fn modify<F>(&self, f: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut T),
     {
-        let _guard = self
+        let inner = self.inner();
+        let _guard = inner
             .write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut next = self.data.load_full().as_ref().clone();
+        let mut next = inner.data.load_full().as_ref().clone();
         f(&mut next);
-        write_atomic(&self.path, &next)?;
-        self.data.store(Arc::new(next));
+        write_atomic(&inner.path, &next)?;
+        inner.data.store(Arc::new(next));
         Ok(())
     }
 }
@@ -169,6 +202,14 @@ mod tests {
         assert!(!path.with_extension("json.tmp").exists());
         let reopened = JsonStore::<Sample>::open(&path).unwrap();
         assert_eq!(reopened.get().value, 7);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn init_rejects_second_call() {
+        let path = temp_path("twice");
+        let store = JsonStore::<Sample>::open(&path).unwrap();
+        assert!(store.init(&path).is_err());
         cleanup(&path);
     }
 }

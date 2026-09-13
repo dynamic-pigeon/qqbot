@@ -5,8 +5,10 @@ edition = "2024"
 
 [features]
 default = []
-# HTML → PNG，只给真正截图的插件打开，避免其它插件编译 Chromium 客户端。
-screenshot = ["dep:chromiumoxide"]
+# 启动/关闭 Chromium 进程；截图和 B 站动态后备共用。
+chromium = ["dep:chromiumoxide"]
+# HTML → PNG，只给真正截图的插件打开，避免其它插件编译截图路径。
+screenshot = ["chromium"]
 # Markdown → HTML → PNG；在 screenshot 之上再加上解析、消毒和 KaTeX 资源。
 markdown = ["screenshot", "dep:pulldown-cmark", "dep:askama", "dep:ammonia"]
 

@@ -45,7 +45,7 @@ async fn word_list() -> Result<std::sync::Arc<WordList>, anyhow::Error> {
         .cloned()
 }
 
-pub async fn run() {
+pub fn run() {
     let bot = plugin::get_runtime_bot();
     CommandRouter::new("wordle", bot)
         .register(wordle_command())
