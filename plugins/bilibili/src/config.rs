@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use kovi::PluginBuilder as plugin;
 use utils::JsonStore;
 
@@ -7,19 +5,13 @@ use utils::JsonStore;
 pub struct Config {
     pub subscribe: Vec<Subscribe>,
     #[serde(default)]
-    pub dynamic_subscribe: Vec<DynamicSubscribe>,
+    pub dynamic_subscribe: Vec<Subscribe>,
     #[serde(default)]
     pub dynamic_checkpoints: Vec<DynamicCheckpoint>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Subscribe {
-    pub uid: u64,
-    pub groups: Vec<i64>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct DynamicSubscribe {
     pub uid: u64,
     pub groups: Vec<i64>,
 }
@@ -31,26 +23,11 @@ pub struct DynamicCheckpoint {
     pub last_seen: i64,
 }
 
-static CONFIG: std::sync::OnceLock<JsonStore<Config>> = std::sync::OnceLock::new();
+pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
 
 pub fn init() -> anyhow::Result<()> {
     let bot = plugin::get_runtime_bot();
-    let store = JsonStore::open(bot.get_data_path().join("config.json"))?;
-    CONFIG
-        .set(store)
-        .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
-    Ok(())
-}
-
-pub fn read_config() -> Arc<Config> {
-    CONFIG.get().expect("配置未初始化").get()
-}
-
-pub fn modify_config<F>(f: F) -> anyhow::Result<()>
-where
-    F: FnOnce(&mut Config),
-{
-    CONFIG.get().expect("配置未初始化").modify(f)
+    CONFIG.init(bot.get_data_path().join("config.json"))
 }
 
 #[cfg(test)]

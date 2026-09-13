@@ -40,7 +40,7 @@ async fn scheduled_task(bot: std::sync::Arc<RuntimeBot>) {
         tracing::warn!("上一轮动态轮询尚未结束，跳过本轮");
         return;
     };
-    let cfg = crate::config::read_config();
+    let cfg = crate::config::CONFIG.get();
     let uids: Vec<u64> = cfg
         .dynamic_subscribe
         .iter()
@@ -61,7 +61,7 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("fetch 超时"))??;
 
-    let cfg = crate::config::read_config();
+    let cfg = crate::config::CONFIG.get();
     let groups: Vec<i64> = cfg
         .dynamic_subscribe
         .iter()
@@ -107,7 +107,7 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
     }
 
     if !updates.is_empty() {
-        config::modify_config(|cfg| {
+        config::CONFIG.modify(|cfg| {
             for &(group, last_seen) in &updates {
                 let still_subscribed = cfg.dynamic_subscribe.iter().any(|subscription| {
                     subscription.uid == uid && subscription.groups.contains(&group)
@@ -209,14 +209,14 @@ pub async fn fetch_recent(uid: u64, count: usize) -> anyhow::Result<Vec<DynamicI
 
 pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
     let mut changed = false;
-    config::modify_config(|cfg| {
+    config::CONFIG.modify(|cfg| {
         if let Some(s) = cfg.dynamic_subscribe.iter_mut().find(|s| s.uid == uid) {
             if !s.groups.contains(&group) {
                 s.groups.push(group);
                 changed = true;
             }
         } else {
-            cfg.dynamic_subscribe.push(crate::config::DynamicSubscribe {
+            cfg.dynamic_subscribe.push(crate::config::Subscribe {
                 uid,
                 groups: vec![group],
             });
@@ -227,7 +227,7 @@ pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
 }
 
 pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
-    config::modify_config(|cfg| {
+    config::CONFIG.modify(|cfg| {
         if let Some(idx) = cfg.dynamic_subscribe.iter().position(|s| s.uid == uid) {
             let s = &mut cfg.dynamic_subscribe[idx];
             s.groups.retain(|g| *g != group);
@@ -241,7 +241,7 @@ pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
 }
 
 pub fn list_subscribes(group: i64) -> Vec<(u64, String)> {
-    let cfg = config::read_config();
+    let cfg = config::CONFIG.get();
     cfg.dynamic_subscribe
         .iter()
         .filter(|s| s.groups.contains(&group))

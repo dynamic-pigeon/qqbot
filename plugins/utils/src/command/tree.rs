@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt, ops::Range};
 
-use super::model::{Command, CommandArguments, CommandHandler, MessageScope, Permission};
+use super::model::{Command, CommandHandler, MessageScope, Permission};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -133,28 +133,9 @@ impl ResolvedCommand {
     pub fn scope(&self) -> MessageScope {
         self.scope
     }
-
-    pub(crate) fn into_dispatch_parts(
-        self,
-    ) -> (
-        Vec<String>,
-        CommandArguments,
-        String,
-        Permission,
-        MessageScope,
-        CommandHandler,
-    ) {
-        (
-            self.path,
-            CommandArguments::new(self.args, self.rest),
-            self.usage,
-            self.permission,
-            self.scope,
-            self.handler,
-        )
-    }
 }
 
+#[derive(Clone)]
 pub struct CommandTree {
     roots: Vec<Command>,
 }
@@ -218,31 +199,14 @@ impl CommandTree {
         }
 
         let Some(handler) = node.handler.clone() else {
-            let usage = node.usage.clone();
-            let permission = node.permission.unwrap_or_default();
-            let scope = node.scope.unwrap_or_default();
-            let available = node
-                .children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect();
-            return match spans.get(consumed) {
-                Some(span) => ResolveOutcome::Error(RouteError::UnknownSubcommand {
-                    path,
-                    subcommand: input[span.clone()].to_owned(),
-                    usage,
-                    available,
-                    permission,
-                    scope,
-                }),
-                None => ResolveOutcome::Error(RouteError::MissingSubcommand {
-                    path,
-                    usage,
-                    available,
-                    permission,
-                    scope,
-                }),
-            };
+            let (permission, scope) = node_access(node);
+            return ResolveOutcome::Error(RouteError::MissingSubcommand {
+                path,
+                usage: node.usage.clone(),
+                available: child_names(node),
+                permission,
+                scope,
+            });
         };
 
         let (args, rest) = if let Some((suffix, rest_start)) = glue {
@@ -261,13 +225,14 @@ impl CommandTree {
             (args, rest_after_path(input, &spans, consumed))
         };
 
+        let (permission, scope) = node_access(node);
         ResolveOutcome::Matched(ResolvedCommand {
             path,
             args,
             rest,
             usage: node.usage.clone(),
-            permission: node.permission.unwrap_or_default(),
-            scope: node.scope.unwrap_or_default(),
+            permission,
+            scope,
             handler,
         })
     }
@@ -275,13 +240,37 @@ impl CommandTree {
     pub(crate) fn roots(&self) -> &[Command] {
         &self.roots
     }
+
+    /// `/help 添加` 要命中根别名，`/help 图库 添加` 要走规范路径；路由 resolve 只处理调用。
+    pub(crate) fn find_for_help(&self, path: &[&str]) -> Option<(&Command, Vec<String>)> {
+        if path.is_empty() {
+            return None;
+        }
+        find_canonical(&self.roots, path).or_else(|| find_exposed(&self.roots, path))
+    }
+
+    pub(crate) fn root_facing_names(&self) -> Vec<&str> {
+        let mut names = Vec::new();
+        fn walk<'a>(command: &'a Command, faces_root: bool, names: &mut Vec<&'a str>) {
+            if faces_root {
+                names.extend(command.names());
+            }
+            for child in &command.children {
+                walk(child, child.expose_as_root, names);
+            }
+        }
+        for root in &self.roots {
+            walk(root, true, &mut names);
+        }
+        names
+    }
 }
 
 fn token_match(command: &Command, token: &str) -> Option<usize> {
     let mut best = None;
-    for name in std::iter::once(&command.name).chain(&command.aliases) {
+    for name in command.names() {
         let matched = if command.prefix_match {
-            !name.is_empty() && token.starts_with(name.as_str())
+            !name.is_empty() && token.starts_with(name)
         } else {
             token == name
         };
@@ -356,19 +345,113 @@ fn match_root_facing<'a>(roots: &'a [Command], token: &str) -> Option<RootHit<'a
     best
 }
 
+fn child_names(node: &Command) -> Vec<String> {
+    node.children
+        .iter()
+        .map(|child| child.name.clone())
+        .collect()
+}
+
+fn node_access(node: &Command) -> (Permission, MessageScope) {
+    (
+        node.permission.unwrap_or_default(),
+        node.scope.unwrap_or_default(),
+    )
+}
+
 fn unknown_subcommand(node: &Command, path: Vec<String>, subcommand: String) -> ResolveOutcome {
+    let (permission, scope) = node_access(node);
     ResolveOutcome::Error(RouteError::UnknownSubcommand {
         path,
         subcommand,
         usage: node.usage.clone(),
-        available: node
-            .children
-            .iter()
-            .map(|child| child.name.clone())
-            .collect(),
-        permission: node.permission.unwrap_or_default(),
-        scope: node.scope.unwrap_or_default(),
+        available: child_names(node),
+        permission,
+        scope,
     })
+}
+
+fn help_token_hits(command: &Command, token: &str, strip_root_prefix: bool) -> bool {
+    command.names().any(|name| {
+        if strip_root_prefix {
+            name == token
+                || name
+                    .strip_prefix(['/', '!', '#'])
+                    .is_some_and(|stripped| stripped == token)
+        } else {
+            name == token
+        }
+    })
+}
+
+fn descend<'a>(
+    mut node: &'a Command,
+    path: &mut Vec<String>,
+    parts: &[&str],
+    match_aliases: bool,
+) -> Option<&'a Command> {
+    for part in parts {
+        let child = node.children.iter().find(|child| {
+            if match_aliases {
+                help_token_hits(child, part, false)
+            } else {
+                child.name == *part
+            }
+        })?;
+        path.push(child.name.clone());
+        node = child;
+    }
+    Some(node)
+}
+
+fn find_canonical<'a>(roots: &'a [Command], path: &[&str]) -> Option<(&'a Command, Vec<String>)> {
+    let (first, rest) = path.split_first()?;
+    for root in roots {
+        if !help_token_hits(root, first, true) {
+            continue;
+        }
+        let mut canonical = vec![root.name.clone()];
+        if let Some(node) = descend(root, &mut canonical, rest, true) {
+            return Some((node, canonical));
+        }
+    }
+    None
+}
+
+fn find_exposed<'a>(roots: &'a [Command], path: &[&str]) -> Option<(&'a Command, Vec<String>)> {
+    let (first, rest) = path.split_first()?;
+    for root in roots {
+        if let Some(found) = walk_exposed_help(root, std::slice::from_ref(&root.name), first, rest)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn walk_exposed_help<'a>(
+    node: &'a Command,
+    path: &[String],
+    first: &str,
+    rest: &[&str],
+) -> Option<(&'a Command, Vec<String>)> {
+    for child in &node.children {
+        let mut child_path = path.to_vec();
+        child_path.push(child.name.clone());
+        if child.expose_as_root && help_token_hits(child, first, true) {
+            if rest.is_empty() {
+                return Some((child, child_path));
+            }
+            let mut canonical = child_path.clone();
+            if let Some(found) = descend(child, &mut canonical, rest, false) {
+                return Some((found, canonical));
+            }
+        }
+        if let Some(found) = walk_exposed_help(child, &child_path, first, rest) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn prepare_node(
@@ -411,8 +494,8 @@ fn prepare_node(
 fn validate_exposed_root_names(roots: &[Command]) -> Result<(), CommandRegistrationError> {
     let mut claimed = HashMap::new();
     for root in roots {
-        for name in std::iter::once(&root.name).chain(&root.aliases) {
-            claimed.insert(name.as_str(), root.name.as_str());
+        for name in root.names() {
+            claimed.insert(name, root.name.as_str());
         }
     }
     for root in roots {
@@ -427,11 +510,11 @@ fn claim_exposed_root_names<'a>(
 ) -> Result<(), CommandRegistrationError> {
     for child in &command.children {
         if child.expose_as_root {
-            for name in std::iter::once(&child.name).chain(&child.aliases) {
-                if claimed.insert(name.as_str(), child.name.as_str()).is_some() {
+            for name in child.names() {
+                if claimed.insert(name, child.name.as_str()).is_some() {
                     return Err(CommandRegistrationError::DuplicateName {
                         parent_path: "<root>".to_owned(),
-                        name: name.clone(),
+                        name: name.to_owned(),
                     });
                 }
             }
@@ -447,11 +530,11 @@ fn validate_siblings(
 ) -> Result<(), CommandRegistrationError> {
     let mut names = HashMap::new();
     for command in commands {
-        for name in std::iter::once(&command.name).chain(&command.aliases) {
-            if names.insert(name.as_str(), command.name.as_str()).is_some() {
+        for name in command.names() {
+            if names.insert(name, command.name.as_str()).is_some() {
                 return Err(CommandRegistrationError::DuplicateName {
                     parent_path: display_path(parent_path),
-                    name: name.clone(),
+                    name: name.to_owned(),
                 });
             }
         }
@@ -495,10 +578,8 @@ fn rest_after_path(input: &str, spans: &[Range<usize>], consumed: usize) -> Stri
         return String::new();
     };
     let suffix = &input[path_end..];
-    let rest = suffix
-        .chars()
-        .next()
-        .filter(|character| character.is_whitespace())
-        .map_or(suffix, |character| &suffix[character.len_utf8()..]);
-    rest.to_owned()
+    suffix
+        .strip_prefix(|character: char| character.is_whitespace())
+        .unwrap_or(suffix)
+        .to_owned()
 }

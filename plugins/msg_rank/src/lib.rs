@@ -4,7 +4,6 @@ use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
 use utils::command::CommandRouter;
 
-#[macro_use]
 mod config;
 mod db;
 mod msg_rank;
@@ -20,7 +19,7 @@ async fn main() {
     let path = Arc::new(bot.get_data_path());
 
     let config_path = path.join("config.json");
-    if let Err(e) = config::init_config(config_path) {
+    if let Err(e) = config::CONFIG.init(config_path) {
         tracing::error!("初始化配置失败: {e}");
         return;
     }
@@ -41,16 +40,14 @@ async fn main() {
         .expect("注册发言排行与词云命令失败");
 
     plugin::on_group_msg(add_msg);
-    word_cloud::init(Arc::clone(&bot), Arc::clone(&path))
-        .await
-        .unwrap();
+    word_cloud::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
 }
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
     let group = event.group_id;
     let user = event.user_id;
 
-    if !config::read_config().notify_group.contains(&group) {
+    if !config::CONFIG.get().notify_group.contains(&group) {
         return;
     }
 

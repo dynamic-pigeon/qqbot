@@ -132,19 +132,20 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
     }
 
     let group = ctx.group_id()?;
-    config::modify_config(|config| {
-        if let Some(subscription) = config.subscribe.iter_mut().find(|item| item.uid == uid) {
-            if !subscription.groups.contains(&group) {
-                subscription.groups.push(group);
+    config::CONFIG
+        .modify(|config| {
+            if let Some(subscription) = config.subscribe.iter_mut().find(|item| item.uid == uid) {
+                if !subscription.groups.contains(&group) {
+                    subscription.groups.push(group);
+                }
+            } else {
+                config.subscribe.push(crate::config::Subscribe {
+                    uid,
+                    groups: vec![group],
+                });
             }
-        } else {
-            config.subscribe.push(crate::config::Subscribe {
-                uid,
-                groups: vec![group],
-            });
-        }
-    })
-    .map_err(CommandError::internal)?;
+        })
+        .map_err(CommandError::internal)?;
     ctx.reply(format!("已为本群订阅 uid={uid}"));
     Ok(())
 }
@@ -153,16 +154,17 @@ fn live_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
     let group = ctx.group_id()?;
-    config::modify_config(|config| {
-        if let Some(index) = config.subscribe.iter().position(|item| item.uid == uid) {
-            let subscription = &mut config.subscribe[index];
-            subscription.groups.retain(|item| *item != group);
-            if subscription.groups.is_empty() {
-                config.subscribe.remove(index);
+    config::CONFIG
+        .modify(|config| {
+            if let Some(index) = config.subscribe.iter().position(|item| item.uid == uid) {
+                let subscription = &mut config.subscribe[index];
+                subscription.groups.retain(|item| *item != group);
+                if subscription.groups.is_empty() {
+                    config.subscribe.remove(index);
+                }
             }
-        }
-    })
-    .map_err(CommandError::internal)?;
+        })
+        .map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的订阅"));
     Ok(())
 }
@@ -170,7 +172,8 @@ fn live_remove(ctx: CommandContext) -> CommandResult {
 async fn live_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group = ctx.group_id()?;
-    let uids = config::read_config()
+    let uids = config::CONFIG
+        .get()
         .subscribe
         .iter()
         .filter(|subscription| subscription.groups.contains(&group))

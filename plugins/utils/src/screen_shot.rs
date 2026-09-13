@@ -1,16 +1,13 @@
-use std::ops::Deref;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
-use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::page::{CaptureScreenshotFormat, Viewport};
 use chromiumoxide::page::ScreenshotParams;
-use kovi::futures_util::StreamExt;
 use kovi::tokio::{self, sync::OnceCell};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
-use crate::{BoundedPool, ResourceManager};
+use crate::{BoundedPool, ChromiumInstance, ChromiumLaunch, ResourceManager};
 
 /// 截图默认超时：避免浏览器偶发卡死永久占用一个 tokio task。
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,20 +64,7 @@ async fn get_manager() -> &'static ScreenshotManager {
         .await
 }
 
-struct ChromiumInstance {
-    browser: Browser,
-    user_data_dir: PathBuf,
-}
-
-impl Deref for ChromiumInstance {
-    type Target = Browser;
-
-    fn deref(&self) -> &Self::Target {
-        &self.browser
-    }
-}
-
-pub struct ScreenshotManager {
+pub(crate) struct ScreenshotManager {
     browser: ResourceManager<ChromiumInstance>,
     pool: BoundedPool,
 }
@@ -88,67 +72,21 @@ pub struct ScreenshotManager {
 impl ScreenshotManager {
     fn new() -> Self {
         Self {
-            browser: ResourceManager::new_with_destructor(
-                IDLE_TIMEOUT,
-                || async {
-                    info!("launching chromiumoxide browser (lazy init)");
-                    Self::launch_browser().await
-                },
-                Self::close_browser,
-            ),
+            browser: ChromiumLaunch::new("screenshot")
+                .flags([
+                    "disable-dev-shm-usage",
+                    "disable-background-networking",
+                    "disable-default-apps",
+                    "disable-extensions",
+                    "disable-sync",
+                    "disable-translate",
+                    "no-first-run",
+                    "mute-audio",
+                    "use-mock-keychain",
+                ])
+                .lifecycle_timeout(BROWSER_LIFECYCLE_TIMEOUT)
+                .managed(IDLE_TIMEOUT),
             pool: BoundedPool::new(MAX_CONCURRENT_SCREENSHOTS),
-        }
-    }
-
-    async fn launch_browser() -> Result<ChromiumInstance> {
-        let user_data_dir = crate::chromium_user_data_dir("screenshot");
-        let config = BrowserConfig::builder()
-            .user_data_dir(&user_data_dir)
-            .window_size(1920, 1080)
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-background-networking")
-            .arg("--disable-default-apps")
-            .arg("--disable-extensions")
-            .arg("--disable-sync")
-            .arg("--disable-translate")
-            .arg("--no-first-run")
-            .arg("--mute-audio")
-            .arg("--password-store=basic")
-            .arg("--use-mock-keychain")
-            .build()
-            .map_err(anyhow::Error::msg)?;
-        let (browser, mut handler) =
-            tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, Browser::launch(config))
-                .await
-                .map_err(|_| anyhow::anyhow!("启动 Chromium 超时"))??;
-
-        // chromiumoxide 要求持续轮询 handler stream，否则 CDP 事件不会被处理。
-        tokio::spawn(async move {
-            while let Some(h) = handler.next().await {
-                if h.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(ChromiumInstance {
-            browser,
-            user_data_dir,
-        })
-    }
-
-    async fn close_browser(instance: ChromiumInstance) {
-        info!("shutting down chromiumoxide browser");
-        let ChromiumInstance {
-            mut browser,
-            user_data_dir,
-        } = instance;
-        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-        if tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait())
-            .await
-            .is_ok()
-        {
-            let _ = tokio::fs::remove_dir_all(user_data_dir).await;
         }
     }
 

@@ -15,5 +15,5 @@ pub mod render;
 #[cfg(feature = "qq")]
 #[kovi::plugin]
 async fn main() {
-    plugin::run().await;
+    plugin::run();
 }
