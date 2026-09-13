@@ -17,7 +17,7 @@ pub mod retry;
 pub mod safe_url;
 
 pub use bounded_pool::BoundedPool;
-pub use fs::restrict_mode_0600;
+pub use fs::{chromium_user_data_dir, restrict_mode_0600};
 pub use hash::{hex_encode, sha256_hex};
 pub use http::http_client;
 pub use json_store::JsonStore;

@@ -628,7 +628,7 @@ fn convert_word(
 }
 
 fn convert_article(
-    _id: &str,
+    id: &str,
     author: &DynamicAuthor,
     body: &Option<DynamicBodyRaw>,
 ) -> Option<DynamicItem> {
@@ -636,7 +636,8 @@ fn convert_article(
     let major = body.major.as_ref()?;
     let art = major.article.as_ref()?;
     Some(DynamicItem::Article {
-        id: art.id,
+        id: id.to_string(),
+        cv_id: art.id,
         title: art.title.clone(),
         summary: RichText {
             text: art.desc.clone(),
@@ -648,7 +649,7 @@ fn convert_article(
 }
 
 fn convert_live(
-    _id: &str,
+    id: &str,
     author: &DynamicAuthor,
     body: &Option<DynamicBodyRaw>,
 ) -> Option<DynamicItem> {
@@ -657,7 +658,7 @@ fn convert_live(
     let live = major.live.as_ref()?;
     let room_id = room_id_from_jump_url(&live.jump_url);
     Some(DynamicItem::Live {
-        id: live.id,
+        id: id.to_string(),
         title: live.title.clone(),
         cover_url: live.cover.clone(),
         room_id,
@@ -705,6 +706,7 @@ mod tests {
 #[cfg(test)]
 mod url_tests {
     use super::*;
+    use crate::dynamics::types::{ArticleRaw, LiveRaw, MajorRaw, ModulesRaw};
 
     #[test]
     fn user_agent_trims_and_falls_back() {
@@ -784,5 +786,66 @@ mod url_tests {
         assert_eq!(room_id_from_jump_url(""), 0);
         assert_eq!(room_id_from_jump_url("https://live.bilibili.com/abc"), 0);
         assert_eq!(room_id_from_jump_url("//"), 0);
+    }
+
+    #[test]
+    fn article_and_live_keep_polymer_id_str() {
+        let article = convert_item(ItemRaw {
+            id_str: "111222333444555666".into(),
+            r#type: "DYNAMIC_TYPE_ARTICLE".into(),
+            modules: ModulesRaw {
+                module_dynamic: Some(DynamicBodyRaw {
+                    major: Some(MajorRaw {
+                        article: Some(ArticleRaw {
+                            id: 678,
+                            title: "专栏".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        match article {
+            DynamicItem::Article {
+                id, cv_id, title, ..
+            } => {
+                assert_eq!(id, "111222333444555666");
+                assert_eq!(cv_id, 678);
+                assert_eq!(title, "专栏");
+            }
+            other => panic!("expected article, got {other:?}"),
+        }
+
+        let live = convert_item(ItemRaw {
+            id_str: "111222333444555667".into(),
+            r#type: "DYNAMIC_TYPE_LIVE".into(),
+            modules: ModulesRaw {
+                module_dynamic: Some(DynamicBodyRaw {
+                    major: Some(MajorRaw {
+                        live: Some(LiveRaw {
+                            title: "直播".into(),
+                            jump_url: "https://live.bilibili.com/12345".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        match live {
+            DynamicItem::Live {
+                id, room_id, title, ..
+            } => {
+                assert_eq!(id, "111222333444555667");
+                assert_eq!(room_id, 12345);
+                assert_eq!(title, "直播");
+            }
+            other => panic!("expected live, got {other:?}"),
+        }
     }
 }
