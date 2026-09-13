@@ -32,7 +32,9 @@ pub enum DynamicItem {
         author: DynamicAuthor,
     },
     Article {
-        id: i64,
+        id: String,
+        /// 专栏 cv 号，只用于拼 read/cv URL，不能当动态水位。
+        cv_id: i64,
         title: String,
         summary: RichText,
         covers: Vec<String>,
@@ -40,7 +42,7 @@ pub enum DynamicItem {
         author: DynamicAuthor,
     },
     Live {
-        id: i64,
+        id: String,
         title: String,
         cover_url: String,
         room_id: i64,
@@ -182,8 +184,6 @@ pub struct ArticleRaw {
 
 #[derive(Default, Deserialize)]
 pub struct LiveRaw {
-    #[serde(default)]
-    pub id: i64,
     #[serde(default)]
     pub title: String,
     #[serde(default)]

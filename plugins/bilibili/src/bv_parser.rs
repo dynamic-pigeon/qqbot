@@ -102,7 +102,8 @@ fn check_rate_limit(group_id: i64) -> bool {
 }
 
 static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"https?://www\.bilibili\.com/video/(?P<bv>BV[0-9A-Za-z]{10})").unwrap()
+    regex::Regex::new(r"https?://(?:www\.|m\.)?bilibili\.com/video/(?P<bv>BV[0-9A-Za-z]{10})")
+        .unwrap()
 });
 
 static SHORT_URL_RE: LazyLock<regex::Regex> =
@@ -116,9 +117,14 @@ pub async fn parse_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
     }
 }
 
+fn extract_bvid(url: &str) -> Option<&str> {
+    LONG_URL_RE
+        .captures(url)
+        .and_then(|caps| caps.name("bv").map(|m| m.as_str()))
+}
+
 async fn parse_long_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
-    if let Some(caps) = LONG_URL_RE.captures(url) {
-        let bv = &caps["bv"];
+    if let Some(bv) = extract_bvid(url) {
         parse_bv(bv, group_id).await
     } else {
         Err(BvError::ParseFailed("未匹配到长链接"))
@@ -221,6 +227,20 @@ https://www.bilibili.com/video/BV198XLBaEYp";
 
         let res = parse_url(txt, GROUP_V_TEXT).await;
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn extract_bvid_accepts_m_and_apex_hosts() {
+        const BV: &str = "BV1CVNU6xEom";
+        assert_eq!(
+            extract_bvid(&format!("https://m.bilibili.com/video/{BV}?spm=1")),
+            Some(BV)
+        );
+        assert_eq!(
+            extract_bvid(&format!("https://bilibili.com/video/{BV}")),
+            Some(BV)
+        );
+        assert!(extract_bvid("https://example.com/video/BV1CVNU6xEom").is_none());
     }
 
     #[test]

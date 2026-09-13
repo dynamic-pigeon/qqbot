@@ -1,3 +1,5 @@
+use std::ops::Deref;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -65,8 +67,21 @@ async fn get_manager() -> &'static ScreenshotManager {
         .await
 }
 
+struct ChromiumInstance {
+    browser: Browser,
+    user_data_dir: PathBuf,
+}
+
+impl Deref for ChromiumInstance {
+    type Target = Browser;
+
+    fn deref(&self) -> &Self::Target {
+        &self.browser
+    }
+}
+
 pub struct ScreenshotManager {
-    browser: ResourceManager<Browser>,
+    browser: ResourceManager<ChromiumInstance>,
     pool: BoundedPool,
 }
 
@@ -85,8 +100,10 @@ impl ScreenshotManager {
         }
     }
 
-    async fn launch_browser() -> Result<Browser> {
+    async fn launch_browser() -> Result<ChromiumInstance> {
+        let user_data_dir = crate::chromium_user_data_dir("screenshot");
         let config = BrowserConfig::builder()
+            .user_data_dir(&user_data_dir)
             .window_size(1920, 1080)
             .arg("--disable-dev-shm-usage")
             .arg("--disable-background-networking")
@@ -114,13 +131,25 @@ impl ScreenshotManager {
             }
         });
 
-        Ok(browser)
+        Ok(ChromiumInstance {
+            browser,
+            user_data_dir,
+        })
     }
 
-    async fn close_browser(mut browser: Browser) {
+    async fn close_browser(instance: ChromiumInstance) {
         info!("shutting down chromiumoxide browser");
+        let ChromiumInstance {
+            mut browser,
+            user_data_dir,
+        } = instance;
         let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
+        if tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait())
+            .await
+            .is_ok()
+        {
+            let _ = tokio::fs::remove_dir_all(user_data_dir).await;
+        }
     }
 
     pub async fn screenshot(&self, html: &str, options: ScreenshotOptions<'_>) -> Result<Vec<u8>> {
@@ -136,8 +165,7 @@ impl ScreenshotManager {
             Err(e) if e.downcast_ref::<ElementWaitTimeoutError>().is_some() => Err(e),
             Err(e) => {
                 error!("截图失败（{}），尝试重启浏览器后重试", e);
-                // replace 会等旧浏览器彻底关闭（释放 profile 锁）后再启动新的，
-                // 避免新进程与还没退出的旧进程冲突（SingletonLock）。
+                // replace 会等旧实例关闭后再启动；新实例用独立 profile，不抢旧进程的锁。
                 let browser = self.browser.replace(browser).await?;
                 Self::do_screenshot(&browser, html, options).await
             }

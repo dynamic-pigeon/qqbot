@@ -1,3 +1,5 @@
+use std::ops::Deref;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -28,8 +30,21 @@ async fn manager() -> &'static BrowserManager {
         .await
 }
 
+struct ChromiumInstance {
+    browser: Browser,
+    user_data_dir: PathBuf,
+}
+
+impl Deref for ChromiumInstance {
+    type Target = Browser;
+
+    fn deref(&self) -> &Self::Target {
+        &self.browser
+    }
+}
+
 struct BrowserManager {
-    browser: utils::ResourceManager<Browser>,
+    browser: utils::ResourceManager<ChromiumInstance>,
     request_lock: tokio::sync::Mutex<()>,
 }
 
@@ -48,8 +63,10 @@ impl BrowserManager {
         }
     }
 
-    async fn launch_browser() -> Result<Browser> {
+    async fn launch_browser() -> Result<ChromiumInstance> {
+        let user_data_dir = utils::chromium_user_data_dir("bili");
         let config = BrowserConfig::builder()
+            .user_data_dir(&user_data_dir)
             .window_size(1920, 1080)
             .args([
                 "disable-gpu",
@@ -79,13 +96,25 @@ impl BrowserManager {
                 }
             }
         });
-        Ok(browser)
+        Ok(ChromiumInstance {
+            browser,
+            user_data_dir,
+        })
     }
 
-    async fn close_browser(mut browser: Browser) {
+    async fn close_browser(instance: ChromiumInstance) {
         tracing::info!("关闭 Bilibili 匿名动态 Chromium 后备");
+        let ChromiumInstance {
+            mut browser,
+            user_data_dir,
+        } = instance;
         let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait()).await;
+        if tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait())
+            .await
+            .is_ok()
+        {
+            let _ = tokio::fs::remove_dir_all(user_data_dir).await;
+        }
     }
 
     async fn fetch(&self, uid: u64, offset: Option<&str>) -> Result<String> {

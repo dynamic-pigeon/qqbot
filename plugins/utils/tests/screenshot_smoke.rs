@@ -4,8 +4,8 @@
 // 单例，若分到多个 #[tokio::test]，首个用例的 runtime 退出时会 abort 掉 chromiumoxide
 // 的 handler task，导致共享浏览器变僵尸，后续用例拿到失效连接并误触发浏览器重启。
 //
-// 注意：用例结束后浏览器会残留为孤儿进程并占用 chromiumoxide 的固定 profile 目录，
-// 再次运行时若提示 SingletonLock 冲突，先清理残留的 chromiumoxide-runner 进程。
+// 注意：用例结束后浏览器可能残留为孤儿进程。每次启动用独立 profile，
+// 再次运行一般不会撞 SingletonLock；若仍冲突，先清残留 Chrome 进程。
 #[tokio::test]
 #[ignore = "需要本机安装 Chromium/Chrome"]
 async fn screenshot_smoke() {

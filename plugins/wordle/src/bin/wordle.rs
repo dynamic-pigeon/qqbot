@@ -28,7 +28,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 word.clone()
             }
-            None => pick_answer(&word_list.answers, args.seed).to_owned(),
+            None => {
+                let seed = args.seed.unwrap_or_else(rand::random);
+                pick_answer(&word_list.answers, seed).to_owned()
+            }
         };
         Game::new(answer)
     };
@@ -71,14 +74,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct Args {
-    seed: u64,
+    seed: Option<u64>,
     answer: Option<String>,
     hard: bool,
     data_dir: PathBuf,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
-    let mut seed = 0u64;
+    let mut seed = None;
     let mut answer = None;
     let mut hard = false;
     let mut data_dir = PathBuf::from("data");
@@ -87,9 +90,11 @@ fn parse_args() -> anyhow::Result<Args> {
         match arg.as_str() {
             "--seed" => {
                 let value = args.next().with_context(|| "--seed 需要一个数字参数")?;
-                seed = value
-                    .parse()
-                    .with_context(|| format!("--seed 参数 {value:?} 不是数字"))?;
+                seed = Some(
+                    value
+                        .parse()
+                        .with_context(|| format!("--seed 参数 {value:?} 不是数字"))?,
+                );
             }
             "--answer" => {
                 let value = args.next().with_context(|| "--answer 需要一个单词参数")?;

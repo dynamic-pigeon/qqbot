@@ -151,8 +151,9 @@ fn dynamic_id_numeric(item: &DynamicItem) -> Option<i64> {
         | DynamicItem::Draw { id, .. }
         | DynamicItem::Opus { id, .. }
         | DynamicItem::Word { id, .. }
+        | DynamicItem::Article { id, .. }
+        | DynamicItem::Live { id, .. }
         | DynamicItem::Other { id, .. } => id.as_str(),
-        DynamicItem::Article { id, .. } | DynamicItem::Live { id, .. } => return Some(*id),
     };
     s.parse::<i64>().ok()
 }
@@ -385,7 +386,7 @@ pub fn push_url(item: &DynamicItem) -> String {
         DynamicItem::Draw { id, .. }
         | DynamicItem::Word { id, .. }
         | DynamicItem::Other { id, .. } => format!("https://t.bilibili.com/{}", id),
-        DynamicItem::Article { id, .. } => format!("https://www.bilibili.com/read/cv{}", id),
+        DynamicItem::Article { cv_id, .. } => format!("https://www.bilibili.com/read/cv{}", cv_id),
         DynamicItem::Live { room_id, .. } => {
             format!("https://live.bilibili.com/{}", room_id)
         }
@@ -448,18 +449,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dynamic_id_numeric_parses_video_and_article() {
-        let v = DynamicItem::Video {
-            id: "12345".into(),
+    fn article_and_live_follow_polymer_watermark_not_cv_or_room() {
+        let video = DynamicItem::Video {
+            id: "800000000000000000".into(),
             bvid: String::new(),
             title: String::new(),
             cover_url: String::new(),
             summary: None,
             author: DynamicAuthor::default(),
         };
-        assert_eq!(dynamic_id_numeric(&v), Some(12345));
-        let a = DynamicItem::Article {
-            id: 678,
+        let article = DynamicItem::Article {
+            id: "900000000000000001".into(),
+            cv_id: 678,
             title: String::new(),
             summary: crate::dynamics::types::RichText {
                 text: String::new(),
@@ -468,7 +469,18 @@ mod tests {
             label: String::new(),
             author: DynamicAuthor::default(),
         };
-        assert_eq!(dynamic_id_numeric(&a), Some(678));
+        let live = DynamicItem::Live {
+            id: "900000000000000002".into(),
+            title: String::new(),
+            cover_url: String::new(),
+            room_id: 12345,
+            author: DynamicAuthor::default(),
+        };
+        let ids: Vec<i64> = pending_items_after(&[video, article, live], 800000000000000000)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![900000000000000001, 900000000000000002]);
     }
 
     #[test]
