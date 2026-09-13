@@ -41,7 +41,8 @@ fn push_url_routes_by_type() {
     );
     assert_eq!(
         push_url(&DynamicItem::Article {
-            id: 999,
+            id: "1".into(),
+            cv_id: 999,
             title: String::new(),
             summary: RichText {
                 text: String::new()
@@ -153,7 +154,8 @@ fn format_body_for_word_draw_article() {
         pub_action: "发布了专栏".into(),
     };
     let article = DynamicItem::Article {
-        id: 100,
+        id: "1".into(),
+        cv_id: 100,
         title: "深入理解 Rust 所有权".into(),
         summary: RichText {
             text: String::new(),
