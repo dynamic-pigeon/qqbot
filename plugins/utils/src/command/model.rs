@@ -137,18 +137,17 @@ impl CommandArguments {
 }
 
 pub(crate) fn render_command_error(error: &CommandError, usage: &str) -> String {
-    let message = match error {
-        CommandError::MissingArgument { name } => format!("缺少参数 `{name}`"),
-        CommandError::InvalidArgument { name } => format!("参数 `{name}` 格式错误"),
-        CommandError::UnexpectedArgument => "参数过多".to_owned(),
-        CommandError::User(message) => return message.clone(),
-        CommandError::Internal(_) => return "命令执行失败，请稍后重试".to_owned(),
-    };
-
-    if usage.is_empty() {
-        message
-    } else {
-        format!("{message}\n用法: {usage}")
+    match error {
+        CommandError::User(message) => message.clone(),
+        CommandError::Internal(_) => "命令执行失败，请稍后重试".to_owned(),
+        error => {
+            let message = error.to_string();
+            if usage.is_empty() {
+                message
+            } else {
+                format!("{message}\n用法: {usage}")
+            }
+        }
     }
 }
 
@@ -248,6 +247,7 @@ impl CommandContext {
     }
 }
 
+#[derive(Clone)]
 pub struct Command {
     pub(crate) name: String,
     pub(crate) aliases: Vec<String>,
@@ -275,6 +275,10 @@ impl Command {
             expose_as_root: false,
             prefix_match: false,
         }
+    }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.name.as_str()).chain(self.aliases.iter().map(String::as_str))
     }
 
     pub fn alias(mut self, alias: impl Into<String>) -> Self {

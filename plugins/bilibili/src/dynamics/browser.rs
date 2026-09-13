@@ -1,15 +1,14 @@
-use std::ops::Deref;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::browser::Browser;
 use chromiumoxide::cdp::browser_protocol::network::{
     EventLoadingFinished, EventResponseReceived, GetResponseBodyParams,
 };
 use kovi::futures_util::StreamExt as _;
 use kovi::tokio::{self, sync::OnceCell};
+use utils::{ChromiumInstance, ChromiumLaunch, ResourceManager};
 
 const BROWSER_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
 const BROWSER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -30,90 +29,33 @@ async fn manager() -> &'static BrowserManager {
         .await
 }
 
-struct ChromiumInstance {
-    browser: Browser,
-    user_data_dir: PathBuf,
-}
-
-impl Deref for ChromiumInstance {
-    type Target = Browser;
-
-    fn deref(&self) -> &Self::Target {
-        &self.browser
-    }
-}
-
 struct BrowserManager {
-    browser: utils::ResourceManager<ChromiumInstance>,
+    browser: ResourceManager<ChromiumInstance>,
     request_lock: tokio::sync::Mutex<()>,
 }
 
 impl BrowserManager {
     fn new() -> Self {
         Self {
-            browser: utils::ResourceManager::new_with_destructor(
-                IDLE_TIMEOUT,
-                || async {
-                    tracing::info!("启动 Bilibili 匿名动态 Chromium 后备");
-                    Self::launch_browser().await
-                },
-                Self::close_browser,
-            ),
+            browser: ChromiumLaunch::new("bili")
+                .flags([
+                    "disable-gpu",
+                    "disable-dev-shm-usage",
+                    "disable-extensions",
+                    "allow-running-insecure-content",
+                    "disable-plugins",
+                    "disable-images",
+                    "disable-web-security",
+                    "mute-audio",
+                    "no-first-run",
+                    "no-default-browser-check",
+                ])
+                .arg("disable-blink-features", "AutomationControlled")
+                // B 站风控认 UA；headless 默认带 HeadlessChrome，和 HTTP 直连指纹不一致。
+                .user_agent(super::fetch::user_agent())
+                .lifecycle_timeout(BROWSER_LIFECYCLE_TIMEOUT)
+                .managed(IDLE_TIMEOUT),
             request_lock: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    async fn launch_browser() -> Result<ChromiumInstance> {
-        let user_data_dir = utils::chromium_user_data_dir("bili");
-        let config = BrowserConfig::builder()
-            .user_data_dir(&user_data_dir)
-            .window_size(1920, 1080)
-            .args([
-                "disable-gpu",
-                "disable-dev-shm-usage",
-                "disable-extensions",
-                "disable-blink-features=AutomationControlled",
-                "allow-running-insecure-content",
-                "disable-plugins",
-                "disable-images",
-                "disable-web-security",
-                "mute-audio",
-                "no-first-run",
-                "no-default-browser-check",
-            ])
-            // B 站风控认 UA；headless 默认带 HeadlessChrome，和 HTTP 直连指纹不一致。
-            .arg(user_agent_arg(super::fetch::user_agent()))
-            .build()
-            .map_err(anyhow::Error::msg)?;
-        let (browser, mut handler) =
-            tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, Browser::launch(config))
-                .await
-                .context("启动 Chromium 超时")??;
-        tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if event.is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(ChromiumInstance {
-            browser,
-            user_data_dir,
-        })
-    }
-
-    async fn close_browser(instance: ChromiumInstance) {
-        tracing::info!("关闭 Bilibili 匿名动态 Chromium 后备");
-        let ChromiumInstance {
-            mut browser,
-            user_data_dir,
-        } = instance;
-        let _ = tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.close()).await;
-        if tokio::time::timeout(BROWSER_LIFECYCLE_TIMEOUT, browser.wait())
-            .await
-            .is_ok()
-        {
-            let _ = tokio::fs::remove_dir_all(user_data_dir).await;
         }
     }
 
@@ -203,12 +145,6 @@ async fn capture_dynamic_body(
         }
     }
     anyhow::bail!("目标动态 API 响应未完成")
-}
-
-/// chromiumoxide 把 `From<&str>` 当成无值 flag（再拼一层 `--`），
-/// UA 必须用 key/value，否则 `--user-agent=...` 会变成非法启动参数。
-fn user_agent_arg(ua: &str) -> (&str, &str) {
-    ("user-agent", ua)
 }
 
 fn validate_api_url(observed: &str, uid: u64, offset: Option<&str>) -> Result<reqwest::Url> {

@@ -1,7 +1,5 @@
-use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::LazyLock;
 
-use anyhow::Result;
 use utils::JsonStore;
 
 /// 根目录 `config.toml` 的 `[msg_rank]`。
@@ -42,14 +40,14 @@ impl Default for StaticConfig {
 }
 
 pub(crate) fn static_config() -> &'static StaticConfig {
-    static CONFIG: LazyLock<StaticConfig> = LazyLock::new(|| {
+    static PARSED: LazyLock<StaticConfig> = LazyLock::new(|| {
         utils::config::parse("msg_rank")
             .unwrap_or_else(|error| panic!("解析 [msg_rank] 配置失败: {error:#}"))
     });
-    &CONFIG
+    &PARSED
 }
 
-static CONFIG: OnceLock<JsonStore<Config>> = OnceLock::new();
+pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
@@ -70,23 +68,4 @@ impl Default for Config {
             wordcloud_background: default_wordcloud_background(),
         }
     }
-}
-
-pub fn init_config(path: PathBuf) -> Result<()> {
-    let store = JsonStore::open(path)?;
-    CONFIG
-        .set(store)
-        .map_err(|_| anyhow::anyhow!("配置已初始化"))?;
-    Ok(())
-}
-
-pub fn read_config() -> Arc<Config> {
-    CONFIG.get().expect("配置未初始化").get()
-}
-
-pub fn modify_config<F>(f: F) -> Result<()>
-where
-    F: FnOnce(&mut Config),
-{
-    CONFIG.get().expect("配置未初始化").modify(f)
 }

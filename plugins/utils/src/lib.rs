@@ -8,6 +8,8 @@ mod json_store;
 mod rate_limit;
 mod resource_manager;
 
+#[cfg(feature = "chromium")]
+mod chromium;
 #[cfg(feature = "markdown")]
 mod markdown;
 #[cfg(feature = "screenshot")]
@@ -17,7 +19,7 @@ pub mod retry;
 pub mod safe_url;
 
 pub use bounded_pool::BoundedPool;
-pub use fs::{chromium_user_data_dir, restrict_mode_0600};
+pub use fs::restrict_mode_0600;
 pub use hash::{hex_encode, sha256_hex};
 pub use http::http_client;
 pub use json_store::JsonStore;
@@ -30,9 +32,11 @@ pub use safe_url::{
     validate_image_url_with_options,
 };
 
+#[cfg(feature = "chromium")]
+pub use chromium::{ChromiumInstance, ChromiumLaunch};
 #[cfg(feature = "markdown")]
 pub use markdown::md_to_html;
 #[cfg(feature = "markdown")]
 pub use markdown::md_to_img;
 #[cfg(feature = "screenshot")]
-pub use screen_shot::{ScreenshotManager, ScreenshotOptions, screenshot};
+pub use screen_shot::{ScreenshotOptions, screenshot};

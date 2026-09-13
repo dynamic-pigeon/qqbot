@@ -3,10 +3,11 @@ use std::sync::Arc;
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
 use kovi_onebot::{EventRegistrar as _, MsgEvent};
 
-use super::model::CommandHandler;
+use super::model::{CommandArguments, CommandHandler};
 use super::{
     AccessError, Command, CommandCatalog, CommandContext, CommandError, CommandRegistrationError,
-    CommandTree, MessageSource, Permission, ResolveOutcome, check_access, render_command_error,
+    CommandTree, MessageSource, Permission, ResolveOutcome, ResolvedCommand, check_access,
+    render_command_error,
 };
 
 pub struct CommandRouter {
@@ -66,13 +67,24 @@ async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<M
         ResolveOutcome::Matched(resolved) => resolved,
     };
 
-    let (path, arguments, usage, permission, scope, handler) = resolved.into_dispatch_parts();
-    if let Err(error) = check_event_access(&event, &bot, scope, permission) {
+    if let Err(error) = check_event_access(&event, &bot, resolved.scope(), resolved.permission()) {
         reply_access_error(&event, error);
         return;
     }
 
-    let context = CommandContext::new(Arc::clone(&event), Arc::clone(&bot), arguments);
+    let ResolvedCommand {
+        path,
+        args,
+        rest,
+        usage,
+        handler,
+        ..
+    } = resolved;
+    let context = CommandContext::new(
+        Arc::clone(&event),
+        Arc::clone(&bot),
+        CommandArguments::new(args, rest),
+    );
     let result = match handler {
         CommandHandler::Sync(handler) => handler(context),
         CommandHandler::Async(handler) => handler(context).await,
