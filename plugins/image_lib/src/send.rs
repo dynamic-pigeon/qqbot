@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use image::{ExtendedColorType, ImageEncoder, RgbImage, codecs::jpeg::JpegEncoder};
+use kovi::serde_json::{Value, json};
 use kovi::{Message, RuntimeBot};
 use kovi_onebot::{MessageRegistrar as _, OneBotMessage, OnebotTrait};
 use utils::retry::retry_async_with_backoff;
@@ -61,12 +62,58 @@ fn encode_jpeg(image: &RgbImage) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
+pub(crate) fn forward_node(name: &str, uin: i64, message: &Message) -> Value {
+    let content = OneBotMessage::from(message.clone());
+    json!({
+        "type": "node",
+        "data": {
+            "name": name,
+            "nickname": name,
+            "uin": uin,
+            "user_id": uin,
+            "content": content,
+        }
+    })
+}
+
 pub(crate) async fn send_group_wait(
     bot: &RuntimeBot,
     group_id: i64,
     message: &Message,
 ) -> Result<(), SendFail> {
     send_wait(|| bot.send_group_msg_return(group_id, message.clone())).await
+}
+
+pub(crate) async fn send_group_forward_wait(
+    bot: &RuntimeBot,
+    group_id: i64,
+    nodes: &[Value],
+) -> Result<(), SendFail> {
+    let params = json!({
+        "group_id": group_id,
+        "messages": nodes,
+    });
+    match send_api_wait(bot, "send_group_forward_msg", &params).await {
+        Ok(()) => Ok(()),
+        Err(SendFail::Timeout) => Err(SendFail::Timeout),
+        Err(first) => match send_api_wait(bot, "send_forward_msg", &params).await {
+            Ok(()) => Ok(()),
+            Err(SendFail::Timeout) => Err(SendFail::Timeout),
+            Err(_) => Err(first),
+        },
+    }
+}
+
+async fn send_api_wait(
+    bot: &RuntimeBot,
+    action: &'static str,
+    params: &Value,
+) -> Result<(), SendFail> {
+    send_wait(|| {
+        let request = bot.send_api_return(action, params.clone());
+        async move { request.await.map(|_| 0) }
+    })
+    .await
 }
 
 async fn send_private_wait(
@@ -164,5 +211,21 @@ pub(crate) async fn report_send_fail(
 
     if let Err(error) = send_wait(|| bot.send_private_msg_return(admin_id, text.clone())).await {
         tracing::warn!("图库失败哈希私聊主管理员失败: {error:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_node_uses_onebot_type_not_kind() {
+        let message = image_message(Some("重复 1/2 · 约 90%"), &[]);
+        let node = forward_node("重复 1/2 · 约 90%", 10000, &message);
+        assert_eq!(node["type"], "node");
+        assert_eq!(node["data"]["name"], "重复 1/2 · 约 90%");
+        assert_eq!(node["data"]["uin"], 10000);
+        assert_eq!(node["data"]["content"][0]["type"], "text");
+        assert!(node["data"]["content"][0].get("kind").is_none());
     }
 }

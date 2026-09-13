@@ -367,7 +367,13 @@ impl MockOneBot {
             .position(|api| {
                 matches!(
                     api["action"].as_str(),
-                    Some("send_msg" | "send_group_msg" | "send_private_msg")
+                    Some(
+                        "send_msg"
+                            | "send_group_msg"
+                            | "send_private_msg"
+                            | "send_group_forward_msg"
+                            | "send_forward_msg"
+                    )
                 )
             })
             .map(|idx| outgoing.remove(idx))
@@ -440,7 +446,11 @@ impl MockOneBot {
                                 "group_id": GROUP,
                             })
                         }
-                        "send_msg" | "send_group_msg" | "send_private_msg" => json!({
+                        "send_msg"
+                        | "send_group_msg"
+                        | "send_private_msg"
+                        | "send_group_forward_msg"
+                        | "send_forward_msg" => json!({
                             "message_id": self.next_message_id.fetch_add(1, Ordering::SeqCst)
                         }),
                         _ => json!({}),
@@ -700,9 +710,25 @@ fn private_message(user_id: i64, text: &str) -> Value {
 }
 
 fn summarize(api: &Value) -> Reply {
-    let message = &api["params"]["message"];
     let mut text_parts = Vec::new();
     let mut has_image = false;
+    match api["action"].as_str() {
+        Some("send_group_forward_msg" | "send_forward_msg") => {
+            if let Value::Array(nodes) = &api["params"]["messages"] {
+                for node in nodes {
+                    collect_message(&node["data"]["content"], &mut text_parts, &mut has_image);
+                }
+            }
+        }
+        _ => collect_message(&api["params"]["message"], &mut text_parts, &mut has_image),
+    }
+    Reply {
+        text: text_parts.join(""),
+        has_image,
+    }
+}
+
+fn collect_message(message: &Value, text_parts: &mut Vec<String>, has_image: &mut bool) {
     match message {
         Value::String(s) => text_parts.push(s.clone()),
         Value::Array(segs) => {
@@ -713,15 +739,14 @@ fn summarize(api: &Value) -> Reply {
                             text_parts.push(t.to_owned());
                         }
                     }
-                    Some("image") => has_image = true,
+                    Some("image") => *has_image = true,
+                    Some("node") => {
+                        collect_message(&seg["data"]["content"], text_parts, has_image);
+                    }
                     _ => {}
                 }
             }
         }
         _ => {}
-    }
-    Reply {
-        text: text_parts.join(""),
-        has_image,
     }
 }
