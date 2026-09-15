@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::{
     Message, PluginBuilder as plugin,
     serde_json::{self, Value},
@@ -327,11 +326,9 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
             }
         };
 
-        let img_base64 = STANDARD.encode(&bv_info.pic);
-
         let msg = Message::new()
             .add_text(bv_info.title.as_str())
-            .add_image(&format!("base64://{}", img_base64))
+            .add_image(&utils::base64_image(&bv_info.pic))
             .add_text(format!(
                 "UP主：{}\n点赞：{} 投币：{}\n收藏：{} 观看：{}\n{}",
                 bv_info.name,

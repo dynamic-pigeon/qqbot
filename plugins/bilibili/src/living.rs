@@ -6,7 +6,6 @@ use std::{
     },
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
@@ -156,8 +155,6 @@ async fn notify(
             }
         }
     };
-    let base64_img = STANDARD.encode(&img);
-
     let text = match kind {
         NotifyKind::Start => format!(
             "{}正在直播【{}】\nhttps://live.bilibili.com/{}",
@@ -165,10 +162,9 @@ async fn notify(
         ),
         NotifyKind::End => format!("{}直播结束了", info.uname),
     };
-
     let mut msg = Message::new().add_text(text);
-    if !base64_img.is_empty() {
-        msg.push_image(&format!("base64://{}", base64_img));
+    if !img.is_empty() {
+        msg.push_image(&utils::base64_image(&img));
     }
 
     for group in cfg

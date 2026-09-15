@@ -17,7 +17,6 @@ pub fn warm_up() {
 
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
@@ -278,8 +277,7 @@ pub async fn push_dynamic(
 
     let mut msg = Message::new().add_text(body);
     for bytes in &images {
-        let b64 = STANDARD.encode(bytes);
-        msg.push_image(&format!("base64://{}", b64));
+        msg.push_image(&utils::base64_image(bytes));
     }
 
     // 用 send_group_msg_return 真正等待 onebot 确认送达；
