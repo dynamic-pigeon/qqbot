@@ -43,8 +43,7 @@ async fn handle_daily_rank(ctx: CommandContext) -> CommandResult {
     let image = utils::screenshot(&html, utils::ScreenshotOptions::default())
         .await
         .map_err(CommandError::internal)?;
-    let base64_image = STANDARD.encode(image);
-    let message = kovi::Message::new().add_image(&format!("base64://{base64_image}"));
+    let message = kovi::Message::new().add_image(&utils::base64_image(&image));
     ctx.reply(message);
     Ok(())
 }

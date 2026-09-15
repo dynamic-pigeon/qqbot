@@ -34,6 +34,15 @@ impl CommandRouter {
         let tree = Arc::new(CommandTree::new(self.commands)?);
         CommandCatalog::register(&self.owner, &tree)?;
 
+        // kovi 禁用插件时先跑 drop 再 clear listen；目录不卸的话 /help 仍会列出已停用命令。
+        let owner = self.owner.clone();
+        plugin::drop(move || {
+            let owner = owner.clone();
+            async move {
+                CommandCatalog::unregister(&owner);
+            }
+        });
+
         // kovi 把 on_msg 记在当前插件的 listen 上，禁用插件会 clear。
         // 分发必须跟命令所属插件同生共死，不能挂到第一个 install 的插件上。
         let bot = self.bot;
