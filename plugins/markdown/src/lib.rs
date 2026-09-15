@@ -1,6 +1,5 @@
 use std::{sync::LazyLock, time::Duration};
 
-use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
 use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
@@ -42,8 +41,7 @@ async fn handle_markdown(ctx: CommandContext) -> CommandResult {
     let img = utils::md_to_img(md_content)
         .await
         .map_err(CommandError::internal)?;
-    let base64_img = base64::engine::general_purpose::STANDARD.encode(&img);
-    let message = Message::new().add_image(&format!("base64://{base64_img}"));
+    let message = Message::new().add_image(&utils::base64_image(&img));
     ctx.reply_and_quote(message);
     Ok(())
 }

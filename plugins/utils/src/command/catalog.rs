@@ -60,6 +60,10 @@ impl CatalogStore {
         Ok(())
     }
 
+    pub fn unregister(&mut self, owner: &str) {
+        self.plugins.retain(|plugin| plugin.owner != owner);
+    }
+
     pub fn roots(&self) -> Vec<CommandMetadata> {
         let mut roots: Vec<_> = self
             .plugins
@@ -128,6 +132,13 @@ impl CommandCatalog {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .register(owner, tree)
+    }
+
+    pub(crate) fn unregister(owner: &str) {
+        COMMAND_CATALOG
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unregister(owner);
     }
 }
 

@@ -11,7 +11,6 @@ use std::{
 };
 
 use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, Pixel as _, Rgba, imageops::FilterType};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, chrono, tokio};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
@@ -263,9 +262,12 @@ async fn send_word_cloud(
 
     info!("send word cloud to group: {}", group_id);
 
-    let image_base64 = STANDARD.encode(&image);
-    let image = format!("base64://{}", image_base64);
-    bot.send_group_msg(group_id, Message::new().add_text(dsc).add_image(&image));
+    bot.send_group_msg(
+        group_id,
+        Message::new()
+            .add_text(dsc)
+            .add_image(&utils::base64_image(&image)),
+    );
 }
 
 async fn make_word_cloud(

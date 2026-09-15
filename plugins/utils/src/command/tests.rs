@@ -273,6 +273,31 @@ fn live_tree(description: &str) -> CommandTree {
 }
 
 #[test]
+fn catalog_unregisters_an_owner_and_is_idempotent() {
+    let mut catalog = CatalogStore::default();
+    catalog
+        .register("bilibili", &live_tree("管理直播订阅"))
+        .unwrap();
+    catalog
+        .register(
+            "help_msg",
+            &CommandTree::new(vec![endpoint("/help")]).unwrap(),
+        )
+        .unwrap();
+
+    catalog.unregister("bilibili");
+    assert_eq!(catalog.roots().len(), 1);
+    assert_eq!(catalog.roots()[0].path[0], "/help");
+    assert_eq!(
+        catalog.render_help(&["live"]),
+        "命令 `live` 的帮助信息不存在"
+    );
+
+    catalog.unregister("bilibili");
+    assert_eq!(catalog.roots().len(), 1);
+}
+
+#[test]
 fn catalog_replaces_an_owners_root_and_resolves_alias_paths() {
     let mut catalog = CatalogStore::default();
     catalog

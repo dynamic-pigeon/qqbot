@@ -1551,7 +1551,6 @@ name = "image_lib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "image",
  "kovi",
  "kovi-onebot",
@@ -1895,7 +1894,6 @@ checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 name = "markdown"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
  "kovi",
  "kovi-onebot",
  "tracing",
@@ -3769,6 +3767,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "askama",
+ "base64 0.23.1",
  "chromiumoxide",
  "kovi",
  "kovi-onebot",
@@ -4239,7 +4238,6 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
- "base64 0.23.1",
  "image",
  "kovi",
  "kovi-onebot",
@@ -4290,7 +4288,6 @@ name = "yu_gi_oh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.23.1",
  "bytes",
  "kovi",
  "kovi-onebot",
