@@ -1,6 +1,5 @@
 use std::{sync::LazyLock, time::Duration};
 
-use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin};
 use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
@@ -51,9 +50,8 @@ async fn handle_card_query(ctx: CommandContext) -> CommandResult {
         }
     };
 
-    let base64_img = base64::engine::general_purpose::STANDARD.encode(img);
     let message = Message::new()
-        .add_image(&format!("base64://{base64_img}"))
+        .add_image(&utils::base64_image(&img))
         .add_text(format!("{card}"));
     ctx.reply(message);
     Ok(())

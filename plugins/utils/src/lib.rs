@@ -20,7 +20,7 @@ pub mod safe_url;
 
 pub use bounded_pool::BoundedPool;
 pub use fs::restrict_mode_0600;
-pub use hash::{hex_encode, sha256_hex};
+pub use hash::{base64_image, hex_encode, sha256_hex};
 pub use http::http_client;
 pub use json_store::JsonStore;
 pub use rate_limit::{RateLimitHit, RateLimiter};

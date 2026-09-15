@@ -1,7 +1,6 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use base64::Engine as _;
 use image::{ExtendedColorType, ImageEncoder, RgbImage, codecs::jpeg::JpegEncoder};
 use kovi::serde_json::{Value, json};
 use kovi::{Message, RuntimeBot};
@@ -29,8 +28,7 @@ pub(crate) fn image_message(text: Option<&str>, images: &[&[u8]]) -> Message {
         None => Message::new(),
     };
     for bytes in images {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        message = message.add_image(&format!("base64://{encoded}"));
+        message = message.add_image(&utils::base64_image(bytes));
     }
     message
 }

@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use kovi::{Message, PluginBuilder as plugin, tokio::sync::OnceCell};
 use kovi_onebot::MessageRegistrar as _;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
@@ -207,8 +206,7 @@ fn expire_sessions(sessions: &mut HashMap<i64, Session>) {
 
 /// 把渲染好的网格发到群里；`note` 非空时附加一行文字。
 fn reply_with_image(ctx: &CommandContext, png: &[u8], note: &str) {
-    let base64_img = base64::engine::general_purpose::STANDARD.encode(png);
-    let mut message = Message::new().add_image(&format!("base64://{base64_img}"));
+    let mut message = Message::new().add_image(&utils::base64_image(png));
     if !note.is_empty() {
         message = message.add_text(note);
     }
