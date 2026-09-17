@@ -35,8 +35,10 @@ pub enum StoreError {
     LibraryEmpty,
     #[error("别名不能指向自己")]
     AliasToSelf,
-    #[error("「{0}」已是图库，不能当别名")]
+    #[error("「{0}」已是图库，不能当别名；要合成一个请在末尾加「合并」")]
     NameIsLibrary(String),
+    #[error("「{alias}」已是「{target}」的别名；要合成一个请在末尾加「合并」")]
+    AliasTaken { alias: String, target: String },
     #[error("「{0}」不存在")]
     TargetMissing(String),
     #[error("「{0}」不是别名")]
@@ -55,6 +57,12 @@ impl From<sqlx::Error> for StoreError {
 pub struct AddResult {
     pub added: usize,
     pub skipped_dup: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasResult {
+    pub canonical: String,
+    pub merged_from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,7 +344,8 @@ impl Store {
         group_id: i64,
         alias: &str,
         target: &str,
-    ) -> Result<String, StoreError> {
+        merge: bool,
+    ) -> Result<AliasResult, StoreError> {
         self.with_group(group_id, |pool| async move {
             let canonical = resolve_library(&pool, target).await?;
             if alias == canonical {
@@ -345,18 +354,73 @@ impl Store {
             if !library_exists(&pool, &canonical).await? {
                 return Err(StoreError::TargetMissing(target.to_owned()));
             }
-            if library_exists(&pool, alias).await? {
-                return Err(StoreError::NameIsLibrary(alias.to_owned()));
+
+            let alias_is_library = library_exists(&pool, alias).await?;
+            let existing_target =
+                sqlx::query_scalar::<_, String>("SELECT target FROM aliases WHERE alias = ?")
+                    .bind(alias)
+                    .fetch_optional(&pool)
+                    .await?;
+
+            if !merge {
+                if alias_is_library {
+                    return Err(StoreError::NameIsLibrary(alias.to_owned()));
+                }
+                // 已占用的别名必须先取消或加「合并」，避免悄悄换库。
+                if let Some(existing_target) = existing_target {
+                    if existing_target == canonical {
+                        return Ok(AliasResult {
+                            canonical,
+                            merged_from: None,
+                        });
+                    }
+                    return Err(StoreError::AliasTaken {
+                        alias: alias.to_owned(),
+                        target: existing_target,
+                    });
+                }
+                sqlx::query("INSERT INTO aliases (alias, target) VALUES (?, ?)")
+                    .bind(alias)
+                    .bind(&canonical)
+                    .execute(&pool)
+                    .await?;
+                return Ok(AliasResult {
+                    canonical,
+                    merged_from: None,
+                });
             }
-            sqlx::query(
-                "INSERT INTO aliases (alias, target) VALUES (?, ?)
-                 ON CONFLICT(alias) DO UPDATE SET target = excluded.target",
-            )
-            .bind(alias)
-            .bind(&canonical)
-            .execute(&pool)
-            .await?;
-            Ok(canonical)
+
+            let source = if alias_is_library {
+                Some(alias.to_owned())
+            } else {
+                existing_target
+            };
+            let merge_source = if let Some(source) = source.as_deref() {
+                if source != canonical && library_exists(&pool, source).await? {
+                    Some(source.to_owned())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(from) = merge_source {
+                let mut tx = pool.begin().await?;
+                merge_library(&mut tx, &from, &canonical).await?;
+                upsert_alias(&mut *tx, alias, &canonical).await?;
+                tx.commit().await?;
+                return Ok(AliasResult {
+                    canonical,
+                    merged_from: Some(from),
+                });
+            }
+
+            upsert_alias(&pool, alias, &canonical).await?;
+            Ok(AliasResult {
+                canonical,
+                merged_from: None,
+            })
         })
         .await
     }
@@ -886,6 +950,74 @@ async fn insert_images(
     Ok(())
 }
 
+async fn upsert_alias<'e, E>(executor: E, alias: &str, target: &str) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        "INSERT INTO aliases (alias, target) VALUES (?, ?)
+         ON CONFLICT(alias) DO UPDATE SET target = excluded.target",
+    )
+    .bind(alias)
+    .bind(target)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+async fn library_min_draw(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    library: &str,
+) -> Result<i64, StoreError> {
+    let min = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MIN(draw_count) FROM images WHERE library = ?",
+    )
+    .bind(library)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(min.unwrap_or(0))
+}
+
+async fn merge_library(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &str,
+    dest: &str,
+) -> Result<(), StoreError> {
+    let source_min = library_min_draw(tx, source).await?;
+    let dest_min = library_min_draw(tx, dest).await?;
+    // 两边最小值对齐到同一基准，图保留相对本库最小值的偏移；重复图取较大偏移。
+    let baseline = source_min.min(dest_min);
+    sqlx::query("UPDATE images SET draw_count = ? + (draw_count - ?) WHERE library = ?")
+        .bind(baseline)
+        .bind(dest_min)
+        .bind(dest)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO images (library, hash, size, draw_count)
+         SELECT ?, hash, size, ? + (draw_count - ?) FROM images WHERE library = ?
+         ON CONFLICT(library, hash) DO UPDATE SET
+             draw_count = MAX(images.draw_count, excluded.draw_count)",
+    )
+    .bind(dest)
+    .bind(baseline)
+    .bind(source_min)
+    .bind(source)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM images WHERE library = ?")
+        .bind(source)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("UPDATE aliases SET target = ? WHERE target = ?")
+        .bind(dest)
+        .bind(source)
+        .execute(&mut **tx)
+        .await?;
+    upsert_alias(&mut **tx, source, dest).await?;
+    Ok(())
+}
+
 async fn prune_dangling_aliases(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM aliases WHERE target NOT IN (SELECT DISTINCT library FROM images)")
         .execute(pool)
@@ -1070,19 +1202,34 @@ mod tests {
         add_images(&store, group, "狗", vec![png_like(3)])
             .await
             .unwrap();
-        let canonical = store.set_alias(group, "喵", "猫").await.unwrap();
-        assert_eq!(canonical, "猫");
+        let canonical = store.set_alias(group, "喵", "猫", false).await.unwrap();
+        assert_eq!(canonical.canonical, "猫");
+        assert_eq!(canonical.merged_from, None);
+        assert_eq!(
+            store
+                .set_alias(group, "喵", "猫", false)
+                .await
+                .unwrap()
+                .canonical,
+            "猫"
+        );
         assert!(store.pick_random(group, "喵").await.is_ok());
         assert!(matches!(
-            store.set_alias(group, "狗", "猫").await,
+            store.set_alias(group, "喵", "狗", false).await,
+            Err(StoreError::AliasTaken { alias, target })
+                if alias == "喵" && target == "猫"
+        ));
+        assert!(store.pick_random(group, "喵").await.is_ok());
+        assert!(matches!(
+            store.set_alias(group, "狗", "猫", false).await,
             Err(StoreError::NameIsLibrary(_))
         ));
         assert!(matches!(
-            store.set_alias(group, "龙", "不存在").await,
+            store.set_alias(group, "龙", "不存在", false).await,
             Err(StoreError::TargetMissing(_))
         ));
         assert!(matches!(
-            store.set_alias(group, "猫", "猫").await,
+            store.set_alias(group, "猫", "猫", true).await,
             Err(StoreError::AliasToSelf)
         ));
 
@@ -1106,6 +1253,80 @@ mod tests {
             store.pick_random(group, "喵").await,
             Err(StoreError::LibraryEmpty)
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn merge_moves_images_and_keeps_old_name_as_alias() {
+        let (store, dir) = temp_store();
+        let group = 3;
+        let shared = png_like(1);
+        add_images(&store, group, "猫", vec![shared.clone(), png_like(2)])
+            .await
+            .unwrap();
+        add_images(&store, group, "狗", vec![shared, png_like(3)])
+            .await
+            .unwrap();
+        store.set_alias(group, "喵", "猫", false).await.unwrap();
+
+        let merged = store.set_alias(group, "喵", "狗", true).await.unwrap();
+        assert_eq!(merged.canonical, "狗");
+        assert_eq!(merged.merged_from.as_deref(), Some("猫"));
+
+        let stats = store.stats(group).await.unwrap();
+        assert_eq!(stats.libraries.len(), 1);
+        assert_eq!(stats.unique_count, 3);
+        let dog = &stats.libraries[0];
+        assert_eq!(dog.name, "狗");
+        assert_eq!(dog.count, 3);
+        assert_eq!(dog.aliases, vec!["喵".to_owned(), "猫".to_owned()]);
+
+        assert!(store.pick_random(group, "猫").await.is_ok());
+        assert!(store.pick_random(group, "喵").await.is_ok());
+        add_images(&store, group, "猫", vec![png_like(4)])
+            .await
+            .unwrap();
+        assert_eq!(store.stats(group).await.unwrap().libraries[0].count, 4);
+
+        add_images(&store, group, "鸟", vec![png_like(5)])
+            .await
+            .unwrap();
+        let merged = store.set_alias(group, "鸟", "狗", true).await.unwrap();
+        assert_eq!(merged.merged_from.as_deref(), Some("鸟"));
+        let stats = store.stats(group).await.unwrap();
+        assert_eq!(stats.libraries.len(), 1);
+        assert_eq!(stats.libraries[0].count, 5);
+        assert!(store.pick_random(group, "鸟").await.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn merge_aligns_draw_counts_to_the_lower_min() {
+        let (store, dir) = temp_store();
+        let group = 4;
+        let shared = png_like(1);
+        let only_cat = png_like(2);
+        let only_dog = png_like(3);
+        add_images(&store, group, "猫", vec![shared.clone(), only_cat.clone()])
+            .await
+            .unwrap();
+        add_images(&store, group, "狗", vec![shared.clone(), only_dog.clone()])
+            .await
+            .unwrap();
+        let shared_hash = sha256_hex(&shared);
+        let cat_hash = sha256_hex(&only_cat);
+        let dog_hash = sha256_hex(&only_dog);
+        set_draw_count(&store, group, "猫", &shared_hash, 5).await;
+        set_draw_count(&store, group, "猫", &cat_hash, 2).await;
+        set_draw_count(&store, group, "狗", &shared_hash, 10).await;
+        set_draw_count(&store, group, "狗", &dog_hash, 12).await;
+
+        store.set_alias(group, "猫", "狗", true).await.unwrap();
+        let mut got = draw_counts(&store, group, "狗").await.unwrap();
+        got.sort();
+        let mut expected = vec![(shared_hash, 5), (cat_hash, 2), (dog_hash, 4)];
+        expected.sort();
+        assert_eq!(got, expected);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1171,7 +1392,7 @@ mod tests {
         assert_eq!(canonical, "猫");
         assert_eq!(images.len(), 2);
 
-        store.set_alias(group, "喵", "猫").await.unwrap();
+        store.set_alias(group, "喵", "猫", false).await.unwrap();
         let (alias, again) = store.fingerprints_for_library(group, "喵").await.unwrap();
         assert_eq!(alias, "猫");
         assert_eq!(again.len(), 2);
@@ -1229,6 +1450,21 @@ mod tests {
         assert!(store.read_blob(group, "../passwd").await.is_err());
         assert!(store.read_blob(group, "zz").await.is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn set_draw_count(store: &Store, group_id: i64, library: &str, hash: &str, count: i64) {
+        store
+            .with_group(group_id, |pool| async move {
+                sqlx::query("UPDATE images SET draw_count = ? WHERE library = ? AND hash = ?")
+                    .bind(count)
+                    .bind(library)
+                    .bind(hash)
+                    .execute(&pool)
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     async fn draw_counts(
