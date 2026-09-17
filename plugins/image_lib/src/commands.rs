@@ -84,8 +84,8 @@ fn delete_command(store: Arc<Store>) -> Command {
 
 fn alias_command(store: Arc<Store>) -> Command {
     Command::new("别名")
-        .description("给已有图库起别名，来只/添加/删除都走同一库")
-        .usage("别名 <别名> <库名>")
+        .description("给已有图库起别名；末尾加「合并」会把原库并进目标库")
+        .usage("别名 <别名> <库名> [合并]")
         .expose_as_root()
         .prefix_match()
         .handler(move |ctx| {
@@ -226,11 +226,24 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
     let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     let target = parse_library_name(ctx.arg(1).unwrap_or(""))?;
-    ctx.ensure_no_extra_args(2)?;
+    let merge = match ctx.arg(2) {
+        None => false,
+        Some("合并") => true,
+        Some(_) => return Err(CommandError::UnexpectedArgument),
+    };
+    ctx.ensure_no_extra_args(if merge { 3 } else { 2 })?;
     let group_id = ctx.group_id()?;
-    match store.set_alias(group_id, alias, target).await {
-        Ok(canonical) => {
-            ctx.reply(format!("「{alias}」现在是「{canonical}」的别名"));
+    match store.set_alias(group_id, alias, target, merge).await {
+        Ok(result) => {
+            let canonical = &result.canonical;
+            let message = if let Some(from) = &result.merged_from {
+                format!(
+                    "已将「{from}」合并进「{canonical}」，「{alias}」现在是「{canonical}」的别名"
+                )
+            } else {
+                format!("「{alias}」现在是「{canonical}」的别名")
+            };
+            ctx.reply(message);
             Ok(())
         }
         Err(error) => Err(map_store_user_error(error)),
@@ -731,6 +744,7 @@ fn map_store_user_error(error: StoreError) -> CommandError {
         StoreError::HashAmbiguous => CommandError::user("哈希前缀对应多张图，请写长一点"),
         StoreError::AliasToSelf
         | StoreError::NameIsLibrary(_)
+        | StoreError::AliasTaken { .. }
         | StoreError::TargetMissing(_)
         | StoreError::AliasMissing(_) => CommandError::user(error.to_string()),
         other => CommandError::internal(other),
