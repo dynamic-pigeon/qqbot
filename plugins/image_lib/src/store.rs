@@ -10,7 +10,7 @@ use std::{
 use kovi::tokio::sync::{Mutex, mpsc};
 
 use anyhow::{Context, Result};
-use rand::RngExt;
+use rand::seq::IndexedRandom;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
@@ -324,7 +324,7 @@ impl Store {
                     ))
                 })
                 .collect::<Result<Vec<_>, sqlx::Error>>()?;
-            let hash = pick_weighted(&items, &mut rand::rng())
+            let hash = pick_weighted(&items)
                 .map(str::to_owned)
                 .ok_or(StoreError::LibraryEmpty)?;
             sqlx::query(
@@ -764,21 +764,12 @@ async fn ensure_draw_count_column(pool: &SqlitePool) -> Result<(), StoreError> {
 }
 
 /// 权重 `4096 >> (次数 - 库内最小次数)`，最少的那档是 4096，最多落后 12 次仍为 1。
-fn pick_weighted<'a>(items: &'a [(String, i64)], rng: &mut impl RngExt) -> Option<&'a str> {
+fn pick_weighted(items: &[(String, i64)]) -> Option<&str> {
     let min = items.iter().map(|(_, count)| *count).min()?;
-    let mut total: u32 = 0;
-    for (_, count) in items {
-        total += weight(*count, min);
-    }
-    let mut throw = rng.random_range(0..total);
-    for (hash, count) in items {
-        let w = weight(*count, min);
-        if throw < w {
-            return Some(hash);
-        }
-        throw -= w;
-    }
-    items.last().map(|(hash, _)| hash.as_str())
+    items
+        .choose_weighted(&mut rand::rng(), |(_, count)| weight(*count, min))
+        .ok()
+        .map(|(hash, _)| hash.as_str())
 }
 
 fn weight(count: i64, min: i64) -> u32 {
