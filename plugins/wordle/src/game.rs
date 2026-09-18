@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::{IndexedRandom, SliceRandom};
+use rand::seq::IndexedRandom;
 
 pub const WORD_LEN: usize = 5;
 pub const MAX_GUESSES: usize = 6;
@@ -66,7 +66,7 @@ pub enum SubmitError {
 /// 两种模式：
 /// - 普通：答案开局固定（`Fixed`）；
 /// - 严格（对抗）：答案不预先固定，每次猜测后从与历史反馈一致的候选池中
-///   选择让游戏延续最久的答案，最大化猜中所需次数。
+///   按稀释信息的程度加权选取新答案，较大的反馈桶更容易被抽中。
 #[derive(Debug, Clone)]
 pub struct Game {
     mode: Mode,
@@ -221,10 +221,9 @@ impl Game {
     }
 }
 
-/// 严格模式的对抗选答案：对猜测分桶统计各候选的反馈，
-/// 排除"全绿桶"（它只可能是 guess 本身，选中即结束），
-/// 从其余桶中选最大的作为新候选池——玩家每轮获得的信息最少。
-/// 候选池只剩 1 个词时只能选它，下一猜必然全绿。
+/// 严格模式：按反馈分桶，候选多于 1 时排除全绿，再按桶大小加权抽取。
+/// 越大的桶越能稀释信息；权重 `4096 >> 排名`，同大小同权重，每落后一档减半，12 档以外为 1。
+/// 候选池只剩 1 个词时只能选它。
 fn adversarial_pick(candidates: &mut Vec<String>, guess: &str) -> ([Tile; WORD_LEN], String) {
     use rand::rng;
 
@@ -237,18 +236,22 @@ fn adversarial_pick(candidates: &mut Vec<String>, guess: &str) -> ([Tile; WORD_L
             .push(cand.clone());
     }
 
-    let mut entries: Vec<([Tile; WORD_LEN], Vec<String>)> = buckets.into_iter().collect();
-    // 平局时随机选一个桶，让对局不单调重复。
-    entries.shuffle(&mut rng());
-    let (tiles, chosen) = entries
-        .iter()
+    let entries: Vec<([Tile; WORD_LEN], Vec<String>)> = buckets
+        .into_iter()
         .filter(|(fb, _)| !(candidates.len() > 1 && *fb == all_green))
-        .max_by_key(|(_, v)| v.len())
+        .collect();
+    let mut sizes: Vec<usize> = entries.iter().map(|(_, words)| words.len()).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    let (tiles, chosen) = entries
+        .choose_weighted(&mut rng(), |(_, words)| {
+            4096u32 >> (sizes.iter().filter(|&&s| s > words.len()).count() as u32).min(12)
+        })
+        .ok()
         .cloned()
         .unwrap_or_else(|| (all_green, vec![guess.to_owned()]));
 
     *candidates = chosen;
-    // 名义答案：从新候选池随机取一个，作为本轮的"当前答案"。
     let current = candidates
         .choose(&mut rng())
         .cloned()
