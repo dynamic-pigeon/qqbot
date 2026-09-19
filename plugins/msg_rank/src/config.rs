@@ -4,7 +4,7 @@ use utils::JsonStore;
 
 /// 根目录 `config.toml` 的 `[msg_rank]`。
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct StaticConfig {
     pub retention_days: u64,
     pub wordcloud_concurrency: usize,
@@ -12,6 +12,7 @@ pub(crate) struct StaticConfig {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WordCloudSchedule {
     pub cron: String,
     pub days: i64,
@@ -40,10 +41,8 @@ impl Default for StaticConfig {
 }
 
 pub(crate) fn static_config() -> &'static StaticConfig {
-    static PARSED: LazyLock<StaticConfig> = LazyLock::new(|| {
-        utils::config::parse("msg_rank")
-            .unwrap_or_else(|error| panic!("解析 [msg_rank] 配置失败: {error:#}"))
-    });
+    static PARSED: LazyLock<StaticConfig> =
+        LazyLock::new(|| utils::config::parse_or_panic("msg_rank"));
     &PARSED
 }
 

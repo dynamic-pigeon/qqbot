@@ -17,7 +17,7 @@ use tencent::get_ocr;
 
 /// 根目录 `config.toml` 的 `[ocr]`。两项都非空才启用腾讯云识别。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct OcrConfig {
     secret_id: String,
     secret_key: String,
@@ -30,10 +30,23 @@ impl OcrConfig {
 }
 
 fn ocr_config() -> &'static OcrConfig {
-    static CONFIG: LazyLock<OcrConfig> = LazyLock::new(|| {
-        utils::config::parse("ocr").unwrap_or_else(|error| panic!("解析 [ocr] 配置失败: {error:#}"))
-    });
+    static CONFIG: LazyLock<OcrConfig> = LazyLock::new(|| utils::config::parse_or_panic("ocr"));
     &CONFIG
+}
+
+fn ocr_ready() -> bool {
+    if ocr_config().is_configured() {
+        return true;
+    }
+    if !OCR_MISSING_CONFIG_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("未配置腾讯云 OCR，跳过图片文字识别");
+    }
+    false
+}
+
+/// 启动时解析 `[ocr]`，密钥未填只打一次日志。
+pub(crate) fn preload_config() {
+    let _ = ocr_ready();
 }
 
 fn ocr_image_hosts() -> &'static [&'static str] {
@@ -99,10 +112,7 @@ static OCR_MISSING_CONFIG_WARNED: AtomicBool = AtomicBool::new(false);
 /// 对已校验过的图片 URL 做 OCR。未配置腾讯云时返回空串。
 pub async fn ocr(img_url: &str) -> Result<Arc<String>> {
     // 未配置腾讯云时直接短路，不为注定失败的识别下载原图。
-    if !ocr_config().is_configured() {
-        if !OCR_MISSING_CONFIG_WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!("未配置腾讯云 OCR，跳过图片文字识别");
-        }
+    if !ocr_ready() {
         return Ok(Arc::new(String::new()));
     }
     let _permit = OCR_POOL.acquire(Duration::from_secs(2)).await?;

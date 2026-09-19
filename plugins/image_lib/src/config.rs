@@ -16,7 +16,7 @@ pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 16;
 
 /// 根目录 `config.toml` 的 `[image_lib]`。
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct StaticConfig {
     pub max_group_mib: u64,
     pub max_image_mib: u64,
@@ -70,9 +70,7 @@ impl StaticConfig {
 }
 
 pub(crate) fn static_config() -> &'static StaticConfig {
-    static CONFIG: LazyLock<StaticConfig> = LazyLock::new(|| {
-        utils::config::parse("image_lib")
-            .unwrap_or_else(|error| panic!("解析 [image_lib] 配置失败: {error:#}"))
-    });
+    static CONFIG: LazyLock<StaticConfig> =
+        LazyLock::new(|| utils::config::parse_or_panic("image_lib"));
     &CONFIG
 }
