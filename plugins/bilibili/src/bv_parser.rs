@@ -125,7 +125,10 @@ fn extract_bvid(url: &str) -> Option<&str> {
 
 async fn parse_long_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
     if let Some(bv) = extract_bvid(url) {
-        parse_bv(bv, group_id).await
+        if !check_rate_limit(group_id) {
+            return Err(BvError::RateLimited);
+        }
+        parse_bv(bv).await
     } else {
         Err(BvError::ParseFailed("未匹配到长链接"))
     }
@@ -157,6 +160,11 @@ async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
         .ok_or(BvError::ParseFailed("未匹配到短链接"))?
         .as_str();
 
+    // 短链 GET 必须先占额度，避免刷 b23.tv 堵住 current_thread。
+    if !check_rate_limit(group_id) {
+        return Err(BvError::RateLimited);
+    }
+
     let resp = CLIENT.get(short_url).send().await?;
 
     // 已关闭自动重定向，短链必须返回 3xx 并携带 Location。
@@ -174,14 +182,11 @@ async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
         return Err(BvError::ParseFailed("短链重定向目标不是 Bilibili 域名"));
     }
 
-    parse_long_url(location, group_id).await
+    let bv = extract_bvid(location).ok_or(BvError::ParseFailed("未匹配到长链接"))?;
+    parse_bv(bv).await
 }
 
-async fn parse_bv(bv: &str, group_id: i64) -> Result<BvInfo, BvError> {
-    if !check_rate_limit(group_id) {
-        return Err(BvError::RateLimited);
-    }
-
+async fn parse_bv(bv: &str) -> Result<BvInfo, BvError> {
     let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
     let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
 

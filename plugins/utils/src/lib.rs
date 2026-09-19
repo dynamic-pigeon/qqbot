@@ -26,10 +26,10 @@ pub use json_store::JsonStore;
 pub use rate_limit::{RateLimitHit, RateLimiter};
 pub use resource_manager::{ManagedResource, ResourceManager};
 pub use safe_url::{
-    PRIVATE_NETWORK_PROTECTION_ENV, QQ_IMAGE_HOSTS, download_image_limited, is_public_ip,
-    private_network_protection_enabled, read_response_limited, validate_image_url,
-    validate_image_url_async, validate_image_url_async_with_options,
-    validate_image_url_with_options,
+    PRIVATE_NETWORK_PROTECTION_ENV, QQ_IMAGE_HOSTS, download_image_limited,
+    https_image_url_from_data, is_public_ip, private_network_protection_enabled,
+    read_response_limited, validate_image_url, validate_image_url_async,
+    validate_image_url_async_with_options, validate_image_url_with_options,
 };
 
 #[cfg(feature = "chromium")]

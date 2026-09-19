@@ -108,29 +108,7 @@ pub async fn load_image_bytes(segment: &Segment) -> Result<Vec<u8>, FetchError> 
 }
 
 fn image_url(segment: &Segment) -> Option<String> {
-    for key in ["url", "file"] {
-        let raw = segment.data.get(key).and_then(Value::as_str)?;
-        if let Some(url) = normalize_https_url(raw) {
-            return Some(url);
-        }
-    }
-    None
-}
-
-fn normalize_https_url(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    let with_scheme = if let Some(rest) = raw.strip_prefix("//") {
-        format!("https:{rest}")
-    } else {
-        raw.to_owned()
-    };
-    let mut parsed = reqwest::Url::parse(&with_scheme).ok()?;
-    match parsed.scheme() {
-        "http" => parsed.set_scheme("https").ok()?,
-        "https" => {}
-        _ => return None,
-    }
-    Some(parsed.into())
+    utils::https_image_url_from_data(&segment.data)
 }
 
 fn local_file_path(segment: &Segment) -> Option<PathBuf> {
