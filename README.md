@@ -1,6 +1,6 @@
 # QQ Bot
 
-基于 Kovi 和 OneBot 的 Rust QQ 机器人。插件：Markdown 截图、发言排行与词云、B 站直播/动态订阅、游戏王查卡、英文 Wordle、按群图库。
+基于 Kovi 和 OneBot 的 Rust QQ 机器人。插件：Markdown 截图、发言排行与词云、B 站直播/动态订阅、游戏王查卡、英文 Wordle、按群图库。群内 `/help` 查看命令。
 
 ## 运行
 
@@ -10,12 +10,14 @@ cp config.toml.example config.toml
 cargo run --release
 ```
 
+没有 `kovi.conf.toml` 时会交互生成。Linux musl 部署请加 `--features jemalloc` 或 `mimalloc`（二者互斥），否则词云/截图后 RSS 不易回落。
+
 | 文件 | 用途 |
 |---|---|
 | `config.toml` | 进程级静态配置，模板是 `config.toml.example`；段内未知键会在启动时失败 |
-| `kovi.conf.toml` | OneBot 连接 |
+| `kovi.conf.toml` | OneBot 连接与机器人管理员 |
 | `kovi.plugin.toml` | 插件启用与访问控制 |
-| `.env` | `BILIBILI_COOKIE` 等环境变量 |
+| `.env` | `BILIBILI_COOKIE`、`BILIBILI_USER_AGENT` 等环境变量 |
 
 `config.toml`、`kovi.conf.toml`、`kovi.plugin.toml`、`.env` 不提交。
 
@@ -27,9 +29,10 @@ Unix 上会把 `.env`、`kovi.conf.toml`、`config.toml`、插件 `config.json`�
 
 ## 数据
 
-- `/wordcloud enable` 之后该群消息才入库；`/wordcloud disable` 停止采集。单条最多 4 KiB。保留天数、词云定时和并发见 `config.toml` 的 `[msg_rank]`。
+- 管理员 `/wordcloud enable` 之后该群消息才入库；`/wordcloud disable` 停止采集。单条最多 4 KiB。保留天数、词云定时和并发见 `config.toml` 的 `[msg_rank]`。
 - 图片 OCR 每条最多 3 张，需在 `[ocr]` 填写腾讯云密钥，否则跳过。
-- 中文词云字体：`data/msg_rank/font.otf`；没有则用 wordcloud-rs 内嵌英文字体。
+- 中文词云字体：`data/msg_rank/font.otf`；没有则用 wordcloud-rs 内嵌英文字体。可选遮罩同目录 `mask.png` / `mask.jpg`。
+- 图库容量、单图上限和抽图限流见 `[image_lib]`；数据在 `data/image_lib/`。
 - Wordle 词库首次使用时下载到 `data/wordle/`，也可预放 `answers.txt` / `allowed.txt`。
 
 ## 开发检查
@@ -37,15 +40,11 @@ Unix 上会把 `.env`、`kovi.conf.toml`、`config.toml`、插件 `config.json`�
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo clippy -p utils --features markdown --all-targets --locked -- -D warnings
-cargo clippy -p wordle --all-features --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
-cargo test -p utils --features markdown --locked
-cargo test -p wordle --all-features --locked
 cargo audit
 ```
 
-`utils` 的 `chromium` / `screenshot` / `markdown` 与 Wordle 的 `cli` 不在默认 feature 里。单独检查这两个 crate 时要用上面的 `-p` 命令把对应模块编进来。Wordle 独立 CLI：`cargo run -p wordle --features cli`。
+workspace 会通过依赖编进 `utils` 的 `chromium` / `screenshot` / `markdown` 和 Wordle 的 `qq`。Wordle 独立 CLI：`cargo run -p wordle --features cli`。单独测 `utils` 时要加 `--features markdown`，否则 Markdown/截图测试不会编进来。
 
 依赖公网 API 或本机 Chrome 的测试标了 `ignored`：
 
