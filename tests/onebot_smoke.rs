@@ -35,7 +35,7 @@ const SLOW: Duration = Duration::from_secs(45);
 async fn plugin_commands_reply_on_mock_onebot() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let iso = IsolatedCwd::enter(&repo);
-    let _ = utils::config::value();
+    utils::config::preload();
     let server = MockOneBot::start().await;
     let bot = build_bot(KoviConf::new(ID::new(ADMIN), None, false), server.driver());
     let run = tokio::spawn(bot.run());
