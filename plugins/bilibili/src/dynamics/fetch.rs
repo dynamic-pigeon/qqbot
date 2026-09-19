@@ -407,7 +407,7 @@ async fn fetch_page_with_browser(
         .await
         .map_err(DynamicsError::Browser)?;
 
-    tracing::debug!("Bilibili Chromium 后备动态响应: {body}");
+    tracing::debug!(len = body.len(), "Bilibili Chromium 后备动态响应");
 
     let api: ApiResponse<SpaceData> = serde_json::from_str(&body)?;
     if api.code != 0 {

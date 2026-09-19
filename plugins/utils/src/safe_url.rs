@@ -32,6 +32,37 @@ pub const QQ_IMAGE_HOSTS: &[&str] = &[
     "qpic.cn",
 ];
 
+/// 把 `http://` / 协议相对 `//` 升成 https；`file` 等其它 scheme 返回 None。
+fn normalize_https_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let with_scheme = if let Some(rest) = raw.strip_prefix("//") {
+        format!("https:{rest}")
+    } else {
+        raw.to_owned()
+    };
+    let mut parsed = reqwest::Url::parse(&with_scheme).ok()?;
+    match parsed.scheme() {
+        "http" => parsed.set_scheme("https").ok()?,
+        "https" => {}
+        _ => return None,
+    }
+    Some(parsed.into())
+}
+
+/// OneBot 图片段优先读 `url`，没有合法 https 时再读 `file`。
+/// 部分实现只把 CDN 链放在 `file` 里；缺 key 或非字符串时继续试下一个字段。
+pub fn https_image_url_from_data(data: &kovi::serde_json::Value) -> Option<String> {
+    for key in ["url", "file"] {
+        let Some(raw) = data.get(key).and_then(kovi::serde_json::Value::as_str) else {
+            continue;
+        };
+        if let Some(url) = normalize_https_url(raw) {
+            return Some(url);
+        }
+    }
+    None
+}
+
 static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
     // 先解析 [network]，环境变量只覆盖开关，文件里的拼写/类型错误仍会暴露。
     let from_file = crate::config::network().private_network_protection;
@@ -380,7 +411,7 @@ pub fn filter_public_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_limited, parse_env_bool};
+    use super::{append_limited, https_image_url_from_data, parse_env_bool};
 
     #[test]
     fn parses_private_network_protection_values() {
@@ -406,5 +437,22 @@ mod tests {
         append_limited(&mut body, b"hel", 5).unwrap();
         append_limited(&mut body, b"lo", 5).unwrap();
         assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn image_data_skips_missing_url_and_reads_file() {
+        let only_file = kovi::serde_json::json!({ "file": "https://gchat.qpic.cn/a.jpg" });
+        assert_eq!(
+            https_image_url_from_data(&only_file).as_deref(),
+            Some("https://gchat.qpic.cn/a.jpg")
+        );
+        let non_string_url = kovi::serde_json::json!({
+            "url": 1,
+            "file": "http://gchat.qpic.cn/a.jpg"
+        });
+        assert_eq!(
+            https_image_url_from_data(&non_string_url).as_deref(),
+            Some("https://gchat.qpic.cn/a.jpg")
+        );
     }
 }

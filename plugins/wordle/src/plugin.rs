@@ -29,9 +29,15 @@ struct Session {
     last_active: Instant,
 }
 
-/// 会话表：公开局 key 为群号，私聊 key 为用户号。
-static SESSIONS: LazyLock<Mutex<HashMap<i64, Session>>> =
+/// 会话表：群聊按群号共享一局，私聊（含群临时会话）按用户号独立。
+static SESSIONS: LazyLock<Mutex<HashMap<SessionKey, Session>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SessionKey {
+    Group(i64),
+    User(i64),
+}
 
 async fn word_list() -> Result<std::sync::Arc<WordList>, anyhow::Error> {
     WORD_LIST
@@ -138,8 +144,8 @@ async fn handle_guess(ctx: CommandContext) -> CommandResult {
 ///
 /// 纯逻辑、不涉及网络，便于单测所有分支。
 fn submit_guess(
-    sessions: &mut HashMap<i64, Session>,
-    key: i64,
+    sessions: &mut HashMap<SessionKey, Session>,
+    key: SessionKey,
     guess: &str,
     words: &WordList,
 ) -> Result<(Vec<u8>, Option<String>), CommandError> {
@@ -189,18 +195,23 @@ fn handle_status(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
-fn session_key(ctx: &CommandContext) -> i64 {
-    // 群消息按群号共享一局；私聊（含群临时会话之外的）按用户号独立。
-    ctx.event().group_id.unwrap_or(ctx.event().user_id)
+fn session_key(ctx: &CommandContext) -> SessionKey {
+    let event = ctx.event();
+    // 群临时会话同样携带 group_id，必须看 message_type；群号与 QQ 号可能相同，key 带来源以免撞槽。
+    if event.message_type == "group" {
+        SessionKey::Group(event.group_id.unwrap_or(event.user_id))
+    } else {
+        SessionKey::User(event.user_id)
+    }
 }
 
-fn lock_sessions() -> std::sync::MutexGuard<'static, HashMap<i64, Session>> {
+fn lock_sessions() -> std::sync::MutexGuard<'static, HashMap<SessionKey, Session>> {
     SESSIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn expire_sessions(sessions: &mut HashMap<i64, Session>) {
+fn expire_sessions(sessions: &mut HashMap<SessionKey, Session>) {
     sessions.retain(|_, s| s.last_active.elapsed() < SESSION_TTL);
 }
 
@@ -240,32 +251,41 @@ mod tests {
     #[test]
     fn submit_guess_requires_started_session() {
         let mut sessions = HashMap::new();
-        let err = submit_guess(&mut sessions, 1, "slate", &test_words()).unwrap_err();
+        let err =
+            submit_guess(&mut sessions, SessionKey::Group(1), "slate", &test_words()).unwrap_err();
         assert!(err.to_string().contains("还没开局"), "{err}");
     }
 
     #[test]
     fn submit_guess_rejects_invalid_words_without_consuming() {
         let mut sessions = HashMap::new();
-        sessions.insert(1, fresh_session("crane"));
+        sessions.insert(SessionKey::Group(1), fresh_session("crane"));
 
-        let err = submit_guess(&mut sessions, 1, "qqqqq", &test_words()).unwrap_err();
+        let err =
+            submit_guess(&mut sessions, SessionKey::Group(1), "qqqqq", &test_words()).unwrap_err();
         assert!(err.to_string().contains("不在词表中"), "{err}");
-        let err = submit_guess(&mut sessions, 1, "abcd", &test_words()).unwrap_err();
+        let err =
+            submit_guess(&mut sessions, SessionKey::Group(1), "abcd", &test_words()).unwrap_err();
         assert!(err.to_string().contains("恰好 5 个字母"), "{err}");
-        assert_eq!(sessions[&1].game.guesses_count(), 0, "非法输入不消耗次数");
+        assert_eq!(
+            sessions[&SessionKey::Group(1)].game.guesses_count(),
+            0,
+            "非法输入不消耗次数"
+        );
     }
 
     #[test]
     fn submit_guess_win_note() {
         let mut sessions = HashMap::new();
-        sessions.insert(1, fresh_session("crane"));
+        sessions.insert(SessionKey::Group(1), fresh_session("crane"));
 
-        let (png, note) = submit_guess(&mut sessions, 1, "slate", &test_words()).unwrap();
+        let (png, note) =
+            submit_guess(&mut sessions, SessionKey::Group(1), "slate", &test_words()).unwrap();
         assert!(note.is_none(), "未结束时无附注");
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "反馈应为 PNG 图片");
 
-        let (_, note) = submit_guess(&mut sessions, 1, "crane", &test_words()).unwrap();
+        let (_, note) =
+            submit_guess(&mut sessions, SessionKey::Group(1), "crane", &test_words()).unwrap();
         let note = note.expect("猜中应有附注");
         assert!(
             note.contains("🎉") && note.contains("CRANE") && note.contains("2 次"),
@@ -276,17 +296,18 @@ mod tests {
     #[test]
     fn submit_guess_exhaust_then_game_over() {
         let mut sessions = HashMap::new();
-        sessions.insert(1, fresh_session("crane"));
+        sessions.insert(SessionKey::Group(1), fresh_session("crane"));
         let words = test_words();
         let mut last_note = None;
         for _ in 0..6 {
-            let (_, note) = submit_guess(&mut sessions, 1, "other", &words).unwrap();
+            let (_, note) =
+                submit_guess(&mut sessions, SessionKey::Group(1), "other", &words).unwrap();
             last_note = note;
         }
         let note = last_note.expect("用尽应有附注");
         assert!(note.contains("😞") && note.contains("CRANE"), "{note}");
 
-        let err = submit_guess(&mut sessions, 1, "slate", &words).unwrap_err();
+        let err = submit_guess(&mut sessions, SessionKey::Group(1), "slate", &words).unwrap_err();
         assert!(err.to_string().contains("本局已结束"), "{err}");
     }
 

@@ -97,9 +97,8 @@ async fn get_text(msg: &Message) -> String {
                 if image_count >= MAX_OCR_IMAGES_PER_MESSAGE {
                     continue;
                 }
-                if let Some(url) = seg.data.get("url").and_then(|v| v.as_str()) {
+                if let Some(url) = utils::https_image_url_from_data(&seg.data) {
                     image_count += 1;
-                    let url = url.to_string();
                     let idx = parts.len();
                     parts.push(String::new()); // OCR 完成后回填
                     let task = kovi::spawn(async move { ocr::ocr(&url).await });
