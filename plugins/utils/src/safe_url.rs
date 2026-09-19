@@ -33,6 +33,8 @@ pub const QQ_IMAGE_HOSTS: &[&str] = &[
 ];
 
 static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
+    // 先解析 [network]，环境变量只覆盖开关，文件里的拼写/类型错误仍会暴露。
+    let from_file = crate::config::network().private_network_protection;
     if let Ok(value) = env::var(PRIVATE_NETWORK_PROTECTION_ENV) {
         match parse_env_bool(&value) {
             Some(enabled) => return enabled,
@@ -41,11 +43,7 @@ static PRIVATE_NETWORK_PROTECTION: LazyLock<bool> = LazyLock::new(|| {
             ),
         }
     }
-    crate::config::value()
-        .get("network")
-        .and_then(|v| v.get("private_network_protection"))
-        .and_then(crate::config::Value::as_bool)
-        .unwrap_or(false)
+    from_file
 });
 
 fn parse_env_bool(value: &str) -> Option<bool> {

@@ -15,6 +15,9 @@ const MAX_STORED_MESSAGE_BYTES: usize = 4 * 1024;
 
 #[kovi::plugin]
 async fn main() {
+    let _ = config::static_config();
+    ocr::preload_config();
+
     let bot = plugin::get_runtime_bot();
     let path = Arc::new(bot.get_data_path());
 

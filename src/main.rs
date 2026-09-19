@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     restrict_sensitive_file("config.toml");
 
     // 配置损坏时在插件启动前失败，避免跑到第一次下图才 panic。
-    let _ = utils::config::value();
+    utils::config::preload();
 
     let driver_config = load_local_conf()?;
     let driver = OneBotDriver::new(driver_config);
