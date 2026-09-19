@@ -19,6 +19,7 @@ use store::Store;
 
 #[kovi::plugin]
 async fn main() {
+    let image_config = config::static_config();
     let bot = plugin::get_runtime_bot();
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));
     let reconcile_store = Arc::clone(&store);
@@ -29,7 +30,6 @@ async fn main() {
             reconcile_store.reconcile_all().await;
         }
     });
-    let image_config = config::static_config();
     let limiter = Arc::new(RateLimiter::new(
         image_config.draw_window(),
         image_config.draw_max_per_window(),

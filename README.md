@@ -12,7 +12,7 @@ cargo run --release
 
 | 文件 | 用途 |
 |---|---|
-| `config.toml` | 进程级静态配置，模板是 `config.toml.example` |
+| `config.toml` | 进程级静态配置，模板是 `config.toml.example`；段内未知键会在启动时失败 |
 | `kovi.conf.toml` | OneBot 连接 |
 | `kovi.plugin.toml` | 插件启用与访问控制 |
 | `.env` | `BILIBILI_COOKIE` 等环境变量 |
