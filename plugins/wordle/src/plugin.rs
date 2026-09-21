@@ -85,7 +85,7 @@ fn wordle_command() -> Command {
 async fn handle_start(ctx: CommandContext) -> CommandResult {
     // 非 hard 的参数直接报用法，避免「/wordle start HARD」静默按普通模式开局。
     let hard = match ctx.arg(0) {
-        Some(arg) if arg == "hard" => true,
+        Some("hard") => true,
         Some(_) => return Err(CommandError::user("用法：/wordle start [hard]")),
         None => false,
     };
