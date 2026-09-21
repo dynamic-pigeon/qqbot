@@ -432,7 +432,12 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
             let duplicate = percent
                 .map(distance_from_percent)
                 .unwrap_or_else(|| config.duplicate_distance());
-            let groups = cluster(&images, duplicate, config.maybe_distance());
+            // 聚类是纯 CPU 的 O(n²) 比较，大库会占住唯一的 async worker 线程。
+            let groups = kovi::tokio::task::spawn_blocking(move || {
+                cluster(&images, duplicate, config.maybe_distance())
+            })
+            .await
+            .map_err(|e| CommandError::internal(anyhow::anyhow!("查重计算线程失败: {e}")))?;
             if groups.is_empty() {
                 ctx.reply(format!("「{canonical}」里没有相似的图"));
                 return Ok(());

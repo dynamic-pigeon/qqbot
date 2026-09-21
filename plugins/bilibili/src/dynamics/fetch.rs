@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    sync::LazyLock,
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +27,10 @@ static COOKIE: LazyLock<Option<String>> = LazyLock::new(|| {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 });
+
+/// `BILIBILI_COOKIE` 被判定登录态失效（API `-101`）后置位，本进程内回退游客会话。
+/// SESSDATA 过期后若继续带坏 cookie 刷新会话，每次轮询都会退化到串行的 Chromium 后备。
+static ENV_COOKIE_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// 默认 User-Agent，用于 `BILIBILI_USER_AGENT` 未设置时的 fallback。
 /// 选用 Chrome Linux 最新稳定版的常见格式。
@@ -326,8 +333,8 @@ async fn web_session(force_refresh: bool) -> Result<WebSession, DynamicsError> {
 
     // cookie / mixin key 走 HTTP，不能占着会话锁，否则所有动态请求都堵在这一次刷新上。
     let cookie = match COOKIE.as_ref() {
-        Some(cookie) => cookie.clone(),
-        None => bootstrap_guest_cookie().await?,
+        Some(cookie) if !ENV_COOKIE_INVALID.load(Ordering::Relaxed) => cookie.clone(),
+        _ => bootstrap_guest_cookie().await?,
     };
     let fresh = WebSession {
         mixin_key: fetch_mixin_key(&cookie).await?,
@@ -457,6 +464,16 @@ pub async fn fetch_user_dynamics(
     let session = web_session(false).await?;
     match fetch_page(uid, offset, &session).await {
         Err(error) if error.is_risk_control() => {
+            // `-101` 是登录态失效而非风控：环境变量 cookie 过期时刷新会话仍是坏 cookie，
+            // 放弃它改走游客会话，避免每次轮询都落到 Chromium 后备。
+            if matches!(error, DynamicsError::Api(-101, _))
+                && COOKIE
+                    .as_ref()
+                    .is_some_and(|cookie| session.cookie == *cookie)
+            {
+                ENV_COOKIE_INVALID.store(true, Ordering::Relaxed);
+                tracing::warn!("BILIBILI_COOKIE 登录态已失效，回退游客会话");
+            }
             tracing::warn!("Bilibili 动态请求触发风控，刷新匿名会话后重试一次: {error}");
             let refreshed = web_session(true).await?;
             match fetch_page(uid, offset, &refreshed).await {
