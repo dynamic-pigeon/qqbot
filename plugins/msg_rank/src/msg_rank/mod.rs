@@ -52,10 +52,12 @@ fn today_time_range() -> (i64, i64) {
     let now = chrono::Local::now();
     let today_midnight_naive = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
 
+    // 夏令时切换日的本地午夜可能不存在或有歧义；取该时刻的 UTC 解释兜底，
+    // 误差最多一小时，避免命令路径 panic。
     let today_start = chrono::Local
         .from_local_datetime(&today_midnight_naive)
         .single()
-        .unwrap();
+        .unwrap_or_else(|| today_midnight_naive.and_utc().with_timezone(&chrono::Local));
 
     let start_timestamp = today_start.timestamp();
     let end_timestamp = start_timestamp + 24 * 3600;

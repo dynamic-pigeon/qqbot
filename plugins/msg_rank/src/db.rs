@@ -265,8 +265,9 @@ pub(crate) async fn flush_on_shutdown() {
     }
 }
 
-pub(crate) fn add_msg(group_id: i64, user_id: i64, msg: String) -> Result<()> {
-    let timestamp = chrono::Local::now().timestamp();
+/// `timestamp` 用事件时刻而不是入库时刻：OCR 下载识别会推迟入库，
+/// 23:59 发出的带图消息不应被计入第二天。
+pub(crate) fn add_msg(group_id: i64, user_id: i64, msg: String, timestamp: i64) -> Result<()> {
     let record = MsgRecord {
         group_id,
         user_id,
@@ -474,9 +475,11 @@ mod tests {
         rt.block_on(async {
             init_db(&tmp).await.unwrap();
 
-            add_msg(1, 100, "hello".into()).unwrap();
-            add_msg(1, 101, "world".into()).unwrap();
-            add_msg(2, 100, "other".into()).unwrap();
+            // 时间戳取近期值：保留期清理会把过老的行当过期删掉，影响下面的计数。
+            let now = chrono::Local::now().timestamp();
+            add_msg(1, 100, "hello".into(), now - 10).unwrap();
+            add_msg(1, 101, "world".into(), now - 5).unwrap();
+            add_msg(2, 100, "other".into(), now - 1).unwrap();
 
             flush_on_shutdown().await;
 
