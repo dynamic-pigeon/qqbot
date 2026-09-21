@@ -260,29 +260,31 @@ impl<T: Send + Sync + 'static> Drop for ManagedResource<T> {
         };
         // 引用已被显式取出（如 [`ResourceManager::replace`] 接管销毁）时，
         // 不再触碰管理器；此时对 `Deref` 的使用仍是 bug，但 drop 本身应安全。
-        let Some(resource) = self.resource.as_ref() else {
+        let Some(resource) = self.resource.take() else {
             return;
         };
 
+        // lease 的引用释放必须始终发生在 state 锁内：若在锁外（字段析构阶段）释放，
+        // 两个并发 drop 会各自把对方尚未归零的引用计入 strong_count，双双判定
+        // 「还有别的使用者」而跳过回收，浏览器进程与 profile 目录就此泄漏。
         let mut state = lock_state(&manager.state);
         let is_cached = state
             .resource
             .as_ref()
-            .is_some_and(|cached| Arc::ptr_eq(cached, resource));
+            .is_some_and(|cached| Arc::ptr_eq(cached, &resource));
         if !is_cached {
-            if Arc::strong_count(resource) == 1 {
-                let resource = self
-                    .resource
-                    .take()
-                    .expect("managed resource already released");
+            if Arc::strong_count(&resource) == 1 {
                 let destructor = Arc::clone(&manager.destructor);
                 drop(state);
                 self.runtime.spawn(destroy_resource(destructor, resource));
+            } else {
+                drop(resource);
             }
             return;
         }
         // 缓存引用和当前 lease 是仅存的两个引用时，当前 lease 即为最后一个使用者。
-        if Arc::strong_count(resource) != 2 {
+        if Arc::strong_count(&resource) != 2 {
+            drop(resource);
             return;
         }
 
@@ -291,11 +293,7 @@ impl<T: Send + Sync + 'static> Drop for ManagedResource<T> {
         state.cancel_cleanup();
         let idle_timeout = manager.idle_timeout;
         let manager = Arc::downgrade(&manager);
-        drop(
-            self.resource
-                .take()
-                .expect("managed resource already released"),
-        );
+        drop(resource);
         state.cleanup_task = Some(self.runtime.spawn(async move {
             kovi::tokio::time::sleep(idle_timeout).await;
             let Some(manager) = manager.upgrade() else {

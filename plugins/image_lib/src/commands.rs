@@ -22,6 +22,9 @@ use crate::send::{
 use crate::similar::{cluster, distance_from_percent};
 use crate::store::{Store, StoreError};
 
+/// 查重展示单组读入内存的原始字节预算。大组逐张全读可放大到数百 MiB 常驻。
+const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     let scans = Arc::new(ScanSessions::new());
     Command::new("图库")
@@ -555,9 +558,17 @@ async fn show_scan_group(
                 total: group_total,
             }) => {
                 total = group_total;
+                // 组员全读会把大组放大成数百 MiB 常驻；超预算即止并提示「仅列部分」。
+                let mut budget = MAX_GROUP_READ_BYTES;
+                let mut read_cut = false;
                 let mut images = Vec::new();
                 for hash in &group.hashes {
+                    if budget == 0 {
+                        read_cut = true;
+                        break;
+                    }
                     if let Ok(bytes) = store.read_blob(group_id, hash).await {
+                        budget = budget.saturating_sub(bytes.len());
                         images.push(PackedImage {
                             hash: hash.clone(),
                             bytes,
@@ -571,9 +582,10 @@ async fn show_scan_group(
                     }
                     continue;
                 }
+                let truncated = group.truncated || read_cut;
                 page.push(ScanPageGroup {
-                    title: group_title(group.kind, index, group_total, group.percent),
-                    name: group_node_name(group.kind, index, group_total, group.percent),
+                    title: group_title(group.kind, index, group_total, group.percent, truncated),
+                    name: group_node_name(group.kind, index, group_total, group.percent, truncated),
                     images,
                     index,
                 });
