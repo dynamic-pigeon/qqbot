@@ -30,11 +30,9 @@ pub(crate) async fn get_ocr(img_base64: &str) -> Result<String> {
     let service = "ocr";
     let host = "ocr.tencentcloudapi.com";
     let region = "";
-    let action = if rand::random::<bool>() {
-        "GeneralBasicOCR" // 通用印刷体识别
-    } else {
-        "GeneralAccurateOCR" // 通用印刷体识别（高精度）
-    };
+    // 固定用通用印刷体识别：高精度档单价约为本档 10 倍，且群内每张图都会触发，
+    // 成本必须可预算、可从日志回溯。
+    let action = "GeneralBasicOCR";
     let version = "2018-11-19";
 
     let timestamp = SystemTime::now()
