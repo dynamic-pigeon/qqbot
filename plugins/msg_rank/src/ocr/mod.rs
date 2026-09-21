@@ -98,10 +98,8 @@ impl OcrMemory {
 
         let value = guard.value();
 
-        if value.is_empty() {
-            return Err(Error::msg("OCR result is empty"));
-        }
-
+        // 识别成功但无文字是正常分支（表情包、风景照），返回空串交上游过滤，
+        // 不当作错误刷日志。
         Ok(Arc::clone(value))
     }
 }

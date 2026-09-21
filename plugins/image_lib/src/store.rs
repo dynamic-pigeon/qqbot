@@ -1064,7 +1064,12 @@ async fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let write = async {
-        kovi::tokio::fs::write(&tmp, bytes).await?;
+        // rename 前先落盘：DB 里已有该 hash 的索引，掉电截断的 blob 会被对账
+        // 当作正常文件，这张图就永久损坏了。
+        let mut file = kovi::tokio::fs::File::create(&tmp).await?;
+        kovi::tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
+        file.sync_all().await?;
+        drop(file);
         utils::restrict_mode_0600(&tmp)?;
         kovi::tokio::fs::rename(&tmp, path).await?;
         Ok(())

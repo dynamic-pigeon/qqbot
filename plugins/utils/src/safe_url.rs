@@ -350,7 +350,7 @@ fn is_public_v4(ip: &Ipv4Addr) -> bool {
         192 if oct[1] == 0 && oct[2] == 0 => false,    // 192.0.0.0/24 IETF
         192 if oct[1] == 0 && oct[2] == 2 => false,    // 192.0.2.0/24 TEST-NET-1
         192 if oct[1] == 168 => false,                 // 192.168.0.0/16 private
-        198 if oct[1] == 18 && oct[2] <= 1 => false,   // 198.18.0.0/15 benchmark
+        198 if (18..=19).contains(&oct[1]) => false,   // 198.18.0.0/15 benchmark
         198 if oct[1] == 51 && oct[2] == 100 => false, // 198.51.100.0/24 TEST-NET-2
         203 if oct[1] == 0 && oct[2] == 113 => false,  // 203.0.113.0/24 TEST-NET-3
         // 224..=239 multicast, 240..=255 reserved: 上面的 is_multicast / broadcast 已涵盖，
@@ -380,6 +380,20 @@ fn is_public_v6(ip: &Ipv6Addr) -> bool {
     }
     if (seg[0] & 0xe000) != 0x2000 {
         return false;
+    }
+    // 2001::/32 Teredo：末 32 位是混淆过的客户端 IPv4，隧道端点不该被 SSRF 触达。
+    if seg[0] == 0x2001 && seg[1] == 0 {
+        return false;
+    }
+    // 2002::/16 6to4：地址内嵌 IPv4，按内网规则再判一次。
+    if seg[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        return is_public_v4(&embedded);
     }
     // 2001:db8::/32 documentation
     if seg[0] == 0x2001 && seg[1] == 0x0db8 {

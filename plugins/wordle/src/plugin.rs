@@ -83,7 +83,12 @@ fn wordle_command() -> Command {
 }
 
 async fn handle_start(ctx: CommandContext) -> CommandResult {
-    let hard = ctx.arg(0).is_some_and(|arg| arg == "hard");
+    // 非 hard 的参数直接报用法，避免「/wordle start HARD」静默按普通模式开局。
+    let hard = match ctx.arg(0) {
+        Some(arg) if arg == "hard" => true,
+        Some(_) => return Err(CommandError::user("用法：/wordle start [hard]")),
+        None => false,
+    };
     ctx.ensure_no_extra_args(1)?;
     let words = word_list().await.map_err(CommandError::internal)?;
     let key = session_key(&ctx);
