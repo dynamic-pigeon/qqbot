@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -121,7 +122,11 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let tmp_path = path.with_extension("json.tmp");
     let data = kovi::serde_json::to_vec_pretty(value)?;
     let write = (|| {
-        fs::write(&tmp_path, &data)?;
+        // rename 前先落盘：掉电时半写的 tmp 不会顶替上一次完好的配置。
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
         restrict_mode_0600(&tmp_path)?;
         fs::rename(&tmp_path, path)?;
         anyhow::Ok(())
