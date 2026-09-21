@@ -1,4 +1,5 @@
-use image::{DynamicImage, GrayImage, imageops::FilterType};
+use image::{DynamicImage, GrayImage, ImageReader, Limits, imageops::FilterType};
+use std::io::Cursor;
 
 /// 64-bit 感知哈希。dHash 看邻域差分，pHash 看低频 DCT。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,8 @@ pub struct SimilarGroup {
     pub hashes: Vec<String>,
     /// 用分组时那条边的距离换算，越大越像。
     pub percent: u8,
+    /// 组员超过 [`MAX_GROUP_MEMBERS`] 被截断或展示超字节预算时置位，标题提示「仅列部分」。
+    pub truncated: bool,
 }
 
 const DHASH_WIDTH: u32 = 9;
@@ -32,6 +35,29 @@ const DHASH_HEIGHT: u32 = 8;
 const PHASH_SIZE: u32 = 32;
 const PHASH_WINDOW: usize = 8;
 const HASH_BITS: u32 = 64;
+/// 单个重复组的成员上限。并查集可把整库近似图并成一桶，展示端逐张读 blob，必须设界。
+const MAX_GROUP_MEMBERS: usize = 30;
+/// 「也许像」组数上限。最坏两两成对是 O(n²)，全量生成会撑爆查重会话内存。
+const MAX_MAYBE_GROUPS: usize = 1000;
+/// 解码分配上限与宽高边界。入库只限制压缩字节，群成员可用小体积大尺寸图
+/// 把解码后的像素缓冲放大成数 GiB；指纹和切图共用这一个受限入口。
+const MAX_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+const MAX_DECODE_WIDTH: u32 = 16384;
+/// 长截图高度可达数万像素，高度边界单独放宽。
+const MAX_DECODE_HEIGHT: u32 = 65536;
+
+/// 带分配与宽高上限的解码。超限返回 `None`，等价于这张图不适合参与比对或切图。
+pub(crate) fn decode_limited(bytes: &[u8]) -> Option<DynamicImage> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_WIDTH);
+    limits.max_image_height = Some(MAX_DECODE_HEIGHT);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    let mut reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    reader.decode().ok()
+}
 
 /// 几乎没有对比度的图（纯色、近纯色）无法靠感知哈希互相区分。
 fn is_flat(gray: &GrayImage) -> bool {
@@ -48,7 +74,7 @@ fn is_flat(gray: &GrayImage) -> bool {
 }
 
 pub fn fingerprint_bytes(bytes: &[u8]) -> Option<Fingerprint> {
-    let image = image::load_from_memory(bytes).ok()?;
+    let image = decode_limited(bytes)?;
     fingerprint_image(&image)
 }
 
@@ -250,16 +276,25 @@ pub fn cluster(
         for &i in &members {
             in_duplicate[i] = true;
         }
-        let mut hashes: Vec<String> = members.iter().map(|&i| images[i].hash.clone()).collect();
+        let truncated = members.len() > MAX_GROUP_MEMBERS;
+        let mut hashes: Vec<String> = members
+            .iter()
+            .take(MAX_GROUP_MEMBERS)
+            .map(|&i| images[i].hash.clone())
+            .collect();
         hashes.sort();
         groups.push(SimilarGroup {
             kind: GroupKind::Duplicate,
             hashes,
             percent: percent_from_distance(best_by_root[root]),
+            truncated,
         });
     }
 
-    for i in 0..n {
+    // 截断时按扫描顺序保留前 MAX_MAYBE_GROUPS 对，不保证剩下的是最相似的；
+    // 宁可少提示也不让 O(n²) 的组列表把会话内存撑爆。
+    let mut maybe_groups = 0usize;
+    'outer: for i in 0..n {
         if in_duplicate[i] {
             continue;
         }
@@ -282,7 +317,12 @@ pub fn cluster(
                 kind: GroupKind::Maybe,
                 hashes,
                 percent: percent_from_distance(dist),
+                truncated: false,
             });
+            maybe_groups += 1;
+            if maybe_groups >= MAX_MAYBE_GROUPS {
+                break 'outer;
+            }
         }
     }
 
@@ -366,6 +406,84 @@ mod tests {
     fn solid_color_is_skipped() {
         let image = RgbImage::from_pixel(16, 16, Rgb([12, 34, 56]));
         assert!(fingerprint_bytes(&png_bytes(&image)).is_none());
+    }
+
+    #[test]
+    fn decode_limited_accepts_normal_image() {
+        assert!(decode_limited(&png_bytes(&patterned(5))).is_some());
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// 只含 IHDR/IEND 的最小 PNG 头，宽高可指定。
+    fn png_header_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut ihdr = b"IHDR".to_vec();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn decode_limited_rejects_oversized_dimensions() {
+        assert!(decode_limited(&png_header_with_dimensions(100_000, 100_000)).is_none());
+    }
+
+    #[test]
+    fn duplicate_group_members_are_capped() {
+        let images: Vec<_> = (0..40)
+            .map(|i| hashed(&format!("d{i}"), 0x1111, 0x1111))
+            .collect();
+        let groups = cluster(&images, 8, 16);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hashes.len(), MAX_GROUP_MEMBERS);
+        assert!(groups[0].truncated);
+    }
+
+    #[test]
+    fn maybe_pairs_are_capped() {
+        // 黄金比例常数的相邻倍数两两汉明距离足够远，phash 全同：
+        // 整库两两「也许像」而非重复，C(46,2)=1035 超出上限。
+        let images: Vec<_> = (1..=46u64)
+            .map(|i| {
+                hashed(
+                    &format!("m{i}"),
+                    i.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    0x5555_5555_5555_5555,
+                )
+            })
+            .collect();
+        for i in 0..images.len() {
+            for j in (i + 1)..images.len() {
+                assert!(
+                    hamming(images[i].fingerprint.dhash, images[j].fingerprint.dhash) > 8,
+                    "测试构造不满足两两不重复的前提"
+                );
+            }
+        }
+        let groups = cluster(&images, 8, 16);
+        assert!(groups.iter().all(|g| g.kind == GroupKind::Maybe));
+        assert_eq!(groups.len(), MAX_MAYBE_GROUPS);
     }
 
     #[test]

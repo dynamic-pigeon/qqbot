@@ -33,9 +33,11 @@ pub(crate) fn image_message(text: Option<&str>, images: &[&[u8]]) -> Message {
     message
 }
 
+use crate::similar::decode_limited;
+
 /// 按高度从中间横切成上下两半。整图发不出时，两半分开发。
 fn split_image(bytes: &[u8]) -> Option<[Vec<u8>; 2]> {
-    let source = image::load_from_memory(bytes).ok()?.to_rgb8();
+    let source = decode_limited(bytes)?.to_rgb8();
     let width = source.width();
     let height = source.height();
     if width == 0 || height < 2 {

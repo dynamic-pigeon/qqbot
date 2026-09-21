@@ -122,20 +122,34 @@ fn expire(sessions: &mut HashMap<ScanKey, ScanState>) {
     sessions.retain(|_, state| state.last_used.elapsed() < SESSION_TTL);
 }
 
-pub fn group_title(kind: GroupKind, index: usize, total: usize, percent: u8) -> String {
+pub fn group_title(
+    kind: GroupKind,
+    index: usize,
+    total: usize,
+    percent: u8,
+    truncated: bool,
+) -> String {
     match kind {
-        GroupKind::Duplicate => group_node_name(kind, index, total, percent),
+        GroupKind::Duplicate => group_node_name(kind, index, total, percent, truncated),
         GroupKind::Maybe => {
-            format!("也许像 {index}/{total} · 约 {percent}%。不确定，别按重复删")
+            let note = if truncated { "，仅列部分" } else { "" };
+            format!("也许像 {index}/{total} · 约 {percent}%{note}。不确定，别按重复删")
         }
     }
 }
 
 /// 合并转发节点昵称。Maybe 组的警告放在正文里，避免昵称被截断。
-pub fn group_node_name(kind: GroupKind, index: usize, total: usize, percent: u8) -> String {
+pub fn group_node_name(
+    kind: GroupKind,
+    index: usize,
+    total: usize,
+    percent: u8,
+    truncated: bool,
+) -> String {
+    let note = if truncated { " · 仅列部分" } else { "" };
     match kind {
-        GroupKind::Duplicate => format!("重复 {index}/{total} · 约 {percent}%"),
-        GroupKind::Maybe => format!("也许像 {index}/{total} · 约 {percent}%"),
+        GroupKind::Duplicate => format!("重复 {index}/{total} · 约 {percent}%{note}"),
+        GroupKind::Maybe => format!("也许像 {index}/{total} · 约 {percent}%{note}"),
     }
 }
 
@@ -235,6 +249,7 @@ mod tests {
             kind: GroupKind::Duplicate,
             hashes: vec![hash.to_owned()],
             percent: 90,
+            truncated: false,
         }
     }
 
@@ -369,9 +384,11 @@ mod tests {
     #[test]
     fn maybe_node_name_drops_warning() {
         assert_eq!(
-            group_node_name(GroupKind::Maybe, 2, 5, 80),
+            group_node_name(GroupKind::Maybe, 2, 5, 80, false),
             "也许像 2/5 · 约 80%"
         );
-        assert!(group_title(GroupKind::Maybe, 2, 5, 80).contains("不确定"));
+        assert!(group_title(GroupKind::Maybe, 2, 5, 80, false).contains("不确定"));
+        assert!(group_title(GroupKind::Maybe, 2, 5, 80, true).contains("仅列部分"));
+        assert!(group_node_name(GroupKind::Duplicate, 1, 3, 95, true).contains("仅列部分"));
     }
 }
