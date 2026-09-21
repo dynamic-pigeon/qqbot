@@ -46,10 +46,25 @@ fn rejects_ipv4_attack_addresses() {
     assert_private_address_rejected("https://192.168.1.1/x");
     // 169.254.0.0/16 link-local（AWS metadata 169.254.169.254 在此范围）
     assert_private_address_rejected("https://169.254.169.254/x");
+    // 198.18.0.0/15 基准段全覆盖（198.18.2.0 起也要拦）
+    assert_private_address_rejected("https://198.18.0.1/x");
+    assert_private_address_rejected("https://198.18.2.1/x");
+    assert_private_address_rejected("https://198.19.255.254/x");
     // unspecified / broadcast / multicast
     assert_private_address_rejected("https://0.0.0.0/x");
     assert_private_address_rejected("https://255.255.255.255/x");
     assert_private_address_rejected("https://224.0.0.1/x");
+}
+
+#[test]
+fn rejects_6to4_and_teredo_attack_addresses() {
+    // 2002::/16 6to4：嵌入的 IPv4 指向内网则拒绝
+    assert_private_address_rejected("https://[2002:a00:1::]/x");
+    // 6to4 嵌入公网 IPv4 时放行（8.8.8.8）
+    assert!(is_public_ip(&"2002:808:808::".parse().unwrap()));
+    // 2001::/32 Teredo 直接拒绝
+    assert_private_address_rejected("https://[2001:0:1234:5678:9abc:def0:1122:3344]/x");
+    assert!(!is_public_ip(&"2001:0::1".parse().unwrap()));
 }
 
 #[test]

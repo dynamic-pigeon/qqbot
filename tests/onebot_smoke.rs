@@ -515,9 +515,17 @@ fn group_message(user_id: i64, text: &str) -> Value {
     )
 }
 
+fn now_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_secs() as i64
+}
+
 fn group_event(user_id: i64, message: Value, raw: &str) -> Value {
     json!({
-        "time": 1_700_000_000,
+        // 事件时刻取真实时钟：消息库按事件时间入账，硬编码旧时间会落出「今日」窗口。
+        "time": now_timestamp(),
         "self_id": BOT_ID,
         "post_type": "message",
         "message_type": "group",
@@ -692,7 +700,7 @@ fn adler32(data: &[u8]) -> u32 {
 
 fn private_message(user_id: i64, text: &str) -> Value {
     json!({
-        "time": 1_700_000_000,
+        "time": now_timestamp(),
         "self_id": BOT_ID,
         "post_type": "message",
         "message_type": "private",
