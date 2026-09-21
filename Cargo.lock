@@ -2026,7 +2026,6 @@ dependencies = [
  "kovi",
  "kovi-onebot",
  "moka",
- "rand 0.10.2",
  "reqwest",
  "serde",
  "sha2 0.11.0",

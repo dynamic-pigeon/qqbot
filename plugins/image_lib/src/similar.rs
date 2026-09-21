@@ -233,27 +233,29 @@ pub fn cluster(
         buckets[find(&mut parent, i)].push(i);
     }
 
+    // 重复边的两端必在同一并查集根下，按根聚合组内最优边，
+    // 避免对每个桶全量扫边（表情包库近似图极多时会退化到立方级）。
+    let mut best_by_root = vec![HASH_BITS; n];
+    for &(a, _b, dist) in &dup_edges {
+        let root = find(&mut parent, a);
+        best_by_root[root] = best_by_root[root].min(dist);
+    }
+
     let mut in_duplicate = vec![false; n];
     let mut groups = Vec::new();
-    for members in buckets {
+    for (root, members) in buckets.into_iter().enumerate() {
         if members.len() < 2 {
             continue;
         }
         for &i in &members {
             in_duplicate[i] = true;
         }
-        let mut best = HASH_BITS;
-        for &(a, b, dist) in &dup_edges {
-            if members.contains(&a) && members.contains(&b) {
-                best = best.min(dist);
-            }
-        }
         let mut hashes: Vec<String> = members.iter().map(|&i| images[i].hash.clone()).collect();
         hashes.sort();
         groups.push(SimilarGroup {
             kind: GroupKind::Duplicate,
             hashes,
-            percent: percent_from_distance(best),
+            percent: percent_from_distance(best_by_root[root]),
         });
     }
 
