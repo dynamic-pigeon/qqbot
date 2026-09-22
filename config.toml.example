@@ -13,6 +13,8 @@ secret_key = ""
 
 [msg_rank]
 retention_days = 8
+# 发言排行展示人数。
+rank_top = 10
 wordcloud_concurrency = 1
 
 [[msg_rank.wordcloud]]

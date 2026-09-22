@@ -14,9 +14,6 @@ mod user_info;
 /// 每群连续两次 B 话榜之间的最短间隔。
 const RANK_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// 榜单展示的名次数量。
-const RANK_TOP: usize = 5;
-
 /// 按群节流，避免连续刷排行打满 DB 连接池和 chromium。
 static RANK_COOLDOWN_LIMITER: LazyLock<RateLimiter<i64>> =
     LazyLock::new(|| RateLimiter::new(RANK_COOLDOWN, 1));
@@ -200,13 +197,13 @@ fn month_window(today: NaiveDate, title: &'static str, period: &'static str) -> 
     }
 }
 
-/// 生成一档 B 话榜 HTML（前 5 名）。
+/// 生成一档 B 话榜 HTML。
 async fn gen_rank_html(bot: &RuntimeBot, group_id: i64, window: &RankWindow) -> Result<String> {
     let top = crate::db::msg_count_top_with_time_range(
         group_id,
         window.start,
         window.end,
-        RANK_TOP as i64,
+        crate::config::static_config().rank_top(),
     )
     .await?;
 
