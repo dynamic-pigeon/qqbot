@@ -19,25 +19,26 @@
             -webkit-font-smoothing: antialiased;
         }
 
-        /* 截图按 .card 元素截取，外阴影会被裁掉，用细边框提供轮廓。 */
+        /* 截图按 .card 矩形裁切，直角边框才能和图片边缘对齐。 */
         .card {
-            width: 520px;
+            width: 580px;
             background: #fff;
             border: 1px solid #e5e7eb;
-            border-radius: 16px;
             overflow: hidden;
         }
 
+        /* 左右列等宽，标题相对卡片水平居中，不被左侧统计芯片撑偏。 */
         .header {
-            display: flex;
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
             align-items: center;
-            justify-content: space-between;
             gap: 12px;
             padding: 14px 18px;
             border-bottom: 1px solid #e5e7eb;
         }
 
         .stat-chip {
+            justify-self: start;
             background: #f3f4f6;
             border-radius: 8px;
             padding: 4px 10px;
@@ -54,7 +55,6 @@
         }
 
         .title {
-            flex: 1;
             min-width: 0;
             text-align: center;
         }
@@ -73,13 +73,16 @@
         }
 
         .time-label {
+            justify-self: end;
             font-size: 11px;
             color: #9ca3af;
             white-space: nowrap;
         }
 
+        /* 固定列宽，超长群昵称只在群友列省略，消息数始终完整可见。 */
         table {
             width: 100%;
+            table-layout: fixed;
             border-collapse: collapse;
         }
 
@@ -109,8 +112,19 @@
             background: #f9fafb;
         }
 
+        col.col-rank {
+            width: 56px;
+        }
+
+        col.col-percent {
+            width: 118px;
+        }
+
+        col.col-count {
+            width: 92px;
+        }
+
         .rank-cell {
-            width: 32px;
             font-weight: 600;
             color: #6b7280;
             font-variant-numeric: tabular-nums;
@@ -136,6 +150,7 @@
             align-items: center;
             gap: 10px;
             min-width: 0;
+            max-width: 100%;
         }
 
         .user-cell img {
@@ -147,14 +162,20 @@
         }
 
         .user-cell .name {
+            flex: 1;
+            min-width: 0;
             font-weight: 500;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
 
+        td:nth-child(2) {
+            overflow: hidden;
+        }
+
         .percent-cell {
-            width: 118px;
+            overflow: hidden;
         }
 
         .percent-inner {
@@ -187,11 +208,11 @@
         }
 
         .count-cell {
-            width: 84px;
             font-weight: 700;
             font-size: 15px;
             color: #4a6ee0;
             font-variant-numeric: tabular-nums;
+            white-space: nowrap;
         }
     </style>
 </head>
@@ -207,6 +228,12 @@
             <div class="time-label">{{ time }}</div>
         </div>
         <table>
+            <colgroup>
+                <col class="col-rank" />
+                <col class="col-user" />
+                <col class="col-percent" />
+                <col class="col-count" />
+            </colgroup>
             <thead>
                 <tr>
                     <th>#</th>
