@@ -51,7 +51,8 @@ pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
     /// 采集消息的群。发言排行和词云都读这份记录。
-    pub notify_group: Vec<i64>,
+    #[serde(default, alias = "notify_group")]
+    pub record_group: Vec<i64>,
     /// 定时推送词云的群。空列表就是不开；缺字段时按空列表读。
     #[serde(default)]
     pub wordcloud_group: Vec<i64>,
@@ -67,7 +68,7 @@ fn default_wordcloud_background() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            notify_group: vec![],
+            record_group: vec![],
             wordcloud_group: vec![],
             wordcloud_background: default_wordcloud_background(),
         }
@@ -80,17 +81,17 @@ impl Config {
     }
 
     pub(crate) fn recording_enabled(&self, group_id: i64) -> bool {
-        self.notify_group.contains(&group_id)
+        self.record_group.contains(&group_id)
     }
 
     pub(crate) fn enable_recording(&mut self, group_id: i64) {
-        if !self.notify_group.contains(&group_id) {
-            self.notify_group.push(group_id);
+        if !self.record_group.contains(&group_id) {
+            self.record_group.push(group_id);
         }
     }
 
     pub(crate) fn disable_recording(&mut self, group_id: i64) {
-        self.notify_group.retain(|&id| id != group_id);
+        self.record_group.retain(|&id| id != group_id);
     }
 
     /// 开始采集，并打开定时词云。
@@ -112,9 +113,18 @@ mod tests {
     use super::Config;
 
     #[test]
+    fn notify_group_alias_still_loads() {
+        let config: Config = kovi::serde_json::from_str(r#"{"notify_group":[1]}"#).unwrap();
+        assert!(config.recording_enabled(1));
+        let json = kovi::serde_json::to_string(&config).unwrap();
+        assert!(json.contains("record_group"));
+        assert!(!json.contains("notify_group"));
+    }
+
+    #[test]
     fn empty_wordcloud_group_means_disabled() {
         let config: Config =
-            kovi::serde_json::from_str(r#"{"notify_group":[1],"wordcloud_group":[]}"#).unwrap();
+            kovi::serde_json::from_str(r#"{"record_group":[1],"wordcloud_group":[]}"#).unwrap();
         assert!(config.recording_enabled(1));
         assert!(!config.wordcloud_enabled(1));
     }
@@ -123,16 +133,16 @@ mod tests {
     fn disable_wordcloud_keeps_recording() {
         let mut config = Config::default();
         config.enable_wordcloud(1);
-        assert!(config.notify_group.contains(&1));
+        assert!(config.record_group.contains(&1));
         assert!(config.wordcloud_enabled(1));
 
         config.disable_wordcloud(1);
-        assert!(config.notify_group.contains(&1));
+        assert!(config.record_group.contains(&1));
         assert!(!config.wordcloud_enabled(1));
 
         config.enable_wordcloud(1);
         assert!(config.wordcloud_enabled(1));
-        assert_eq!(config.notify_group.iter().filter(|&&id| id == 1).count(), 1);
+        assert_eq!(config.record_group.iter().filter(|&&id| id == 1).count(), 1);
     }
 
     #[test]
@@ -150,7 +160,7 @@ mod tests {
     #[test]
     fn enable_recording_does_not_change_wordcloud_group() {
         let mut config = Config {
-            notify_group: vec![1],
+            record_group: vec![1],
             wordcloud_group: vec![1],
             wordcloud_background: super::default_wordcloud_background(),
         };
