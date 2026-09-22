@@ -199,15 +199,17 @@ impl Game {
 
     /// 游戏结束后的统一展示文本（胜/负），CLI 与 QQ 插件共用。
     ///
-    /// 严格模式用尽仍未收敛时如实告知剩余候选数，而非给出不确定的答案。
-    pub fn result_note(&self) -> Option<String> {
+    /// `meaning` 为答案释义，只在展示确定答案的分支追加；
+    /// 严格模式用尽仍未收敛时答案不确定，如实告知剩余候选数，不附释义。
+    pub fn result_note(&self, meaning: Option<&str>) -> Option<String> {
         if !self.is_over() {
             return None;
         }
         let answer = self.answer().to_ascii_uppercase();
+        let gloss = meaning.map(|m| format!("\n📖 {m}")).unwrap_or_default();
         if self.is_won() {
             Some(format!(
-                "🎉 恭喜猜中！答案是 {answer}，共用 {} 次",
+                "🎉 恭喜猜中！答案是 {answer}，共用 {} 次{gloss}",
                 self.guesses_count()
             ))
         } else if self.is_adversarial() && self.candidates_remaining() > 1 {
@@ -216,7 +218,7 @@ impl Game {
                 self.candidates_remaining()
             ))
         } else {
-            Some(format!("😞 次数用尽，答案是 {answer}"))
+            Some(format!("😞 次数用尽，答案是 {answer}{gloss}"))
         }
     }
 }
@@ -422,8 +424,28 @@ mod tests {
         assert!(game.is_won());
         assert_eq!(game.answer(), "crane");
         assert_eq!(
-            game.result_note().unwrap(),
+            game.result_note(None).unwrap(),
             "🎉 恭喜猜中！答案是 CRANE，共用 1 次"
+        );
+    }
+
+    #[test]
+    fn result_note_appends_meaning_when_answer_settled() {
+        let mut allowed: HashSet<String> =
+            ["crane", "xyzzy"].into_iter().map(str::to_owned).collect();
+        allowed.insert("crane".to_owned());
+        let mut game = Game::new("crane".to_owned());
+        for _ in 0..6 {
+            game.submit("xyzzy", &allowed).unwrap();
+        }
+        assert_eq!(
+            game.result_note(Some("n. 鹤, 起重机")).unwrap(),
+            "😞 次数用尽，答案是 CRANE\n📖 n. 鹤, 起重机"
+        );
+        assert_eq!(
+            game.result_note(None).unwrap(),
+            "😞 次数用尽，答案是 CRANE",
+            "无释义时保持原文"
         );
     }
 
@@ -437,7 +459,7 @@ mod tests {
             let _ = game.submit("abcde", &allowed).unwrap();
         }
         assert!(game.is_over());
-        let note = game.result_note().unwrap();
+        let note = game.result_note(None).unwrap();
         if !game.is_won() {
             assert!(note.contains("未收敛") || note.contains("答案是"), "{note}");
         }
@@ -447,8 +469,8 @@ mod tests {
     fn adversarial_result_note_requires_game_over() {
         let allowed = adversarial_allowed();
         let mut game = Game::new_adversarial(allowed.iter().cloned().collect());
-        assert_eq!(game.result_note(), None);
+        assert_eq!(game.result_note(None), None);
         game.submit("crane", &allowed).unwrap();
-        assert_eq!(game.result_note(), None, "未结束时无结果文本");
+        assert_eq!(game.result_note(None), None, "未结束时无结果文本");
     }
 }

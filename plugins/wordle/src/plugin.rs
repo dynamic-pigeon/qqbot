@@ -172,7 +172,9 @@ fn submit_guess(
     }
     session.last_active = Instant::now();
     let png = render_board_png(&session.game);
-    let note = session.game.result_note();
+    let note = session
+        .game
+        .result_note(words.meaning(session.game.answer()));
     Ok((png, note))
 }
 
@@ -243,7 +245,17 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect();
-        WordList { answers, allowed }
+        let meanings = [(
+            "crane".to_owned(),
+            "n. 鹤, 起重机；vt. 伸颈, 起重机起吊".to_owned(),
+        )]
+        .into_iter()
+        .collect();
+        WordList {
+            answers,
+            allowed,
+            meanings,
+        }
     }
 
     fn fresh_session(answer: &str) -> Session {
@@ -296,6 +308,7 @@ mod tests {
             note.contains("🎉") && note.contains("CRANE") && note.contains("2 次"),
             "{note}"
         );
+        assert!(note.contains("📖 n. 鹤"), "结束时附注应包含释义：{note}");
     }
 
     #[test]

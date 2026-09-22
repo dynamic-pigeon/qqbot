@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use tracing::info;
+
+use crate::meaning;
 
 /// 答案池（2315 词）：cfreshman 的 gist，官方 NYT 词表镜像。
 /// gist 不支持 jsDelivr 镜像，故无备源；失败时允许手动预置文件。
@@ -17,6 +20,9 @@ const ALLOWED_URL_FALLBACK: &str = "https://cdn.jsdelivr.net/gh/tabatkins/wordle
 const ANSWERS_FILE: &str = "answers.txt";
 const ALLOWED_FILE: &str = "allowed.txt";
 
+/// 可选的释义覆盖文件：不强制存在，用于给自定义词库配释义或改写内置释义。
+const MEANINGS_FILE: &str = "meanings.txt";
+
 /// 词库文件解析后的最小词数，低于此值视为文件损坏。
 const MIN_ANSWERS: usize = 1000;
 const MIN_ALLOWED: usize = 10_000;
@@ -24,11 +30,19 @@ const MIN_ALLOWED: usize = 10_000;
 /// 单次下载响应体上限，防止异常源返回超大内容。
 const MAX_DOWNLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
-/// 词库：`answers` 是答案池，`allowed` 是允许猜测的全集（含答案词）。
+/// 词库：`answers` 是答案池，`allowed` 是允许猜测的全集（含答案词），
+/// `meanings` 是词 → 中文释义（内置标准表，叠加本地覆盖文件）。
 #[derive(Debug)]
 pub struct WordList {
     pub answers: Vec<String>,
     pub allowed: HashSet<String>,
+    pub meanings: HashMap<String, String>,
+}
+
+impl WordList {
+    pub fn meaning(&self, word: &str) -> Option<&str> {
+        self.meanings.get(word).map(String::as_str)
+    }
 }
 
 /// 确保词库就绪：本地缓存缺失时按 URL 顺序尝试下载，成功写入缓存。
@@ -66,7 +80,24 @@ pub async fn load_or_download(data_dir: &Path) -> anyhow::Result<WordList> {
 
     // 允许猜测 = 全表 ∪ 答案池，兼容官方"答案在可猜池内"的规则。
     let allowed: HashSet<String> = allowed.into_iter().chain(answers.iter().cloned()).collect();
-    Ok(WordList { answers, allowed })
+    // 释义 = 内置标准表 ∪ 本地覆盖文件；自定义词库没有覆盖文件也不影响游戏。
+    let mut meanings = meaning::embedded();
+    if let Ok(content) = fs::read_to_string(word_dir.join(MEANINGS_FILE)) {
+        let overrides = meaning::parse(&content);
+        if !overrides.is_empty() {
+            info!(
+                "释义覆盖文件 {} 生效：{} 条",
+                MEANINGS_FILE,
+                overrides.len()
+            );
+        }
+        meanings.extend(overrides);
+    }
+    Ok(WordList {
+        answers,
+        allowed,
+        meanings,
+    })
 }
 
 /// 文件存在且非空则直接复用，否则按顺序尝试每个 URL 下载。
@@ -221,6 +252,29 @@ mod tests {
 
         let err = load_or_download(&dir).await.unwrap_err();
         assert!(err.to_string().contains("答案池过小"), "{err:#}");
+        remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn optional_meanings_file_overrides_embedded() {
+        let dir = tempfile_dir();
+        let word_dir = dir.join("wordle");
+        fs::create_dir_all(&word_dir).unwrap();
+        let answers: Vec<String> = (0..2000).map(fake_word).collect();
+        let allowed: Vec<String> = (0..12_000).map(fake_word).collect();
+        write_words(&word_dir, ANSWERS_FILE, &answers);
+        write_words(&word_dir, ALLOWED_FILE, &allowed);
+        fs::write(
+            word_dir.join(MEANINGS_FILE),
+            "crane\tn. 鹤（覆盖）\nzzzzz\tn. 自定义词",
+        )
+        .unwrap();
+
+        let list = load_or_download(&dir).await.unwrap();
+        // 内置表仍可用、覆盖文件改写同词条并补充新词
+        assert_eq!(list.meaning("crane"), Some("n. 鹤（覆盖）"));
+        assert_eq!(list.meaning("zzzzz"), Some("n. 自定义词"));
+        assert!(list.meaning("perky").is_some(), "未被覆盖的内置释义保留");
         remove_dir(&dir);
     }
 

@@ -4,6 +4,7 @@
 //! 插件适配层（`plugin` 模块）与 PNG 渲染（`render` 模块）仅在 `qq` feature 下编译。
 
 pub mod game;
+pub mod meaning;
 pub mod words;
 
 #[cfg(feature = "qq")]
