@@ -7,6 +7,8 @@ use utils::JsonStore;
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct StaticConfig {
     pub retention_days: u64,
+    /// 发言排行展示人数。
+    pub rank_top: usize,
     pub wordcloud_concurrency: usize,
     pub wordcloud: Vec<WordCloudSchedule>,
 }
@@ -23,6 +25,7 @@ impl Default for StaticConfig {
     fn default() -> Self {
         Self {
             retention_days: 8,
+            rank_top: 10,
             wordcloud_concurrency: 1,
             wordcloud: vec![
                 WordCloudSchedule {
@@ -37,6 +40,13 @@ impl Default for StaticConfig {
                 },
             ],
         }
+    }
+}
+
+impl StaticConfig {
+    /// SQL LIMIT 需要 i64；0 会查出空榜，至少取 1。
+    pub(crate) fn rank_top(&self) -> i64 {
+        i64::try_from(self.rank_top.max(1)).unwrap_or(i64::MAX)
     }
 }
 
@@ -110,7 +120,20 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, StaticConfig};
+
+    #[test]
+    fn missing_rank_top_defaults_to_ten() {
+        let parsed: StaticConfig = kovi::toml::from_str("").unwrap();
+        assert_eq!(parsed.rank_top, 10);
+        assert_eq!(parsed.rank_top(), 10);
+    }
+
+    #[test]
+    fn rank_top_zero_becomes_one() {
+        let parsed: StaticConfig = kovi::toml::from_str("rank_top = 0").unwrap();
+        assert_eq!(parsed.rank_top(), 1);
+    }
 
     #[test]
     fn notify_group_alias_still_loads() {
