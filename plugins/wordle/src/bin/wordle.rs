@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(note) = game.result_note() {
+    if let Some(note) = game.result_note(word_list.meaning(game.answer())) {
         println!("\n{note}");
     }
     Ok(())
