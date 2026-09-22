@@ -78,8 +78,10 @@
             white-space: nowrap;
         }
 
+        /* 固定列宽，超长群昵称只在群友列省略，消息数始终完整可见。 */
         table {
             width: 100%;
+            table-layout: fixed;
             border-collapse: collapse;
         }
 
@@ -109,8 +111,19 @@
             background: #f9fafb;
         }
 
+        col.col-rank {
+            width: 56px;
+        }
+
+        col.col-percent {
+            width: 118px;
+        }
+
+        col.col-count {
+            width: 92px;
+        }
+
         .rank-cell {
-            width: 32px;
             font-weight: 600;
             color: #6b7280;
             font-variant-numeric: tabular-nums;
@@ -136,6 +149,7 @@
             align-items: center;
             gap: 10px;
             min-width: 0;
+            max-width: 100%;
         }
 
         .user-cell img {
@@ -147,14 +161,20 @@
         }
 
         .user-cell .name {
+            flex: 1;
+            min-width: 0;
             font-weight: 500;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
 
+        td:nth-child(2) {
+            overflow: hidden;
+        }
+
         .percent-cell {
-            width: 118px;
+            overflow: hidden;
         }
 
         .percent-inner {
@@ -187,11 +207,11 @@
         }
 
         .count-cell {
-            width: 84px;
             font-weight: 700;
             font-size: 15px;
             color: #4a6ee0;
             font-variant-numeric: tabular-nums;
+            white-space: nowrap;
         }
     </style>
 </head>
@@ -207,6 +227,12 @@
             <div class="time-label">{{ time }}</div>
         </div>
         <table>
+            <colgroup>
+                <col class="col-rank" />
+                <col class="col-user" />
+                <col class="col-percent" />
+                <col class="col-count" />
+            </colgroup>
             <thead>
                 <tr>
                     <th>#</th>
