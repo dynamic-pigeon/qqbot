@@ -575,7 +575,7 @@ impl IsolatedCwd {
         std::fs::write(
             root.join("data/msg_rank/config.json"),
             format!(
-                r##"{{"notify_group":[{GROUP}],"wordcloud_group":[{GROUP}],"tencent":null,"wordcloud_background":"#ffffff"}}"##
+                r##"{{"record_group":[{GROUP}],"wordcloud_group":[{GROUP}],"tencent":null,"wordcloud_background":"#ffffff"}}"##
             ),
         )
         .unwrap();

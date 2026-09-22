@@ -266,7 +266,7 @@ async fn send_word_cloud(
 
 async fn make_word_cloud(
     path: &Path,
-    notify_group: i64,
+    group_id: i64,
     duration: chrono::Duration,
 ) -> Result<Vec<u8>> {
     // 生成全局串行，排队的任务需等待前一个个完成，超时时间需覆盖最坏等待。
@@ -277,7 +277,7 @@ async fn make_word_cloud(
     let start_time = end_time - duration;
 
     let messages = crate::db::select_text_from_time_range(
-        notify_group,
+        group_id,
         start_time.timestamp(),
         end_time.timestamp(),
         MAX_WORDCLOUD_INPUT_BYTES,
