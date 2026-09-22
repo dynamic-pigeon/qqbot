@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
 use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
-use utils::command::CommandRouter;
+use utils::command::{
+    Command, CommandContext, CommandError, CommandResult, CommandRouter, MessageScope, Permission,
+};
 
 mod config;
 mod db;
@@ -37,20 +39,78 @@ async fn main() {
     plugin::drop(|| async move { db::flush_on_shutdown().await });
 
     CommandRouter::new("msg_rank", Arc::clone(&bot))
+        .register(record_command())
         .register(word_cloud::wordcloud_command(Arc::clone(&path)))
         .register(msg_rank::rank_command())
         .install()
-        .expect("注册发言排行与词云命令失败");
+        .expect("注册发言排行、消息采集与词云命令失败");
 
     plugin::on_group_msg(add_msg);
     word_cloud::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
+}
+
+fn record_command() -> Command {
+    Command::new("/消息采集")
+        .description("启用或停用本群消息采集")
+        .usage("/消息采集 <enable|disable|status>")
+        .scope(MessageScope::Group)
+        .permission(Permission::BotAdmin)
+        .subcommand(
+            Command::new("enable")
+                .description("启用本群消息采集")
+                .usage("/消息采集 enable")
+                .sync_handler(record_enable),
+        )
+        .subcommand(
+            Command::new("disable")
+                .description("停用本群消息采集")
+                .usage("/消息采集 disable")
+                .sync_handler(record_disable),
+        )
+        .subcommand(
+            Command::new("status")
+                .description("查看本群消息采集状态")
+                .usage("/消息采集 status")
+                .sync_handler(record_status),
+        )
+}
+
+fn record_enable(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.group_id()?;
+    config::CONFIG
+        .modify(|config| config.enable_recording(group_id))
+        .map_err(CommandError::internal)?;
+    ctx.reply("消息采集已启用");
+    Ok(())
+}
+
+fn record_disable(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.group_id()?;
+    config::CONFIG
+        .modify(|config| config.disable_recording(group_id))
+        .map_err(CommandError::internal)?;
+    ctx.reply("消息采集已停用");
+    Ok(())
+}
+
+fn record_status(ctx: CommandContext) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.group_id()?;
+    ctx.reply(if config::CONFIG.get().recording_enabled(group_id) {
+        "消息采集已启用"
+    } else {
+        "消息采集未启用"
+    });
+    Ok(())
 }
 
 async fn add_msg(event: Arc<GroupMsgEvent>) {
     let group = event.group_id;
     let user = event.user_id;
 
-    if !config::CONFIG.get().notify_group.contains(&group) {
+    if !config::CONFIG.get().recording_enabled(group) {
         return;
     }
 
@@ -141,10 +201,24 @@ async fn get_text(msg: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::truncate_utf8;
+    use utils::command::{Permission, ResolveOutcome};
 
     #[test]
     fn truncate_utf8_never_splits_a_character() {
         assert_eq!(truncate_utf8("ab中文".to_string(), 5), "ab中");
         assert_eq!(truncate_utf8("short".to_string(), 10), "short");
+    }
+
+    #[test]
+    fn record_commands_are_admin_group_commands() {
+        let tree = utils::command::CommandTree::new(vec![super::record_command()]).unwrap();
+        for name in ["enable", "disable", "status"] {
+            let ResolveOutcome::Matched(command) = tree.resolve(&format!("/消息采集 {name}"))
+            else {
+                panic!("expected /消息采集 {name} to resolve");
+            };
+            assert_eq!(command.permission(), Permission::BotAdmin);
+            assert_eq!(command.scope(), utils::command::MessageScope::Group);
+        }
     }
 }

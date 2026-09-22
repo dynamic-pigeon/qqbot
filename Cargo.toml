@@ -1,6 +1,6 @@
 [package]
 name = "bot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["dynamic-pigeon <3040313336@qq.com>"]
 license = "MIT"
@@ -23,7 +23,7 @@ kovi.workspace = true
 kovi-onebot.workspace = true
 kovi-plugin-cmd = { version = "0.4.0", features = ["onebot"] }
 markdown = { version = "0.1.0", path = "plugins/markdown" }
-msg_rank = { version = "0.1.0", path = "plugins/msg_rank" }
+msg_rank = { version = "0.2.0", path = "plugins/msg_rank" }
 utils.workspace = true
 wordle = { version = "0.1.0", path = "plugins/wordle", features = ["qq"] }
 yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }

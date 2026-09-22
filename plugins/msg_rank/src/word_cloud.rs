@@ -123,7 +123,7 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
             let bot = &bot;
             if mark_cron_fire(&last_fire_ts, chrono::Local::now().timestamp()) {
                 let config = CONFIG.get();
-                for &group_id in &config.notify_group {
+                for &group_id in &config.wordcloud_group {
                     let bot = Arc::clone(bot);
                     let path = Arc::clone(path);
                     let title = title.clone();
@@ -164,13 +164,13 @@ pub(crate) fn wordcloud_command(path: Arc<PathBuf>) -> Command {
         )
         .subcommand(
             Command::new("enable")
-                .description("启用本群词云")
+                .description("启用本群词云（同时开始采集）")
                 .usage("/wordcloud enable")
                 .sync_handler(wordcloud_enable),
         )
         .subcommand(
             Command::new("disable")
-                .description("停用本群词云")
+                .description("停用本群定时词云（消息采集继续）")
                 .usage("/wordcloud disable")
                 .sync_handler(wordcloud_disable),
         )
@@ -197,11 +197,7 @@ fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     CONFIG
-        .modify(|config| {
-            if !config.notify_group.contains(&group_id) {
-                config.notify_group.push(group_id);
-            }
-        })
+        .modify(|config| config.enable_wordcloud(group_id))
         .map_err(CommandError::internal)?;
     ctx.reply("启用成功");
     Ok(())
@@ -211,9 +207,7 @@ fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
     CONFIG
-        .modify(|config| {
-            config.notify_group.retain(|&id| id != group_id);
-        })
+        .modify(|config| config.disable_wordcloud(group_id))
         .map_err(CommandError::internal)?;
     ctx.reply("停用成功");
     Ok(())
@@ -222,7 +216,7 @@ fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
 fn wordcloud_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    let enabled = CONFIG.get().notify_group.contains(&group_id);
+    let enabled = CONFIG.get().wordcloud_enabled(group_id);
     ctx.reply(if enabled {
         "词云功能已启用"
     } else {
