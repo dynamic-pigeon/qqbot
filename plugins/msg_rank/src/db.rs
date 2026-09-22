@@ -317,6 +317,24 @@ SELECT user_id, COUNT(*) as count FROM MSG
         .collect())
 }
 
+/// 时间范围内的消息总数，用作排行头部的总计与占比分母。
+pub(crate) async fn msg_count_total_with_time_range(
+    group_id: i64,
+    start_time: i64,
+    end_time: i64,
+) -> Result<u32> {
+    let conn = get_pool()?;
+    let (total,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM MSG WHERE group_id = ? AND timestamp BETWEEN ? AND ?")
+            .bind(group_id)
+            .bind(start_time)
+            .bind(end_time)
+            .fetch_one(conn)
+            .await?;
+
+    Ok(total.max(0) as u32)
+}
+
 pub(crate) async fn select_text_from_time_range(
     group_id: i64,
     start_time: i64,
