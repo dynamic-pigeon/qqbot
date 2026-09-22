@@ -19,25 +19,26 @@
             -webkit-font-smoothing: antialiased;
         }
 
-        /* 截图按 .card 元素截取，外阴影会被裁掉，用细边框提供轮廓。 */
+        /* 截图按 .card 矩形裁切，直角边框才能和图片边缘对齐。 */
         .card {
-            width: 520px;
+            width: 580px;
             background: #fff;
             border: 1px solid #e5e7eb;
-            border-radius: 16px;
             overflow: hidden;
         }
 
+        /* 左右列等宽，标题相对卡片水平居中，不被左侧统计芯片撑偏。 */
         .header {
-            display: flex;
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
             align-items: center;
-            justify-content: space-between;
             gap: 12px;
             padding: 14px 18px;
             border-bottom: 1px solid #e5e7eb;
         }
 
         .stat-chip {
+            justify-self: start;
             background: #f3f4f6;
             border-radius: 8px;
             padding: 4px 10px;
@@ -54,7 +55,6 @@
         }
 
         .title {
-            flex: 1;
             min-width: 0;
             text-align: center;
         }
@@ -73,6 +73,7 @@
         }
 
         .time-label {
+            justify-self: end;
             font-size: 11px;
             color: #9ca3af;
             white-space: nowrap;
