@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "bot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bilibili",
  "dotenvy",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "msg_rank"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "askama",
