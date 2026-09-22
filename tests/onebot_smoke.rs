@@ -57,6 +57,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     assert_contains(&server, "/dynamic rm 1", "已取消").await;
     assert_contains(&server, "图库", "本群还没有图库").await;
     assert_contains(&server, "来只 猫", "「猫」里还没有图").await;
+    assert_contains(&server, "/消息采集 status", "消息采集已启用").await;
     assert_contains(&server, "/wordcloud status", "词云功能已启用").await;
     assert_contains(&server, "/wordcloud disable", "停用成功").await;
     assert_contains(&server, "/wordcloud status", "词云功能未启用").await;
@@ -574,7 +575,7 @@ impl IsolatedCwd {
         std::fs::write(
             root.join("data/msg_rank/config.json"),
             format!(
-                r##"{{"notify_group":[{GROUP}],"tencent":null,"wordcloud_background":"#ffffff"}}"##
+                r##"{{"notify_group":[{GROUP}],"wordcloud_group":[{GROUP}],"tencent":null,"wordcloud_background":"#ffffff"}}"##
             ),
         )
         .unwrap();
