@@ -20,6 +20,8 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CONCURRENT_SCREENSHOTS: usize = 2;
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SCREENSHOT_PIXELS: f64 = 16_000_000.0;
+/// 按 2 倍设备像素截图，手机和 Retina 上看文字更清楚。
+const SCREENSHOT_SCALE: f64 = 2.0;
 
 /// 浏览器空闲超过此时间后自动关闭，释放内存和 CPU。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -133,13 +135,13 @@ impl ScreenshotManager {
                     .map_err(|e| anyhow::anyhow!("找不到元素 {}: {}", selector, e))?
                     .bounding_box()
                     .await?;
-                validate_dimensions(bounding_box.width, bounding_box.height)?;
+                validate_dimensions(bounding_box.width, bounding_box.height, SCREENSHOT_SCALE)?;
                 let viewport = Viewport {
                     x: bounding_box.x,
                     y: bounding_box.y,
                     width: bounding_box.width,
                     height: bounding_box.height,
-                    scale: 1.0,
+                    scale: SCREENSHOT_SCALE,
                 };
                 page.screenshot(
                     ScreenshotParams::builder()
@@ -159,11 +161,19 @@ impl ScreenshotManager {
                 if dimensions.len() != 2 {
                     anyhow::bail!("无法获取页面尺寸");
                 }
-                validate_dimensions(dimensions[0], dimensions[1])?;
+                validate_dimensions(dimensions[0], dimensions[1], SCREENSHOT_SCALE)?;
+                let viewport = Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    scale: SCREENSHOT_SCALE,
+                };
                 page.screenshot(
                     ScreenshotParams::builder()
                         .format(CaptureScreenshotFormat::Png)
-                        .full_page(true)
+                        .clip(viewport)
+                        .capture_beyond_viewport(true)
                         .build(),
                 )
                 .await?
@@ -214,12 +224,15 @@ async fn wait_for_selector(page: &chromiumoxide::Page, selector: &str) -> Result
     })
 }
 
-fn validate_dimensions(width: f64, height: f64) -> Result<()> {
+fn validate_dimensions(width: f64, height: f64, scale: f64) -> Result<()> {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         anyhow::bail!("无效的截图尺寸: {width}x{height}");
     }
-    if width * height > MAX_SCREENSHOT_PIXELS {
-        anyhow::bail!("截图像素面积超过上限: {width}x{height}");
+    if !scale.is_finite() || scale <= 0.0 {
+        anyhow::bail!("无效的截图缩放: {scale}");
+    }
+    if width * scale * height * scale > MAX_SCREENSHOT_PIXELS {
+        anyhow::bail!("截图像素面积超过上限: {width}x{height}@{scale}x");
     }
     Ok(())
 }
@@ -230,9 +243,10 @@ mod tests {
 
     #[test]
     fn screenshot_dimensions_have_a_hard_limit() {
-        assert!(validate_dimensions(1920.0, 1080.0).is_ok());
-        assert!(validate_dimensions(10_000.0, 10_000.0).is_err());
-        assert!(validate_dimensions(f64::NAN, 100.0).is_err());
-        assert!(validate_dimensions(0.0, 100.0).is_err());
+        assert!(validate_dimensions(1920.0, 1080.0, SCREENSHOT_SCALE).is_ok());
+        assert!(validate_dimensions(10_000.0, 10_000.0, 1.0).is_err());
+        assert!(validate_dimensions(f64::NAN, 100.0, SCREENSHOT_SCALE).is_err());
+        assert!(validate_dimensions(0.0, 100.0, SCREENSHOT_SCALE).is_err());
+        assert!(validate_dimensions(100.0, 100.0, 0.0).is_err());
     }
 }
