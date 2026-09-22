@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>每日发言排行 - {{ date }}</title>
+    <title>{{ title }} - {{ date }}</title>
     <style>
         * {
             box-sizing: border-box;
@@ -13,140 +13,185 @@
         }
 
         body {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-family: "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-            padding: 24px;
+            background: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+                "Microsoft YaHei", "Segoe UI", sans-serif;
+            -webkit-font-smoothing: antialiased;
         }
 
+        /* 截图按 .card 元素截取，外阴影会被裁掉，用细边框提供轮廓。 */
         .card {
-            background: rgba(255, 255, 255, 0.07);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 20px;
-            width: 480px;
-            padding: 32px 28px;
-            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+            width: 520px;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 16px;
+            overflow: hidden;
         }
 
         .header {
-            text-align: center;
-            margin-bottom: 28px;
-        }
-
-        .header h1 {
-            color: #fff;
-            font-size: 22px;
-            font-weight: 700;
-            letter-spacing: 2px;
-        }
-
-        .header .date {
-            color: rgba(255, 255, 255, 0.5);
-            font-size: 13px;
-            margin-top: 6px;
-        }
-
-        .rank-item {
             display: flex;
             align-items: center;
-            gap: 14px;
-            background: rgba(255, 255, 255, 0.06);
-            border-radius: 14px;
-            padding: 14px 16px;
-            margin-bottom: 12px;
-            position: relative;
-            transition: background 0.2s;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid #e5e7eb;
         }
 
-        .rank-item:last-child {
-            margin-bottom: 0;
+        .stat-chip {
+            background: #f3f4f6;
+            border-radius: 8px;
+            padding: 4px 10px;
+            font-size: 12px;
+            color: #6b7280;
+            white-space: nowrap;
         }
 
-        .rank-1 {
-            background: rgba(255, 215, 0, 0.10);
-            border: 1px solid rgba(255, 215, 0, 0.25);
+        .stat-chip b {
+            color: #111827;
+            font-size: 14px;
+            margin: 0 3px;
+            font-variant-numeric: tabular-nums;
         }
 
-        .rank-2 {
-            background: rgba(192, 192, 192, 0.08);
-            border: 1px solid rgba(192, 192, 192, 0.2);
-        }
-
-        .rank-3 {
-            background: rgba(205, 127, 50, 0.08);
-            border: 1px solid rgba(205, 127, 50, 0.2);
-        }
-
-        .rank-badge {
-            font-size: 26px;
-            width: 32px;
-            text-align: center;
-            flex-shrink: 0;
-            line-height: 1;
-        }
-
-        .avatar-wrap {
-            flex-shrink: 0;
-        }
-
-        .avatar {
-            width: 52px;
-            height: 52px;
-            border-radius: 50%;
-            object-fit: cover;
-            border: 2px solid rgba(255, 255, 255, 0.2);
-            display: block;
-        }
-
-        .user-info {
+        .title {
             flex: 1;
             min-width: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
+            text-align: center;
         }
 
-        .nickname {
-            color: #fff;
-            font-size: 15px;
+        .title h1 {
+            font-size: 17px;
+            font-weight: 700;
+            color: #111827;
+            letter-spacing: 1px;
+        }
+
+        .title .date {
+            margin-top: 2px;
+            font-size: 11px;
+            color: #9ca3af;
+        }
+
+        .time-label {
+            font-size: 11px;
+            color: #9ca3af;
+            white-space: nowrap;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            padding: 9px 18px;
+            font-size: 11px;
+            font-weight: 500;
+            color: #9ca3af;
+            text-align: left;
+            border-bottom: 1px solid #e5e7eb;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 9px 18px;
+            font-size: 14px;
+            color: #111827;
+            vertical-align: middle;
+        }
+
+        th.right,
+        td.right {
+            text-align: right;
+        }
+
+        tbody tr:nth-child(even) {
+            background: #f9fafb;
+        }
+
+        .rank-cell {
+            width: 32px;
             font-weight: 600;
+            color: #6b7280;
+            font-variant-numeric: tabular-nums;
+        }
+
+        tr.r1 .rank-cell {
+            color: #f59e0b;
+            font-weight: 700;
+        }
+
+        tr.r2 .rank-cell {
+            color: #9ca3af;
+            font-weight: 700;
+        }
+
+        tr.r3 .rank-cell {
+            color: #a16207;
+            font-weight: 700;
+        }
+
+        .user-cell {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+
+        .user-cell img {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            object-fit: cover;
+            flex-shrink: 0;
+        }
+
+        .user-cell .name {
+            font-weight: 500;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
 
-        .count {
-            color: rgba(255, 255, 255, 0.55);
-            font-size: 12px;
+        .percent-cell {
+            width: 118px;
         }
 
-        .bar-wrap {
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
-            border-radius: 0 0 14px 14px;
-            background: rgba(255, 255, 255, 0.05);
+        .percent-inner {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .track {
+            flex: 1;
+            height: 6px;
+            border-radius: 3px;
+            background: #eef0f4;
             overflow: hidden;
         }
 
-        .bar {
+        .fill {
             height: 100%;
-            border-radius: 0 0 14px 14px;
-            opacity: 0.7;
-            transition: width 0.5s ease;
+            min-width: 4px;
+            border-radius: 3px;
+            background: linear-gradient(90deg, #4a6ee0, #7c9df2);
         }
 
-        .footer {
-            text-align: center;
-            color: rgba(255, 255, 255, 0.3);
-            font-size: 11px;
-            margin-top: 20px;
+        .pct {
+            width: 36px;
+            font-size: 12px;
+            color: #6b7280;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+        }
+
+        .count-cell {
+            width: 84px;
+            font-weight: 700;
+            font-size: 15px;
+            color: #4a6ee0;
+            font-variant-numeric: tabular-nums;
         }
     </style>
 </head>
@@ -154,25 +199,45 @@
 <body>
     <div class="card">
         <div class="header">
-            <h1>🏆 每日发言排行</h1>
-            <div class="date">{{ date }}</div>
+            <div class="stat-chip">{{ period }}总计<b>{{ total }}</b>条</div>
+            <div class="title">
+                <h1>{{ title }}</h1>
+                <div class="date">{{ date }}</div>
+            </div>
+            <div class="time-label">{{ time }}</div>
         </div>
-        {% for item in items %}
-        <div class="rank-item rank-{{ item.rank }}">
-            <div class="rank-badge" style="color:{{ item.medal_color }};">{{ item.medal }}</div>
-            <div class="avatar-wrap">
-                <img class="avatar" src="{{ item.avatar_src }}" alt="avatar" />
-            </div>
-            <div class="user-info">
-                <span class="nickname">{{ item.nickname }}</span>
-                <span class="count">{{ item.count }} 条消息</span>
-            </div>
-            <div class="bar-wrap">
-                <div class="bar" style="width:{{ item.bar_pct }}%; background:{{ item.medal_color }};"></div>
-            </div>
-        </div>
-        {% endfor %}
-        <div class="footer">Top 5 · 数据截至今日</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>群友</th>
+                    <th class="right">占比</th>
+                    <th class="right">消息数</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in items %}
+                <tr class="r{{ item.rank }}">
+                    <td class="rank-cell">{{ item.rank }}</td>
+                    <td>
+                        <div class="user-cell">
+                            <img src="{{ item.avatar_src }}" alt="" />
+                            <span class="name">{{ item.nickname }}</span>
+                        </div>
+                    </td>
+                    <td class="percent-cell">
+                        <div class="percent-inner">
+                            <div class="track">
+                                <div class="fill" style="width: {{ item.percent }}%;"></div>
+                            </div>
+                            <span class="pct">{{ item.percent }}%</span>
+                        </div>
+                    </td>
+                    <td class="count-cell right">{{ item.count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 </body>
 

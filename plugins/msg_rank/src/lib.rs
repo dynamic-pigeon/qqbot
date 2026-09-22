@@ -38,7 +38,7 @@ async fn main() {
 
     CommandRouter::new("msg_rank", Arc::clone(&bot))
         .register(word_cloud::wordcloud_command(Arc::clone(&path)))
-        .register(msg_rank::daily_rank_command())
+        .register(msg_rank::rank_command())
         .install()
         .expect("注册发言排行与词云命令失败");
 

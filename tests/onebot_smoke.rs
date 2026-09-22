@@ -64,7 +64,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     assert_contains(&server, "/wordcloud status", "词云功能已启用").await;
     assert_contains(&server, "/查卡", "缺少参数 `卡片名称`").await;
     assert_contains(&server, "!md", "缺少参数 `Markdown 内容`").await;
-    let rank = server.ask("#今日发言排行", SLOW).await;
+    let rank = server.ask("/今日B话榜", SLOW).await;
     assert!(
         rank.has_image || rank.text.contains("命令执行失败") || rank.text.contains("刚跑完"),
         "排行不应挂死: {rank:?}"
