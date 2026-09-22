@@ -33,7 +33,7 @@ Unix 上会把 `.env`、`kovi.conf.toml`、`config.toml`、插件 `config.json`�
 - 图片 OCR 每条最多 3 张，需在 `[ocr]` 填写腾讯云密钥，否则跳过。
 - 中文词云字体：`data/msg_rank/font.otf`；没有则用 wordcloud-rs 内嵌英文字体。可选遮罩同目录 `mask.png` / `mask.jpg`。
 - 图库容量、单图上限和抽图限流见 `[image_lib]`；数据在 `data/image_lib/`。
-- Wordle 词库首次使用时下载到 `data/wordle/`，也可预放 `answers.txt` / `allowed.txt`。
+- Wordle 词库首次使用时下载到 `data/wordle/`，也可预放 `answers.txt` / `allowed.txt`。结束时展示答案的中文释义（2315 个标准答案词已内置）；自定义词库可放可选的 `meanings.txt`（每行 `word<TAB>释义`）覆盖或补充释义。
 
 ## 开发检查
 
