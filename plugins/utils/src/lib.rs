@@ -20,13 +20,13 @@ pub mod safe_url;
 
 pub use bounded_pool::BoundedPool;
 pub use fs::restrict_mode_0600;
-pub use hash::{base64_image, hex_encode, sha256_hex};
+pub use hash::{base64_image, hex_encode, sha256_hex, sha256_hex_file};
 pub use http::http_client;
 pub use json_store::JsonStore;
 pub use rate_limit::{RateLimitHit, RateLimiter};
 pub use resource_manager::{ManagedResource, ResourceManager};
 pub use safe_url::{
-    PRIVATE_NETWORK_PROTECTION_ENV, QQ_IMAGE_HOSTS, download_image_limited,
+    PRIVATE_NETWORK_PROTECTION_ENV, QQ_IMAGE_HOSTS, download_image_limited, download_image_to_file,
     https_image_url_from_data, is_public_ip, private_network_protection_enabled,
     read_response_limited, validate_image_url, validate_image_url_async,
     validate_image_url_async_with_options, validate_image_url_with_options,

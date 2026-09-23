@@ -14,6 +14,7 @@
 use std::{
     env,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
     sync::LazyLock,
     time::Duration,
 };
@@ -189,11 +190,59 @@ pub async fn download_image_limited(
     max_bytes: usize,
     request_timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let protect_private_network = private_network_protection_enabled();
-    validate_image_url_with_options(url, allowed_hosts, protect_private_network)?;
+    let response = send_validated_image_request(url, allowed_hosts, request_timeout).await?;
+    read_response_limited(response, max_bytes).await
+}
+
+/// 与 [`download_image_limited`] 相同的校验与限速，但响应体流式写入 `dest`，
+/// 不在内存中聚合；超过 `max_bytes` 时中止并删除半成品文件。
+pub async fn download_image_to_file(
+    url: &str,
+    allowed_hosts: &[&str],
+    max_bytes: usize,
+    request_timeout: Duration,
+    dest: &Path,
+) -> Result<()> {
+    let response = send_validated_image_request(url, allowed_hosts, request_timeout).await?;
     if max_bytes == 0 {
         return Err(anyhow::anyhow!("图片大小上限必须大于 0"));
     }
+    if let Some(length) = response.content_length()
+        && length > max_bytes as u64
+    {
+        return Err(anyhow::anyhow!(
+            "响应超过大小上限: {length} > {max_bytes} bytes"
+        ));
+    }
+
+    let write = async {
+        let mut file = kovi::tokio::fs::File::create(dest).await?;
+        let mut written: usize = 0;
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await? {
+            written += chunk.len();
+            if written > max_bytes {
+                anyhow::bail!("响应超过大小上限: > {max_bytes} bytes");
+            }
+            kovi::tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        }
+        file.sync_all().await?;
+        Ok(())
+    }
+    .await;
+    if write.is_err() {
+        let _ = kovi::tokio::fs::remove_file(dest).await;
+    }
+    write
+}
+
+async fn send_validated_image_request(
+    url: &str,
+    allowed_hosts: &[&str],
+    request_timeout: Duration,
+) -> Result<reqwest::Response> {
+    let protect_private_network = private_network_protection_enabled();
+    validate_image_url_with_options(url, allowed_hosts, protect_private_network)?;
 
     let parsed = reqwest::Url::parse(url)?;
 
@@ -222,8 +271,7 @@ pub async fn download_image_limited(
             return Err(anyhow::anyhow!("响应不是图片: {content_type}"));
         }
     }
-
-    read_response_limited(response, max_bytes).await
+    Ok(response)
 }
 
 /// 流式读取 HTTP 响应，并在响应体超过 `max_bytes` 时立即中止。
