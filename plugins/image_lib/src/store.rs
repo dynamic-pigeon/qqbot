@@ -1,10 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use kovi::tokio::sync::{Mutex, mpsc};
@@ -15,7 +12,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
-use utils::sha256_hex;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -57,6 +53,14 @@ impl From<sqlx::Error> for StoreError {
 pub struct AddResult {
     pub added: usize,
     pub skipped_dup: usize,
+}
+
+/// 已下载到 blobs 目录旁、等待入库的图片：内容哈希、字节数与临时文件路径。
+#[derive(Debug, Clone)]
+pub struct StagedImage {
+    pub hash: String,
+    pub size: u64,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +125,7 @@ impl Store {
         self.root.join(group_id.to_string())
     }
 
-    fn blobs_dir(&self, group_id: i64) -> PathBuf {
+    pub(crate) fn blobs_dir(&self, group_id: i64) -> PathBuf {
         self.group_dir(group_id).join("blobs")
     }
 
@@ -174,70 +178,72 @@ impl Store {
         &self,
         group_id: i64,
         name: &str,
-        images: Vec<Vec<u8>>,
+        images: Vec<StagedImage>,
     ) -> Result<AddResult, StoreError> {
         let blobs = self.blobs_dir(group_id);
         let max_group_bytes = self.max_group_bytes;
-        self.with_group(group_id, |pool| {
-            let images = &images;
-            async move {
-                kovi::tokio::fs::create_dir_all(&blobs)
-                    .await
-                    .context("创建图片目录失败")?;
-                let library = resolve_library(&pool, name).await?;
-                let existing = library_hashes(&pool, &library).await?;
+        let result = self
+            .with_group(group_id, |pool| {
+                let images = &images;
+                async move {
+                    let library = resolve_library(&pool, name).await?;
+                    let existing = library_hashes(&pool, &library).await?;
 
-                let mut added_hashes = HashSet::new();
-                let mut to_insert = Vec::new();
-                let mut skipped_dup = 0usize;
+                    let mut added_hashes = HashSet::new();
+                    let mut to_insert = Vec::new();
+                    let mut skipped_dup = 0usize;
 
-                for bytes in images {
-                    if bytes.is_empty() {
-                        return Err(StoreError::Other(anyhow::anyhow!("图片为空")));
+                    for image in images {
+                        if existing.contains(&image.hash)
+                            || !added_hashes.insert(image.hash.clone())
+                        {
+                            skipped_dup += 1;
+                            continue;
+                        }
+                        to_insert.push(image);
                     }
-                    let hash = sha256_hex(bytes);
-                    if existing.contains(&hash) || !added_hashes.insert(hash.clone()) {
-                        skipped_dup += 1;
-                        continue;
-                    }
-                    to_insert.push((hash, bytes.as_slice()));
-                }
 
-                let additional = additional_unique_bytes(&pool, &to_insert).await?;
-                let used = unique_image_bytes(&pool).await?;
-                if used.saturating_add(additional) > max_group_bytes {
-                    return Err(StoreError::QuotaExceeded {
-                        used,
-                        additional,
-                        limit: max_group_bytes,
-                    });
-                }
-
-                let mut created = Vec::new();
-                for (hash, bytes) in &to_insert {
-                    let path = blob_file(&blobs, hash)?;
-                    if kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                        continue;
+                    let additional = additional_unique_bytes(&pool, &to_insert).await?;
+                    let used = unique_image_bytes(&pool).await?;
+                    if used.saturating_add(additional) > max_group_bytes {
+                        return Err(StoreError::QuotaExceeded {
+                            used,
+                            additional,
+                            limit: max_group_bytes,
+                        });
                     }
-                    if let Err(error) = write_blob_atomic(&path, bytes).await {
+
+                    let mut created = Vec::new();
+                    for image in &to_insert {
+                        let path = blob_file(&blobs, &image.hash)?;
+                        if kovi::tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                            continue;
+                        }
+                        if let Err(error) = promote_staged(&image.path, &path).await {
+                            let _ = remove_unindexed(&pool, &created).await;
+                            return Err(error.into());
+                        }
+                        created.push((image.hash.clone(), path));
+                    }
+
+                    if let Err(error) = insert_images(&pool, &library, &to_insert).await {
                         let _ = remove_unindexed(&pool, &created).await;
-                        return Err(error.into());
+                        return Err(error);
                     }
-                    created.push((hash.clone(), path));
-                }
 
-                if let Err(error) = insert_images(&pool, &library, &to_insert).await {
-                    let _ = remove_unindexed(&pool, &created).await;
-                    return Err(error);
+                    Ok(AddResult {
+                        added: to_insert.len(),
+                        skipped_dup,
+                    })
                 }
-
-                Ok(AddResult {
-                    added: to_insert.len(),
-                    skipped_dup,
-                })
-            }
-        })
-        .await
+            })
+            .await;
+        // staged 文件被 promote 后原路径已不存在，剩余的（重复跳过、
+        // blob 复用、出错回滚）在此统一清理。
+        for image in &images {
+            let _ = kovi::tokio::fs::remove_file(&image.path).await;
+        }
+        result
     }
 
     pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
@@ -813,7 +819,7 @@ async fn unique_image_bytes(pool: &SqlitePool) -> Result<u64, StoreError> {
 
 async fn additional_unique_bytes(
     pool: &SqlitePool,
-    to_insert: &[(String, &[u8])],
+    to_insert: &[&StagedImage],
 ) -> Result<u64, StoreError> {
     if to_insert.is_empty() {
         return Ok(0);
@@ -822,8 +828,8 @@ async fn additional_unique_bytes(
         sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT DISTINCT hash FROM images WHERE hash IN (");
     {
         let mut separated = builder.separated(", ");
-        for (hash, _) in to_insert {
-            separated.push_bind(hash);
+        for image in to_insert {
+            separated.push_bind(&image.hash);
         }
     }
     builder.push(")");
@@ -835,8 +841,8 @@ async fn additional_unique_bytes(
         .collect();
     Ok(to_insert
         .iter()
-        .filter(|(hash, _)| !present.contains(hash))
-        .map(|(_, bytes)| bytes.len() as u64)
+        .filter(|image| !present.contains(&image.hash))
+        .map(|image| image.size)
         .sum())
 }
 
@@ -918,7 +924,7 @@ async fn library_fingerprints(
 async fn insert_images(
     pool: &SqlitePool,
     library: &str,
-    images: &[(String, &[u8])],
+    images: &[&StagedImage],
 ) -> Result<(), StoreError> {
     let draw_count = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MIN(draw_count) FROM images WHERE library = ?",
@@ -927,13 +933,13 @@ async fn insert_images(
     .fetch_one(pool)
     .await?
     .unwrap_or(0);
-    for (hash, bytes) in images {
+    for image in images {
         sqlx::query(
             "INSERT OR IGNORE INTO images (library, hash, size, draw_count) VALUES (?, ?, ?, ?)",
         )
         .bind(library)
-        .bind(hash)
-        .bind(bytes.len() as i64)
+        .bind(&image.hash)
+        .bind(image.size as i64)
         .bind(draw_count)
         .execute(pool)
         .await?;
@@ -1055,30 +1061,19 @@ fn is_hash_prefix(prefix: &str) -> bool {
     (1..=64).contains(&len) && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-async fn write_blob_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(
-        "{name}.{}.{:x}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write = async {
-        // rename 前先落盘：DB 里已有该 hash 的索引，掉电截断的 blob 会被对账
-        // 当作正常文件，这张图就永久损坏了。
-        let mut file = kovi::tokio::fs::File::create(&tmp).await?;
-        kovi::tokio::io::AsyncWriteExt::write_all(&mut file, bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        utils::restrict_mode_0600(&tmp)?;
-        kovi::tokio::fs::rename(&tmp, path).await?;
-        Ok(())
-    }
-    .await;
-    if write.is_err() {
-        let _ = kovi::tokio::fs::remove_file(&tmp).await;
-    }
-    write
+/// staged 文件入库：落盘、收紧权限后，在同目录内 rename 成正式 blob。
+async fn promote_staged(from: &Path, to: &Path) -> Result<()> {
+    // rename 前先落盘：DB 里已有该 hash 的索引，掉电截断的 blob 会被对账
+    // 当作正常文件，这张图就永久损坏了。
+    let file = kovi::tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(from)
+        .await?;
+    file.sync_all().await?;
+    drop(file);
+    utils::restrict_mode_0600(from)?;
+    kovi::tokio::fs::rename(from, to).await?;
+    Ok(())
 }
 
 async fn remove_unindexed(
@@ -1098,6 +1093,7 @@ async fn remove_unindexed(
 mod tests {
     use super::*;
     use kovi::tokio;
+    use utils::sha256_hex;
 
     fn temp_store() -> (Store, PathBuf) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1121,13 +1117,26 @@ mod tests {
         bytes
     }
 
+    /// 模拟下载管线：bytes 先落成 blobs 目录旁的临时文件再走正式入库。
     async fn add_images(
         store: &Store,
         group_id: i64,
         name: &str,
         images: Vec<Vec<u8>>,
     ) -> Result<AddResult, StoreError> {
-        store.add_images(group_id, name, images).await
+        let blobs = store.blobs_dir(group_id);
+        std::fs::create_dir_all(&blobs).unwrap();
+        let mut staged = Vec::with_capacity(images.len());
+        for (index, bytes) in images.into_iter().enumerate() {
+            let path = blobs.join(format!(".stage.test.{index}.tmp"));
+            std::fs::write(&path, &bytes).unwrap();
+            staged.push(StagedImage {
+                hash: sha256_hex(&bytes),
+                size: bytes.len() as u64,
+                path,
+            });
+        }
+        store.add_images(group_id, name, staged).await
     }
 
     #[tokio::test]
