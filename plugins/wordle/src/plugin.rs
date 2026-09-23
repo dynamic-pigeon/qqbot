@@ -6,8 +6,8 @@
 //! 图片由纯 Rust 渲染（`render` 模块），不依赖浏览器。
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kovi::{Message, PluginBuilder as plugin, tokio::sync::OnceCell};
@@ -23,6 +23,9 @@ const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// 词库只加载一次；下载失败不缓存，下次命令可重试。
 static WORD_LIST: LazyLock<OnceCell<std::sync::Arc<WordList>>> = LazyLock::new(OnceCell::new);
+
+/// 词库目录在插件启动时由 kovi 的插件数据目录决定，命令处理前必定就绪。
+static WORD_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 struct Session {
     game: Game,
@@ -42,9 +45,8 @@ enum SessionKey {
 async fn word_list() -> Result<std::sync::Arc<WordList>, anyhow::Error> {
     WORD_LIST
         .get_or_try_init(|| async {
-            load_or_download(Path::new("data"))
-                .await
-                .map(std::sync::Arc::new)
+            let word_dir = WORD_DIR.get().expect("词库目录在插件启动时初始化");
+            load_or_download(word_dir).await.map(std::sync::Arc::new)
         })
         .await
         .cloned()
@@ -52,6 +54,7 @@ async fn word_list() -> Result<std::sync::Arc<WordList>, anyhow::Error> {
 
 pub fn run() {
     let bot = plugin::get_runtime_bot();
+    let _ = WORD_DIR.set(bot.get_data_path());
     CommandRouter::new("wordle", bot)
         .register(wordle_command())
         .install()

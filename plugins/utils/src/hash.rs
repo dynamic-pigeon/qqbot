@@ -24,3 +24,18 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&Sha256::digest(bytes))
 }
+
+/// 流式计算文件哈希。async 读盘按 chunk 喂 digest，避免整文件进内存。
+pub async fn sha256_hex_file(path: &std::path::Path) -> std::io::Result<String> {
+    let mut file = kovi::tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    use kovi::tokio::io::AsyncReadExt as _;
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(hex_encode(&hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}

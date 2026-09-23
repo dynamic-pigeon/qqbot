@@ -107,6 +107,102 @@ pub async fn load_image_bytes(segment: &Segment) -> Result<Vec<u8>, FetchError> 
     Err(FetchError::Unreadable)
 }
 
+/// 已落到 blobs 目录旁、等待入库的图片文件。
+pub struct StagedFile {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// 把一张图流式下载/复制到 `blobs` 目录旁的临时文件，全程不进内存。
+///
+/// 临时文件带 `.tmp` 扩展名：崩溃残留由每日对账清理；入库时在同目录内
+/// rename 成正式 blob，避免跨文件系统拷贝。
+/// 把一张图流式下载/复制到 `blobs` 目录旁的临时文件，全程不进内存。
+///
+/// 临时文件带 `.tmp` 扩展名：崩溃残留由每日对账清理；入库时在同目录内
+/// rename 成正式 blob，避免跨文件系统拷贝。
+pub async fn stage_image(segment: &Segment, blobs: &Path) -> Result<StagedFile, FetchError> {
+    kovi::tokio::fs::create_dir_all(blobs)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
+    let path = staging_path(blobs);
+    let staged = async {
+        if let Some(url) = image_url(segment) {
+            utils::download_image_to_file(
+                &url,
+                utils::QQ_IMAGE_HOSTS,
+                max_image_bytes(),
+                DOWNLOAD_TIMEOUT,
+                &path,
+            )
+            .await
+            .map_err(map_download_error)?;
+        } else if let Some(source) = local_file_path(segment) {
+            copy_local_limited(&source, &path).await?;
+        } else {
+            return Err(FetchError::Unreadable);
+        }
+        ensure_staged_image(&path).await
+    }
+    .await;
+    match staged {
+        Ok(()) => {
+            let size = kovi::tokio::fs::metadata(&path)
+                .await
+                .map_err(|_| FetchError::Unreadable)?
+                .len();
+            Ok(StagedFile { path, size })
+        }
+        Err(error) => {
+            let _ = kovi::tokio::fs::remove_file(&path).await;
+            Err(error)
+        }
+    }
+}
+
+static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn staging_path(blobs: &Path) -> PathBuf {
+    let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    blobs.join(format!(".stage.{}.{seq}.tmp", std::process::id()))
+}
+
+async fn copy_local_limited(source: &Path, dest: &Path) -> Result<(), FetchError> {
+    let max_bytes = max_image_bytes();
+    let meta = kovi::tokio::fs::metadata(source)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return Err(if meta.is_file() {
+            too_large()
+        } else {
+            FetchError::Unreadable
+        });
+    }
+    kovi::tokio::fs::copy(source, dest)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
+    Ok(())
+}
+
+/// 校验 staged 文件头是受支持的图片格式；不匹配时删除文件并报错。
+async fn ensure_staged_image(path: &Path) -> Result<(), FetchError> {
+    let Ok(mut file) = kovi::tokio::fs::File::open(path).await else {
+        return Err(FetchError::Unreadable);
+    };
+    let mut head = [0u8; 12];
+    use kovi::tokio::io::AsyncReadExt as _;
+    let read = file
+        .read(&mut head)
+        .await
+        .map_err(|_| FetchError::Unreadable)?;
+    if is_supported_image(&head[..read]) {
+        return Ok(());
+    }
+    let _ = kovi::tokio::fs::remove_file(path).await;
+    Err(FetchError::Unreadable)
+}
+
 fn image_url(segment: &Segment) -> Option<String> {
     utils::https_image_url_from_data(&segment.data)
 }
