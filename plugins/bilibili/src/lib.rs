@@ -283,6 +283,16 @@ async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
+/// 数量达到 1w 后用 w 作为单位，保留一位小数并去掉多余的 `.0`。
+fn format_count(n: u32) -> String {
+    if n < 10000 {
+        return n.to_string();
+    }
+    let w = format!("{:.1}", n as f64 / 10000.0);
+    let w = w.strip_suffix(".0").unwrap_or(&w);
+    format!("{w}w")
+}
+
 async fn parse_bv(event: Arc<GroupMsgEvent>) {
     for msg in event.message.iter() {
         let bv_info = match msg.kind.as_str() {
@@ -332,10 +342,10 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
             .add_text(format!(
                 "UP主：{}\n点赞：{} 投币：{}\n收藏：{} 观看：{}\n{}",
                 bv_info.name,
-                bv_info.like,
-                bv_info.coin,
-                bv_info.favorite,
-                bv_info.view,
+                format_count(bv_info.like),
+                format_count(bv_info.coin),
+                format_count(bv_info.favorite),
+                format_count(bv_info.view),
                 bv_info.url
             ));
 
@@ -409,5 +419,25 @@ mod command_tests {
             super::parse_dynamic_fetch_count(Some("not-a-number")),
             Err(CommandError::InvalidArgument { ref name }) if name == "count"
         ));
+    }
+}
+
+#[cfg(test)]
+mod format_count_tests {
+    use super::format_count;
+
+    #[test]
+    fn keeps_plain_number_below_10k() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(9999), "9999");
+    }
+
+    #[test]
+    fn uses_w_unit_from_10k_up() {
+        assert_eq!(format_count(10000), "1w");
+        assert_eq!(format_count(12345), "1.2w");
+        assert_eq!(format_count(150000), "15w");
+        assert_eq!(format_count(99999), "10w");
+        assert_eq!(format_count(u32::MAX), "429496.7w");
     }
 }
