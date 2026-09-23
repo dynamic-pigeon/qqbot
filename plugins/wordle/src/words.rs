@@ -47,10 +47,9 @@ impl WordList {
 
 /// 确保词库就绪：本地缓存缺失时按 URL 顺序尝试下载，成功写入缓存。
 ///
-/// 缓存文件位于 `data_dir/wordle/`，解析后不合法则报错并提示手动预置。
-pub async fn load_or_download(data_dir: &Path) -> anyhow::Result<WordList> {
-    let word_dir = data_dir.join("wordle");
-    fs::create_dir_all(&word_dir)
+/// `word_dir` 即词库目录，缓存文件直接位于其中；解析后不合法则报错并提示手动预置。
+pub async fn load_or_download(word_dir: &Path) -> anyhow::Result<WordList> {
+    fs::create_dir_all(word_dir)
         .with_context(|| format!("创建词库目录 {} 失败", word_dir.display()))?;
 
     let answers_path = word_dir.join(ANSWERS_FILE);
@@ -223,15 +222,13 @@ mod tests {
     #[tokio::test]
     async fn load_reads_cached_files_without_download() {
         let dir = tempfile_dir();
-        let word_dir = dir.join("wordle");
-        fs::create_dir_all(&word_dir).unwrap();
         // 用 base-26 编码生成唯一的纯字母 5 词（is_valid_word 只接受 a-z）
         let answers: Vec<String> = (0..2000).map(fake_word).collect();
         let mut allowed: Vec<String> = (0..12_000).map(fake_word).collect();
         // 让答案词也在 allowed 中出现，验证并集去重后仍满足数量下限
         allowed.extend(answers.iter().cloned());
-        write_words(&word_dir, ANSWERS_FILE, &answers);
-        write_words(&word_dir, ALLOWED_FILE, &allowed);
+        write_words(&dir, ANSWERS_FILE, &answers);
+        write_words(&dir, ALLOWED_FILE, &allowed);
 
         let list = load_or_download(&dir).await.unwrap();
         assert!(list.answers.len() >= MIN_ANSWERS);
@@ -245,10 +242,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_corrupt_word_lists() {
         let dir = tempfile_dir();
-        let word_dir = dir.join("wordle");
-        fs::create_dir_all(&word_dir).unwrap();
-        write_words(&word_dir, ANSWERS_FILE, ["abcde"]);
-        write_words(&word_dir, ALLOWED_FILE, ["abcde"]);
+        write_words(&dir, ANSWERS_FILE, ["abcde"]);
+        write_words(&dir, ALLOWED_FILE, ["abcde"]);
 
         let err = load_or_download(&dir).await.unwrap_err();
         assert!(err.to_string().contains("答案池过小"), "{err:#}");
@@ -258,14 +253,12 @@ mod tests {
     #[tokio::test]
     async fn optional_meanings_file_overrides_embedded() {
         let dir = tempfile_dir();
-        let word_dir = dir.join("wordle");
-        fs::create_dir_all(&word_dir).unwrap();
         let answers: Vec<String> = (0..2000).map(fake_word).collect();
         let allowed: Vec<String> = (0..12_000).map(fake_word).collect();
-        write_words(&word_dir, ANSWERS_FILE, &answers);
-        write_words(&word_dir, ALLOWED_FILE, &allowed);
+        write_words(&dir, ANSWERS_FILE, &answers);
+        write_words(&dir, ALLOWED_FILE, &allowed);
         fs::write(
-            word_dir.join(MEANINGS_FILE),
+            dir.join(MEANINGS_FILE),
             "crane\tn. 鹤（覆盖）\nzzzzz\tn. 自定义词",
         )
         .unwrap();

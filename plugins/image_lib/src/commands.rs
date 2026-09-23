@@ -9,7 +9,7 @@ use utils::{RateLimiter, sha256_hex};
 
 use crate::fetch::{
     AddImageSource, FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes,
-    parse_message_segments, resolve_add_source, select_images,
+    parse_message_segments, resolve_add_source, select_images, stage_image,
 };
 use crate::name::parse_library_name;
 use crate::scan::{
@@ -20,7 +20,7 @@ use crate::send::{
     forward_node, image_message, report_send_fail, send_group_forward_wait, send_group_wait,
 };
 use crate::similar::{cluster, distance_from_percent};
-use crate::store::{Store, StoreError};
+use crate::store::{StagedImage, Store, StoreError};
 
 /// 查重展示单组读入内存的原始字节预算。大组逐张全读可放大到数百 MiB 常驻。
 const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
@@ -206,14 +206,8 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     ctx.ensure_no_extra_args(1)?;
     let group_id = ctx.group_id()?;
     let segments = add_image_segments(&ctx).await?;
-    let mut images = Vec::with_capacity(segments.len());
-    for segment in &segments {
-        match load_image_bytes(segment).await {
-            Ok(bytes) => images.push(bytes),
-            Err(error) => return Err(error.into()),
-        }
-    }
-    match store.add_images(group_id, name, images).await {
+    let staged = stage_all(store, group_id, &segments).await?;
+    match store.add_images(group_id, name, staged).await {
         Ok(result) if result.added == 0 => {
             ctx.reply(format!("都已在「{name}」里"));
             Ok(())
@@ -224,6 +218,37 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
         }
         Err(error) => Err(map_store_user_error(error)),
     }
+}
+
+/// 逐张把消息里的图片流式下载到 blobs 目录旁并计算内容哈希。
+/// 中途失败时清理已落盘的临时文件，不留半成品。
+async fn stage_all(
+    store: &Store,
+    group_id: i64,
+    segments: &[Segment],
+) -> Result<Vec<StagedImage>, CommandError> {
+    let blobs = store.blobs_dir(group_id);
+    let mut staged: Vec<StagedImage> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let file = match stage_image(segment, &blobs).await {
+            Ok(file) => file,
+            Err(error) => {
+                for image in &staged {
+                    let _ = kovi::tokio::fs::remove_file(&image.path).await;
+                }
+                return Err(error.into());
+            }
+        };
+        let hash = utils::sha256_hex_file(&file.path)
+            .await
+            .map_err(|_| FetchError::Unreadable)?;
+        staged.push(StagedImage {
+            hash,
+            size: file.size,
+            path: file.path,
+        });
+    }
+    Ok(staged)
 }
 
 async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {

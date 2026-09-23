@@ -161,8 +161,14 @@ fn init_buffer() {
                     }
                 }
                 _ = interval.tick() => {
-                    if !state.is_empty() {
+                    // 数据库恢复后要在一个周期内清空积压：缓冲满时新消息仍会被丢弃，
+                    // 只 flush 一批会把恢复拖长到积压量 / 批大小个周期。
+                    while !state.is_empty() {
+                        let before = state.len();
                         flush_batch(&mut state).await;
+                        if state.len() >= before {
+                            break;
+                        }
                     }
                 }
                 _ = cleanup_interval.tick() => {

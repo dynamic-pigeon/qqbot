@@ -84,7 +84,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut seed = None;
     let mut answer = None;
     let mut hard = false;
-    let mut data_dir = PathBuf::from("data");
+    let mut data_dir = PathBuf::from("data/wordle");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
