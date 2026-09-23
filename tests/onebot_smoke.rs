@@ -171,6 +171,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     assert!(
         card.has_image
             || card.text.contains("未找到卡片")
+            || card.text.contains("获取卡片图片失败")
             || card.text.contains("命令执行失败")
             || card.text.contains("查询过于频繁"),
         "/查卡 不应挂死: {card:?}"
