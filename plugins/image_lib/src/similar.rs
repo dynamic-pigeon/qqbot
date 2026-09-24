@@ -1,5 +1,5 @@
 use image::{DynamicImage, GrayImage, ImageReader, Limits, imageops::FilterType};
-use std::io::Cursor;
+use std::{io::Cursor, sync::LazyLock};
 
 /// 64-bit 感知哈希。dHash 看邻域差分，pHash 看低频 DCT。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,13 +161,26 @@ fn dct2_32(input: &[[f64; 32]; 32]) -> [[f64; 32]; 32] {
     cols
 }
 
+/// DCT 基函数余弦表:`[u][x] = cos(π·(2x+1)·u / 64)`,只依赖 `(u, x)` 下标。
+/// 每张图 `dct2_32` 要调 64 次 `dct1_32`,共 65536 次三角函数;查表后仅剩乘加。
+/// 表用与原式完全相同的公式预计算,浮点结果逐位一致,指纹与存量数据零漂移。
+static DCT_COS: LazyLock<[[f64; 32]; 32]> = LazyLock::new(|| {
+    let mut table = [[0.0f64; 32]; 32];
+    for (u, row) in table.iter_mut().enumerate() {
+        for (x, slot) in row.iter_mut().enumerate() {
+            *slot = (std::f64::consts::PI * (2.0 * x as f64 + 1.0) * u as f64 / 64.0).cos();
+        }
+    }
+    table
+});
+
 fn dct1_32(input: &[f64; 32], output: &mut [f64; 32]) {
     const N: f64 = 32.0;
+    let cos = &*DCT_COS;
     for (u, slot) in output.iter_mut().enumerate() {
         let mut sum = 0.0;
         for (x, value) in input.iter().enumerate() {
-            sum += *value
-                * (std::f64::consts::PI * (2.0 * x as f64 + 1.0) * u as f64 / (2.0 * N)).cos();
+            sum += *value * cos[u][x];
         }
         let alpha = if u == 0 {
             (1.0 / N).sqrt()
@@ -376,6 +389,18 @@ mod tests {
         HashedImage {
             hash: hash.into(),
             fingerprint: Fingerprint { dhash, phash },
+        }
+    }
+
+    #[test]
+    fn dct_cos_table_matches_direct_formula() {
+        // 表与逐次 cos() 调用必须逐位一致,否则查表会改变存量指纹。
+        for u in 0..32 {
+            for x in 0..32 {
+                let direct =
+                    (std::f64::consts::PI * (2.0 * x as f64 + 1.0) * u as f64 / 64.0).cos();
+                assert_eq!(DCT_COS[u][x].to_bits(), direct.to_bits(), "u={u} x={x}");
+            }
         }
     }
 
