@@ -139,14 +139,16 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
         let bot = &bot;
         let path = &path;
         if crate::word_cloud::mark_cron_fire(&last_fire_ts, chrono::Local::now().timestamp()) {
-            let config = CONFIG.get();
-            for &group_id in &config.weekly_report_group {
-                let bot = Arc::clone(bot);
-                let path = Arc::clone(path);
-                kovi::spawn(async move {
+            let bot = Arc::clone(bot);
+            let path = Arc::clone(path);
+            // 截图池并发槽位只有 2 且 acquire 超时 5 秒，逐群 spawn 会让第 3 个群起
+            // 直接超时失败；同一 tick 内单任务顺序生成，每群都能出，代价是到群时间被拉平。
+            kovi::spawn(async move {
+                let config = CONFIG.get();
+                for &group_id in &config.weekly_report_group {
                     send_weekly_report(&bot, group_id, &path).await;
-                });
-            }
+                }
+            });
         }
         async move {}
     })
