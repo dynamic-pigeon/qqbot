@@ -10,6 +10,7 @@ use utils::RateLimiter;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
 
 mod user_info;
+pub(crate) mod weekly_report;
 
 /// 每群连续两次 B 话榜之间的最短间隔。
 const RANK_COOLDOWN: Duration = Duration::from_secs(30);
