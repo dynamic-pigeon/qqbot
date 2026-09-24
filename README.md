@@ -44,7 +44,7 @@ cargo test --workspace --all-targets --locked
 cargo audit
 ```
 
-workspace 会通过依赖编进 `utils` 的 `chromium` / `screenshot` / `markdown` 和 Wordle 的 `qq`。Wordle 独立 CLI：`cargo run -p wordle --features cli`。单独测 `utils` 时要加 `--features markdown`，否则 Markdown/截图测试不会编进来。
+workspace 会通过依赖编进 `utils` 的 `chromium` / `screenshot` / `markdown` 和 Wordle 的 `qq`。单独测 `utils` 时要加 `--features markdown`，否则 Markdown/截图测试不会编进来。
 
 依赖公网 API 或本机 Chrome 的测试标了 `ignored`：
 
