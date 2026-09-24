@@ -42,11 +42,15 @@ async fn main() {
         .register(record_command())
         .register(word_cloud::wordcloud_command(Arc::clone(&path)))
         .register(msg_rank::rank_command())
+        .register(msg_rank::weekly_report::weekly_report_command(Arc::clone(
+            &path,
+        )))
         .install()
-        .expect("注册发言排行、消息采集与词云命令失败");
+        .expect("注册发言排行、消息采集、词云与周报命令失败");
 
     plugin::on_group_msg(add_msg);
     word_cloud::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
+    msg_rank::weekly_report::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
 }
 
 fn record_command() -> Command {

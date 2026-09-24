@@ -16,6 +16,9 @@ retention_days = 8
 # 发言排行展示人数。
 rank_top = 10
 wordcloud_concurrency = 1
+# 周报定时推送（统计上一个完整自然周）；榜单展示人数。
+weekly_report_cron = "0 10 * * 1"
+weekly_report_top = 10
 
 [[msg_rank.wordcloud]]
 cron = "0 21 * * *"

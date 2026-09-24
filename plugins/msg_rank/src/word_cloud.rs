@@ -106,7 +106,7 @@ const WORDCLOUD_COLORS: [Rgba<u8>; 10] = [
 ];
 
 /// Kovi cron 会在目标秒前被唤醒；间隔不足 2 秒视为同一次触发。
-fn mark_cron_fire(last_fire_ts: &AtomicI64, now_ts: i64) -> bool {
+pub(crate) fn mark_cron_fire(last_fire_ts: &AtomicI64, now_ts: i64) -> bool {
     let prev = last_fire_ts.swap(now_ts, Ordering::Relaxed);
     now_ts.saturating_sub(prev) >= 2
 }
@@ -467,6 +467,27 @@ fn load_stop_words(path: &Path) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// 周报热词：复用词云的 jieba 资源管理器分词统计，返回频次降序、同频字典序的前 `limit` 个词。
+pub(crate) async fn top_words(path: &Path, text: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stop_words = load_stop_words(path);
+    let resources = resource_manager(path.join("font.otf")).await.get().await?;
+    let text = text.to_string();
+    let mut words: Vec<(String, u64)> = tokio::task::spawn_blocking(move || {
+        count_frequencies(&resources.jieba, &text, &stop_words)
+            .into_iter()
+            .map(|(word, count)| (word.into_owned(), count))
+            .collect()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("热词分词任务失败: {e}"))?;
+    words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    words.truncate(limit);
+    Ok(words)
 }
 
 #[cfg(test)]

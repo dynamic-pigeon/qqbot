@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>群活跃周报 - {{ date }}</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+                "Microsoft YaHei", "Segoe UI", sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* 截图按 .card 矩形裁切，直角边框才能和图片边缘对齐。 */
+        .card {
+            width: 580px;
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            overflow: hidden;
+        }
+
+        .header {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .stat-chip {
+            justify-self: start;
+            background: #f3f4f6;
+            border-radius: 8px;
+            padding: 4px 10px;
+            font-size: 12px;
+            color: #6b7280;
+            white-space: nowrap;
+        }
+
+        .stat-chip b {
+            color: #111827;
+            font-size: 14px;
+            margin: 0 3px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .title {
+            min-width: 0;
+            text-align: center;
+        }
+
+        .title h1 {
+            font-size: 17px;
+            font-weight: 700;
+            color: #111827;
+            letter-spacing: 1px;
+        }
+
+        .title .date {
+            margin-top: 2px;
+            font-size: 11px;
+            color: #9ca3af;
+        }
+
+        .time-label {
+            justify-self: end;
+            font-size: 11px;
+            color: #9ca3af;
+            white-space: nowrap;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .stat {
+            padding: 12px 4px;
+            text-align: center;
+        }
+
+        .stat+.stat {
+            border-left: 1px solid #f0f1f4;
+        }
+
+        .stat .num {
+            font-size: 20px;
+            font-weight: 700;
+            color: #111827;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .stat .label {
+            margin-top: 2px;
+            font-size: 11px;
+            color: #9ca3af;
+        }
+
+        .section-title {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+        }
+
+        .daily {
+            padding: 14px 18px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .chart {
+            display: flex;
+            gap: 10px;
+        }
+
+        .col {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .col .count {
+            height: 14px;
+            font-size: 10px;
+            color: #9ca3af;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .col .bar {
+            width: 100%;
+            height: 52px;
+            display: flex;
+            align-items: flex-end;
+        }
+
+        .col .fill {
+            width: 100%;
+            min-height: 2px;
+            border-radius: 3px 3px 0 0;
+            background: linear-gradient(180deg, #8aa7f0, #4a6ee0);
+        }
+
+        .col.zero .fill {
+            background: #e5e7eb;
+        }
+
+        .col .day {
+            margin-top: 4px;
+            font-size: 11px;
+            color: #6b7280;
+        }
+
+        table {
+            width: 100%;
+            table-layout: fixed;
+            border-collapse: collapse;
+        }
+
+        th {
+            padding: 9px 18px;
+            font-size: 11px;
+            font-weight: 500;
+            color: #9ca3af;
+            text-align: left;
+            border-bottom: 1px solid #e5e7eb;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 9px 18px;
+            font-size: 14px;
+            color: #111827;
+            vertical-align: middle;
+        }
+
+        th.right,
+        td.right {
+            text-align: right;
+        }
+
+        tbody tr:nth-child(even) {
+            background: #f9fafb;
+        }
+
+        col.col-rank {
+            width: 56px;
+        }
+
+        col.col-percent {
+            width: 118px;
+        }
+
+        col.col-count {
+            width: 92px;
+        }
+
+        .rank-cell {
+            font-weight: 600;
+            color: #6b7280;
+            font-variant-numeric: tabular-nums;
+        }
+
+        tr.r1 .rank-cell {
+            color: #f59e0b;
+            font-weight: 700;
+        }
+
+        tr.r2 .rank-cell {
+            color: #9ca3af;
+            font-weight: 700;
+        }
+
+        tr.r3 .rank-cell {
+            color: #a16207;
+            font-weight: 700;
+        }
+
+        .user-cell {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+            max-width: 100%;
+        }
+
+        .user-cell img {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            object-fit: cover;
+            flex-shrink: 0;
+        }
+
+        .user-cell .name {
+            flex: 1;
+            min-width: 0;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .badge {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border-radius: 999px;
+            background: #fef3c7;
+            color: #b45309;
+            font-size: 10px;
+            font-weight: 600;
+            vertical-align: 1px;
+        }
+
+        td:nth-child(2) {
+            overflow: hidden;
+        }
+
+        .percent-inner {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .track {
+            flex: 1;
+            height: 6px;
+            border-radius: 3px;
+            background: #eef0f4;
+            overflow: hidden;
+        }
+
+        .fill-bar {
+            height: 100%;
+            min-width: 4px;
+            border-radius: 3px;
+            background: linear-gradient(90deg, #4a6ee0, #7c9df2);
+        }
+
+        .pct {
+            width: 36px;
+            font-size: 12px;
+            color: #6b7280;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+        }
+
+        .count-cell {
+            font-weight: 700;
+            font-size: 15px;
+            color: #4a6ee0;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        .kings {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            padding: 14px 18px;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .king {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: #f9fafb;
+            border-radius: 10px;
+            padding: 10px 12px;
+            min-width: 0;
+        }
+
+        .king img {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            object-fit: cover;
+            flex-shrink: 0;
+        }
+
+        .king-body {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .king-title {
+            font-size: 11px;
+            color: #9ca3af;
+        }
+
+        .king-name {
+            margin-top: 2px;
+            font-size: 14px;
+            font-weight: 600;
+            color: #111827;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .king-count {
+            font-size: 18px;
+            font-weight: 700;
+            color: #4a6ee0;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+
+        .king-count span {
+            margin-left: 2px;
+            font-size: 11px;
+            color: #9ca3af;
+            font-weight: 400;
+        }
+
+        .hotwords {
+            padding: 14px 18px 16px;
+        }
+
+        /* 窄卡片里标签云展不开（一行挤满+孤词换行），改为排行徽章流。 */
+        .cloud {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 5px;
+            background: #f3f4f6;
+            border-radius: 999px;
+            padding: 4px 11px;
+            white-space: nowrap;
+        }
+
+        .chip .rank {
+            font-size: 11px;
+            font-style: normal;
+            color: #9ca3af;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chip b {
+            font-size: 14px;
+            font-weight: 600;
+            color: #111827;
+        }
+
+        .chip .cnt {
+            font-size: 11px;
+            color: #9ca3af;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* 前三名琥珀色，与「全勤」徽章同一配色。 */
+        .chip.top {
+            background: #fef3c7;
+        }
+
+        .chip.top .rank {
+            color: #b45309;
+            font-weight: 700;
+        }
+
+        .chip.top b {
+            color: #92400e;
+        }
+
+        .chip.top .cnt {
+            color: #b45309;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <div class="header">
+            <div class="stat-chip">上周总计<b>{{ total }}</b>条</div>
+            <div class="title">
+                <h1>群活跃周报</h1>
+                <div class="date">{{ date }}</div>
+            </div>
+            <div class="time-label">{{ time }}</div>
+        </div>
+        <div class="stats">
+            <div class="stat">
+                <div class="num">{{ total }}</div>
+                <div class="label">消息</div>
+            </div>
+            <div class="stat">
+                <div class="num">{{ active_users }}</div>
+                <div class="label">活跃群友</div>
+            </div>
+            <div class="stat">
+                <div class="num">{{ daily_avg }}</div>
+                <div class="label">日均消息</div>
+            </div>
+            <div class="stat">
+                <div class="num">{{ full_week_users }}</div>
+                <div class="label">全勤</div>
+            </div>
+        </div>
+        <div class="daily">
+            <div class="section-title">每日消息量</div>
+            <div class="chart">
+                {% for bar in bars %}
+                <div class="col{% if bar.zero %} zero{% endif %}">
+                    <div class="count">{{ bar.count }}</div>
+                    <div class="bar">
+                        <div class="fill" style="height: {{ bar.height }}%;"></div>
+                    </div>
+                    <div class="day">{{ bar.label }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        <table>
+            <colgroup>
+                <col class="col-rank" />
+                <col class="col-user" />
+                <col class="col-percent" />
+                <col class="col-count" />
+            </colgroup>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>群友</th>
+                    <th class="right">占比</th>
+                    <th class="right">消息数</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in items %}
+                <tr class="r{{ item.rank }}">
+                    <td class="rank-cell">{{ item.rank }}</td>
+                    <td>
+                        <div class="user-cell">
+                            <img src="{{ item.avatar_src }}" alt="" />
+                            <span class="name">{{ item.nickname }}{% if item.full_week %}<span
+                                    class="badge">全勤</span>{% endif %}</span>
+                        </div>
+                    </td>
+                    <td class="percent-cell">
+                        <div class="percent-inner">
+                            <div class="track">
+                                <div class="fill-bar" style="width: {{ item.percent }}%;"></div>
+                            </div>
+                            <span class="pct">{{ item.percent }}%</span>
+                        </div>
+                    </td>
+                    <td class="count-cell right">{{ item.count }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% if night_owl.is_some() || early_bird.is_some() %}
+        <div class="kings">
+            {% if let Some(owl) = night_owl %}
+            <div class="king">
+                <img src="{{ owl.avatar_src }}" alt="" />
+                <div class="king-body">
+                    <div class="king-title">🌙 夜聊王</div>
+                    <div class="king-name">{{ owl.nickname }}</div>
+                </div>
+                <div class="king-count">{{ owl.count }}<span>条</span></div>
+            </div>
+            {% endif %}
+            {% if let Some(bird) = early_bird %}
+            <div class="king">
+                <img src="{{ bird.avatar_src }}" alt="" />
+                <div class="king-body">
+                    <div class="king-title">🌅 早起王</div>
+                    <div class="king-name">{{ bird.nickname }}</div>
+                </div>
+                <div class="king-count">{{ bird.count }}<span>条</span></div>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+        {% if hot_words.len() > 0 %}
+        <div class="hotwords">
+            <div class="section-title">本周热词</div>
+            <div class="cloud">
+                {% for word in hot_words %}
+                <span class="chip{% if loop.index <= 3 %} top{% endif %}">
+                    <i class="rank">{{ loop.index }}</i>
+                    <b>{{ word.word }}</b>
+                    <span class="cnt">{{ word.count }}</span>
+                </span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+
+</html>
