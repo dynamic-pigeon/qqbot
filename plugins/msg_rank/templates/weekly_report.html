@@ -368,29 +368,58 @@
             padding: 14px 18px 16px;
         }
 
+        /* 窄卡片里标签云展不开（一行挤满+孤词换行），改为排行徽章流。 */
         .cloud {
             display: flex;
             flex-wrap: wrap;
-            align-items: center;
-            gap: 6px 12px;
-            line-height: 1.2;
+            gap: 8px;
         }
 
-        .cloud .word {
-            color: #374151;
+        .chip {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 5px;
+            background: #f3f4f6;
+            border-radius: 999px;
+            padding: 4px 11px;
+            white-space: nowrap;
+        }
+
+        .chip .rank {
+            font-size: 11px;
+            font-style: normal;
+            color: #9ca3af;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chip b {
+            font-size: 14px;
             font-weight: 600;
+            color: #111827;
         }
 
-        .cloud .word:nth-child(4n+2) {
-            color: #4a6ee0;
+        .chip .cnt {
+            font-size: 11px;
+            color: #9ca3af;
+            font-variant-numeric: tabular-nums;
         }
 
-        .cloud .word:nth-child(4n+3) {
-            color: #0e9f6e;
+        /* 前三名琥珀色，与「全勤」徽章同一配色。 */
+        .chip.top {
+            background: #fef3c7;
         }
 
-        .cloud .word:nth-child(4n) {
-            color: #d97706;
+        .chip.top .rank {
+            color: #b45309;
+            font-weight: 700;
+        }
+
+        .chip.top b {
+            color: #92400e;
+        }
+
+        .chip.top .cnt {
+            color: #b45309;
         }
     </style>
 </head>
@@ -504,8 +533,13 @@
         <div class="hotwords">
             <div class="section-title">本周热词</div>
             <div class="cloud">
-                {% for word in hot_words %}<span class="word" style="font-size: {{ word.size }}px;">{{ word.word
-                    }}</span>{% endfor %}
+                {% for word in hot_words %}
+                <span class="chip{% if loop.index <= 3 %} top{% endif %}">
+                    <i class="rank">{{ loop.index }}</i>
+                    <b>{{ word.word }}</b>
+                    <span class="cnt">{{ word.count }}</span>
+                </span>
+                {% endfor %}
             </div>
         </div>
         {% endif %}

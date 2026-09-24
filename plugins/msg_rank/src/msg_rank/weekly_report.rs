@@ -25,8 +25,6 @@ const MIN_KING_MESSAGES: u32 = 3;
 /// 热词统计读取原文的上限，与词云一致。
 const MAX_HOTWORD_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const HOTWORD_LIMIT: usize = 12;
-const HOTWORD_MIN_PX: u32 = 14;
-const HOTWORD_MAX_PX: u32 = 26;
 /// 每日消息量柱状图从周一排到周日。
 const DAY_LABELS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
 
@@ -376,27 +374,10 @@ async fn collect_hot_words(
         return Ok(Vec::new());
     }
     let words = crate::word_cloud::top_words(path, &text, HOTWORD_LIMIT).await?;
-    Ok(scale_hot_words(words))
-}
-
-/// 频次线性映射到字号；top_words 频次降序，首尾即最大/最小频次。
-fn scale_hot_words(words: Vec<(String, u64)>) -> Vec<HotWord> {
-    let Some(max) = words.first().map(|(_, count)| *count) else {
-        return Vec::new();
-    };
-    let min = words.last().map(|(_, count)| *count).unwrap_or(max);
-    let spread = HOTWORD_MAX_PX - HOTWORD_MIN_PX;
-    words
+    Ok(words
         .into_iter()
-        .map(|(word, count)| {
-            let size = if max == min {
-                (HOTWORD_MIN_PX + HOTWORD_MAX_PX) / 2
-            } else {
-                HOTWORD_MIN_PX + ((count - min) * u64::from(spread) / (max - min)) as u32
-            };
-            HotWord { word, size }
-        })
-        .collect()
+        .map(|(word, count)| HotWord { word, count })
+        .collect())
 }
 
 /// 把按 `YYYY-MM-DD` 的每日计数铺满周一到周日七根柱，无数据的日子画灰柱。
@@ -463,7 +444,7 @@ struct King {
 
 struct HotWord {
     word: String,
-    size: u32,
+    count: u64,
 }
 
 #[cfg(test)]
@@ -475,7 +456,7 @@ mod tests {
 
     use super::{
         DailyBar, HotWord, King, WeeklyItem, WeeklyReportTemplate, daily_bars, last_week_window,
-        scale_hot_words, week_date_label,
+        week_date_label,
     };
 
     fn sample_template() -> WeeklyReportTemplate {
@@ -508,7 +489,7 @@ mod tests {
             early_bird: None,
             hot_words: vec![HotWord {
                 word: "rust".into(),
-                size: 26,
+                count: 9,
             }],
         }
     }
@@ -592,22 +573,6 @@ mod tests {
     }
 
     #[test]
-    fn scale_hot_words_maps_counts_onto_font_sizes() {
-        let words = vec![
-            ("甲".to_string(), 10),
-            ("乙".to_string(), 5),
-            ("丙".to_string(), 5),
-        ];
-        let scaled = scale_hot_words(words);
-        let sizes: Vec<u32> = scaled.iter().map(|word| word.size).collect();
-        assert_eq!(sizes, vec![26, 14, 14]);
-
-        // 只有一个词时无频差，落在区间中点。
-        let single = scale_hot_words(vec![("独".to_string(), 3)]);
-        assert_eq!(single[0].size, 20);
-    }
-
-    #[test]
     fn template_renders_sections_and_escapes_optionals() {
         let html = sample_template().render().unwrap();
         assert!(html.contains("群活跃周报"));
@@ -615,6 +580,10 @@ mod tests {
         assert!(html.contains("全勤"));
         assert!(html.contains("夜聊王"));
         assert!(html.contains("夜猫子"));
+        // 热词徽章带序号与词频，第一个是 top 高亮位。
+        assert!(html.contains("chip top"));
+        assert!(html.contains(">rust<"));
+        assert!(html.contains(">9<"));
         // early_bird 为 None，不应渲染早起王卡片。
         assert!(!html.contains("早起王"));
     }
