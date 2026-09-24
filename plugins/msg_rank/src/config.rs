@@ -11,6 +11,10 @@ pub(crate) struct StaticConfig {
     pub rank_top: usize,
     pub wordcloud_concurrency: usize,
     pub wordcloud: Vec<WordCloudSchedule>,
+    /// 周报定时推送的 cron，统计范围固定为上一个完整自然周。
+    pub weekly_report_cron: String,
+    /// 周报发言榜展示人数。
+    pub weekly_report_top: usize,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -39,6 +43,8 @@ impl Default for StaticConfig {
                     title: "上周词云".into(),
                 },
             ],
+            weekly_report_cron: "0 10 * * 1".into(),
+            weekly_report_top: 10,
         }
     }
 }
@@ -47,6 +53,11 @@ impl StaticConfig {
     /// SQL LIMIT 需要 i64；0 会查出空榜，至少取 1。
     pub(crate) fn rank_top(&self) -> i64 {
         i64::try_from(self.rank_top.max(1)).unwrap_or(i64::MAX)
+    }
+
+    /// 周报榜单只用于 Rust 侧 take；0 会渲染空榜，至少取 1。
+    pub(crate) fn weekly_report_top(&self) -> usize {
+        self.weekly_report_top.max(1)
     }
 }
 
@@ -69,6 +80,9 @@ pub struct Config {
     /// 词云背景色，支持 #RRGGBB 和常见颜色名。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
+    /// 定时推送周报的群。空列表就是不开；缺字段时按空列表读。
+    #[serde(default)]
+    pub weekly_report_group: Vec<i64>,
 }
 
 fn default_wordcloud_background() -> String {
@@ -81,6 +95,7 @@ impl Default for Config {
             record_group: vec![],
             wordcloud_group: vec![],
             wordcloud_background: default_wordcloud_background(),
+            weekly_report_group: vec![],
         }
     }
 }
@@ -115,6 +130,23 @@ impl Config {
     /// 只关掉定时词云，采集继续。
     pub(crate) fn disable_wordcloud(&mut self, group_id: i64) {
         self.wordcloud_group.retain(|&id| id != group_id);
+    }
+
+    pub(crate) fn weekly_report_enabled(&self, group_id: i64) -> bool {
+        self.weekly_report_group.contains(&group_id)
+    }
+
+    /// 开启周报推送，并开始采集。
+    pub(crate) fn enable_weekly_report(&mut self, group_id: i64) {
+        self.enable_recording(group_id);
+        if !self.weekly_report_group.contains(&group_id) {
+            self.weekly_report_group.push(group_id);
+        }
+    }
+
+    /// 只关掉定时周报，采集继续。
+    pub(crate) fn disable_weekly_report(&mut self, group_id: i64) {
+        self.weekly_report_group.retain(|&id| id != group_id);
     }
 }
 
@@ -186,6 +218,7 @@ mod tests {
             record_group: vec![1],
             wordcloud_group: vec![1],
             wordcloud_background: super::default_wordcloud_background(),
+            weekly_report_group: vec![],
         };
         config.enable_recording(2);
         assert!(config.recording_enabled(1));
@@ -193,5 +226,48 @@ mod tests {
         assert!(config.wordcloud_enabled(1));
         assert!(!config.wordcloud_enabled(2));
         assert_eq!(config.wordcloud_group, vec![1]);
+    }
+
+    #[test]
+    fn missing_weekly_report_keys_default_to_monday_ten() {
+        let parsed: StaticConfig = kovi::toml::from_str("").unwrap();
+        assert_eq!(parsed.weekly_report_cron, "0 10 * * 1");
+        assert_eq!(parsed.weekly_report_top(), 10);
+    }
+
+    #[test]
+    fn weekly_report_top_zero_becomes_one() {
+        let parsed: StaticConfig = kovi::toml::from_str("weekly_report_top = 0").unwrap();
+        assert_eq!(parsed.weekly_report_top(), 1);
+    }
+
+    #[test]
+    fn weekly_report_enable_also_records_and_disable_keeps_recording() {
+        let mut config = Config::default();
+        config.enable_weekly_report(1);
+        assert!(config.weekly_report_enabled(1));
+        assert!(config.recording_enabled(1));
+
+        config.disable_weekly_report(1);
+        assert!(!config.weekly_report_enabled(1));
+        assert!(config.recording_enabled(1));
+
+        config.enable_weekly_report(1);
+        assert_eq!(
+            config
+                .weekly_report_group
+                .iter()
+                .filter(|&&id| id == 1)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn enable_recording_does_not_enable_weekly_report() {
+        let mut config = Config::default();
+        config.enable_recording(1);
+        assert!(config.recording_enabled(1));
+        assert!(!config.weekly_report_enabled(1));
     }
 }

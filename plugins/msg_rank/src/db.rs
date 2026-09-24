@@ -384,6 +384,97 @@ SELECT msg FROM MSG
     Ok(text)
 }
 
+/// 周报聚合：按用户返回 (user_id, 消息数, 发言覆盖的本地日期数)，消息数降序。
+/// 不加 LIMIT：行数以群成员数为上界，榜单、活跃人数与全勤统计共用这一份结果。
+pub(crate) async fn msg_count_with_active_days(
+    group_id: i64,
+    start_time: i64,
+    end_time: i64,
+) -> Result<Vec<(i64, u32, u32)>> {
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "
+SELECT user_id, COUNT(*) AS cnt,
+       COUNT(DISTINCT date(timestamp, 'unixepoch', 'localtime')) AS days
+FROM MSG
+WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+GROUP BY user_id
+ORDER BY cnt DESC
+",
+    )
+    .bind(group_id)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_all(get_pool()?)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(user_id, count, days)| (user_id, count.max(0) as u32, days.max(0) as u32))
+        .collect())
+}
+
+/// 按本地日期统计消息数，键为 `YYYY-MM-DD`，升序返回；周报每日柱状图用。
+pub(crate) async fn msg_count_by_local_date(
+    group_id: i64,
+    start_time: i64,
+    end_time: i64,
+) -> Result<Vec<(String, u32)>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "
+SELECT date(timestamp, 'unixepoch', 'localtime') AS d, COUNT(*) AS cnt
+FROM MSG
+WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+GROUP BY d
+ORDER BY d
+",
+    )
+    .bind(group_id)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_all(get_pool()?)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(date, count)| (date, count.max(0) as u32))
+        .collect())
+}
+
+/// 给定本地小时集合内发言最多的用户；不足 min_count 时返回 None。
+/// 夜聊/早起时段共用；IN 列表元素个数随调用方常量变化，用 QueryBuilder 绑定参数构建。
+pub(crate) async fn msg_count_top_at_local_hours(
+    group_id: i64,
+    start_time: i64,
+    end_time: i64,
+    hours: &[u32],
+    min_count: u32,
+) -> Result<Option<(i64, u32)>> {
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT user_id, COUNT(*) AS cnt FROM MSG
+WHERE group_id = ",
+    );
+    builder.push_bind(group_id);
+    builder.push(" AND timestamp BETWEEN ");
+    builder.push_bind(start_time);
+    builder.push(" AND ");
+    builder.push_bind(end_time);
+    builder.push(" AND CAST(strftime('%H', timestamp, 'unixepoch', 'localtime') AS INTEGER) IN (");
+    let mut hours_clause = builder.separated(", ");
+    for hour in hours {
+        hours_clause.push_bind(i64::from(*hour));
+    }
+    builder.push(") GROUP BY user_id HAVING cnt >= ");
+    builder.push_bind(i64::from(min_count));
+    builder.push(" ORDER BY cnt DESC LIMIT 1");
+
+    let row: Option<(i64, i64)> = builder
+        .build_query_as::<(i64, i64)>()
+        .fetch_optional(get_pool()?)
+        .await?;
+
+    Ok(row.map(|(user_id, count)| (user_id, count.max(0) as u32)))
+}
+
 async fn delete_expired_messages() -> Result<u64> {
     let cutoff = chrono::Local::now().timestamp() - message_retention_secs();
     let result = sqlx::query("DELETE FROM MSG WHERE timestamp < ?")
@@ -538,8 +629,78 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(delete_expired_messages().await.unwrap(), 1);
+
+            // 周报聚合放在既有断言之后：连接池是进程级 OnceCell，并行测试共享同一份数据，
+            // 独立测试函数里的插入会打破上面「全表 3 条」的计数。
+            assert_weekly_aggregations().await;
         });
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 周报查询的固定数据：用户 1 深夜 5 条 + 次日中午 2 条（跨 2 个本地日期），
+    /// 用户 2 清晨 3 条 + 深夜 1 条，用户 3 凌晨 1 条。
+    async fn assert_weekly_aggregations() {
+        use kovi::chrono::{Days, TimeZone as _};
+
+        // 用本地时间反推时间戳，和 SQL 里 'localtime' 的小时口径一致，测试不依赖运行时区。
+        let ts = |days_ago: u32, hour: u32, minute: u32| {
+            let date = chrono::Local::now().date_naive() - Days::new(u64::from(days_ago));
+            let naive = date.and_hms_opt(hour, minute, 0).expect("时间合法");
+            chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap_or_else(|| naive.and_utc().with_timezone(&chrono::Local))
+                .timestamp()
+        };
+        let insert = |user_id: i64, timestamp: i64| {
+            sqlx::query("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?)")
+                .bind(90210_i64)
+                .bind(user_id)
+                .bind("m")
+                .bind(timestamp)
+                .execute(get_pool().unwrap())
+        };
+
+        for minute in 0..5 {
+            insert(1, ts(2, 23, minute)).await.unwrap();
+        }
+        insert(1, ts(1, 12, 0)).await.unwrap();
+        insert(1, ts(1, 12, 5)).await.unwrap();
+        for minute in 0..3 {
+            insert(2, ts(2, 7, minute)).await.unwrap();
+        }
+        insert(2, ts(2, 23, 30)).await.unwrap();
+        insert(3, ts(1, 0, 30)).await.unwrap();
+
+        let rows = msg_count_with_active_days(90210, 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(1, 7, 2), (2, 4, 1), (3, 1, 1)]);
+
+        let daily: std::collections::HashMap<String, u32> =
+            msg_count_by_local_date(90210, 0, i64::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        let today = chrono::Local::now().date_naive();
+        let day_ago = |days_ago: u32| (today - Days::new(u64::from(days_ago))).format("%Y-%m-%d");
+        assert_eq!(daily.get(&day_ago(2).to_string()), Some(&9));
+        assert_eq!(daily.get(&day_ago(1).to_string()), Some(&3));
+
+        let night = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[23, 0, 1, 2, 3, 4, 5], 3)
+            .await
+            .unwrap();
+        assert_eq!(night, Some((1, 5)));
+        let early = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[6, 7, 8], 3)
+            .await
+            .unwrap();
+        assert_eq!(early, Some((2, 3)));
+        // 门槛过滤：时段内没人达到 6 条时不加冕。
+        let none = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[6, 7, 8], 6)
+            .await
+            .unwrap();
+        assert_eq!(none, None);
     }
 }
