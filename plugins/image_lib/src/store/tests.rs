@@ -405,7 +405,7 @@ async fn draw_counts(
 }
 
 #[tokio::test]
-async fn new_images_start_at_library_min_and_pick_increments() {
+async fn new_images_start_one_behind_library_min_and_pick_increments() {
     let (store, dir) = temp_store();
     let group = 31;
     let a = png_like(1);
@@ -417,7 +417,8 @@ async fn new_images_start_at_library_min_and_pick_increments() {
     add_images(&store, group, "猫", vec![b.clone()])
         .await
         .unwrap();
-    let mut expected = vec![(sha256_hex(&a), 1), (sha256_hex(&b), 1)];
+    // a 抽过一次为 1，新图 b 按库内最小值 +1 入场为 2。
+    let mut expected = vec![(sha256_hex(&a), 1), (sha256_hex(&b), 2)];
     expected.sort();
     assert_eq!(draw_counts(&store, group, "猫").await.unwrap(), expected);
     let _ = std::fs::remove_dir_all(dir);
