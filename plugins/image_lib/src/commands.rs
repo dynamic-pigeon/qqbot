@@ -8,8 +8,8 @@ use utils::command::{
 use utils::{RateLimiter, sha256_hex};
 
 use crate::fetch::{
-    AddImageSource, FetchError, MAX_ADD_IMAGES, extract_reply_id, load_image_bytes,
-    parse_message_segments, resolve_add_source, select_images, stage_image,
+    AddImageSource, FetchError, MAX_ADD_IMAGES, load_image_bytes, parse_message_segments,
+    resolve_add_source, select_images, stage_image,
 };
 use crate::name::parse_library_name;
 use crate::scan::{
@@ -75,7 +75,7 @@ fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
 
 fn delete_command(store: Arc<Store>) -> Command {
     Command::new("删除")
-        .description("回复一张图删除该图；管理员删除库名或别名则清空整个库")
+        .description("带图或回复一张图删除该图；管理员删除库名或别名则清空整个库")
         .usage("删除\n删除 <库名或别名>")
         .expose_as_root()
         .prefix_match()
@@ -368,10 +368,15 @@ async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
 }
 
 async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) -> CommandResult {
-    let reply_id = extract_reply_id(&ctx.event().message)
-        .ok_or_else(|| CommandError::user("请回复一张图后再发送「删除」"))?;
-    let images = load_replied_images(ctx, reply_id, 1, true).await?;
-    let hash = sha256_hex(&images[0]);
+    let segments = collect_image_segments(
+        ctx,
+        1,
+        true,
+        "请在这条消息里带图，或回复一张包含图片的消息后再删除",
+    )
+    .await?;
+    let bytes = load_replied_bytes(&segments).await?;
+    let hash = sha256_hex(&bytes[0]);
     match store.delete_hash(group_id, &hash).await {
         Ok(libraries) => {
             ctx.reply(format!(
@@ -717,18 +722,30 @@ async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
 }
 
 async fn add_image_segments(ctx: &CommandContext) -> Result<Vec<Segment>, CommandError> {
+    collect_image_segments(
+        ctx,
+        MAX_ADD_IMAGES,
+        false,
+        "请在这条消息里带图，或回复一张包含图片的消息后再添加",
+    )
+    .await
+}
+
+/// 本条消息带图优先，否则用回复消息里的图；「添加」与「删除」共用。
+async fn collect_image_segments(
+    ctx: &CommandContext,
+    max: usize,
+    single: bool,
+    missing_hint: &str,
+) -> Result<Vec<Segment>, CommandError> {
     let message = &ctx.event().message;
     match resolve_add_source(message) {
         AddImageSource::Current => {
-            let images = select_images(message.iter(), MAX_ADD_IMAGES, false)?;
+            let images = select_images(message.iter(), max, single)?;
             Ok(images.into_iter().cloned().collect())
         }
-        AddImageSource::Reply(reply_id) => {
-            replied_image_segments(ctx, reply_id, MAX_ADD_IMAGES, false).await
-        }
-        AddImageSource::Missing => Err(CommandError::user(
-            "请在这条消息里带图，或回复一张包含图片的消息后再添加",
-        )),
+        AddImageSource::Reply(reply_id) => replied_image_segments(ctx, reply_id, max, single).await,
+        AddImageSource::Missing => Err(CommandError::user(missing_hint)),
     }
 }
 
@@ -752,15 +769,9 @@ async fn replied_image_segments(
     Ok(images.into_iter().cloned().collect())
 }
 
-async fn load_replied_images(
-    ctx: &CommandContext,
-    reply_id: i32,
-    max: usize,
-    single: bool,
-) -> Result<Vec<Vec<u8>>, CommandError> {
-    let segments = replied_image_segments(ctx, reply_id, max, single).await?;
+async fn load_replied_bytes(segments: &[Segment]) -> Result<Vec<Vec<u8>>, CommandError> {
     let mut loaded = Vec::with_capacity(segments.len());
-    for segment in &segments {
+    for segment in segments {
         loaded.push(load_image_bytes(segment).await?);
     }
     Ok(loaded)
