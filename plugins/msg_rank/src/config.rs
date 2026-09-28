@@ -62,9 +62,25 @@ impl StaticConfig {
 }
 
 pub(crate) fn static_config() -> &'static StaticConfig {
-    static PARSED: LazyLock<StaticConfig> =
-        LazyLock::new(|| utils::config::parse_or_panic("msg_rank"));
+    static PARSED: LazyLock<StaticConfig> = LazyLock::new(|| {
+        let config: StaticConfig = utils::config::parse_or_panic("msg_rank");
+        validate_static(&config);
+        config
+    });
     &PARSED
+}
+
+/// 周报与 `/上周B话榜` 固定统计上一个完整自然周：窗口起点为上周一本地午夜，
+/// 而默认 cron 周一 10:00 触发时距起点已 7 天 10 小时。保留期不足 8 天会把
+/// 窗口尾部静默裁掉，榜单与全勤统计无提示地偏低，因此在启动时直接拒绝。
+fn validate_static(config: &StaticConfig) {
+    if config.retention_days < 8 {
+        panic!(
+            "解析 config.toml 的 [msg_rank] 失败: retention_days = {} 不合法，\
+             最小为 8（周报/上周榜需要覆盖上一个完整自然周，起点距周一触发最长约 7.42 天）",
+            config.retention_days
+        );
+    }
 }
 
 pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
@@ -153,6 +169,23 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{Config, StaticConfig};
+
+    #[test]
+    fn retention_days_below_eight_is_rejected() {
+        let mut parsed: StaticConfig = kovi::toml::from_str("").unwrap();
+        parsed.retention_days = 7;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::validate_static(&parsed);
+        }));
+        assert!(result.is_err(), "retention_days = 7 必须在启动时被拒绝");
+    }
+
+    #[test]
+    fn retention_days_eight_is_accepted() {
+        let mut parsed: StaticConfig = kovi::toml::from_str("").unwrap();
+        parsed.retention_days = 8;
+        super::validate_static(&parsed);
+    }
 
     #[test]
     fn missing_rank_top_defaults_to_ten() {

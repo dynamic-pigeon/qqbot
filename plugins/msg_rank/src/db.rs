@@ -304,7 +304,7 @@ pub(crate) async fn msg_count_top_with_time_range(
     let rows: Vec<(i64, i64)> = sqlx::query_as(
         "
 SELECT user_id, COUNT(*) as count FROM MSG
-    WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+    WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
     GROUP BY user_id
     ORDER BY count DESC
     LIMIT ?
@@ -330,13 +330,14 @@ pub(crate) async fn msg_count_total_with_time_range(
     end_time: i64,
 ) -> Result<u32> {
     let conn = get_pool()?;
-    let (total,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM MSG WHERE group_id = ? AND timestamp BETWEEN ? AND ?")
-            .bind(group_id)
-            .bind(start_time)
-            .bind(end_time)
-            .fetch_one(conn)
-            .await?;
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM MSG WHERE group_id = ? AND timestamp >= ? AND timestamp < ?",
+    )
+    .bind(group_id)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_one(conn)
+    .await?;
 
     Ok(total.max(0) as u32)
 }
@@ -351,7 +352,7 @@ pub(crate) async fn select_text_from_time_range(
     let mut rows = sqlx::query_as::<_, (String,)>(
         "
 SELECT msg FROM MSG
-    WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+    WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
     ORDER BY timestamp DESC
 ",
     )
@@ -396,7 +397,7 @@ pub(crate) async fn msg_count_with_active_days(
 SELECT user_id, COUNT(*) AS cnt,
        COUNT(DISTINCT date(timestamp, 'unixepoch', 'localtime')) AS days
 FROM MSG
-WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
 GROUP BY user_id
 ORDER BY cnt DESC
 ",
@@ -423,7 +424,7 @@ pub(crate) async fn msg_count_by_local_date(
         "
 SELECT date(timestamp, 'unixepoch', 'localtime') AS d, COUNT(*) AS cnt
 FROM MSG
-WHERE group_id = ? AND timestamp BETWEEN ? AND ?
+WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
 GROUP BY d
 ORDER BY d
 ",
@@ -454,9 +455,9 @@ pub(crate) async fn msg_count_top_at_local_hours(
 WHERE group_id = ",
     );
     builder.push_bind(group_id);
-    builder.push(" AND timestamp BETWEEN ");
+    builder.push(" AND timestamp >= ");
     builder.push_bind(start_time);
-    builder.push(" AND ");
+    builder.push(" AND timestamp < ");
     builder.push_bind(end_time);
     builder.push(" AND CAST(strftime('%H', timestamp, 'unixepoch', 'localtime') AS INTEGER) IN (");
     let mut hours_clause = builder.separated(", ");
@@ -702,5 +703,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
+
+        // 各窗口的 end 都是下一周期的起点（本地午夜），窗口是 [start, end)
+        // 半开区间：恰在端点上的消息（如周一 00:00:00）属于后一周期。
+        let boundary = ts(0, 0, 0);
+        sqlx::query("INSERT INTO MSG (group_id, user_id, msg, timestamp) VALUES (?, ?, ?, ?)")
+            .bind(90211_i64)
+            .bind(1_i64)
+            .bind("boundary")
+            .bind(boundary)
+            .execute(get_pool().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            msg_count_total_with_time_range(90211, 0, boundary)
+                .await
+                .unwrap(),
+            0,
+            "端点消息不得计入以它为 end 的窗口"
+        );
+        assert_eq!(
+            msg_count_total_with_time_range(90211, boundary, boundary + 1)
+                .await
+                .unwrap(),
+            1,
+            "端点消息必须计入以它为 start 的窗口"
+        );
     }
 }
