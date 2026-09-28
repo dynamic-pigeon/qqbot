@@ -30,7 +30,7 @@ struct Data {
     pic: String,
     owner: Owner,
     stat: Stat,
-    duration: u32,
+    duration: i64,
 }
 
 #[derive(Deserialize)]
@@ -38,25 +38,27 @@ struct Owner {
     name: String,
 }
 
+// view API 对 UP 主隐藏的数据（充电专属视频、隐藏播放量等）返回 -1，
+// 统计字段是有符号整数，展示层把负数渲染为 --。
 #[derive(Deserialize)]
 struct Stat {
-    view: u32,
-    coin: u32,
-    like: u32,
-    favorite: u32,
+    view: i64,
+    coin: i64,
+    like: i64,
+    favorite: i64,
 }
 
 pub struct BvInfo {
     pub title: String,
     pub pic: bytes::Bytes,
     pub name: String,
-    pub view: u32,
-    pub coin: u32,
-    pub like: u32,
+    pub view: i64,
+    pub coin: i64,
+    pub like: i64,
     #[allow(dead_code)]
-    pub duration: u32,
+    pub duration: i64,
     pub url: String,
-    pub favorite: u32,
+    pub favorite: i64,
 }
 
 impl ApiRes {
