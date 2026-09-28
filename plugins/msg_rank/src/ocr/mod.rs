@@ -52,7 +52,9 @@ pub(crate) fn preload_config() {
 fn ocr_image_hosts() -> &'static [&'static str] {
     static HOSTS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         let mut hosts = utils::QQ_IMAGE_HOSTS.to_vec();
-        hosts.extend(["txmov2.a.yximgs.com", "yximgs.com", "qq.com"]);
+        // 白名单按具体图床域收窄：放进 qq.com 这类注册域整域，任意 *.qq.com
+        // 子域都会通过。QQ 图床的具体域已在 QQ_IMAGE_HOSTS 里。
+        hosts.extend(["txmov2.a.yximgs.com", "yximgs.com"]);
         hosts
     });
     HOSTS.as_slice()

@@ -284,7 +284,11 @@ async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
 }
 
 /// 数量达到 1w 后用 w 作为单位，保留一位小数并去掉多余的 `.0`。
-fn format_count(n: u32) -> String {
+/// 负数是 view API 对隐藏数据的标记值，展示为 `--`。
+fn format_count(n: i64) -> String {
+    if n < 0 {
+        return "--".into();
+    }
     if n < 10000 {
         return n.to_string();
     }
@@ -438,6 +442,11 @@ mod format_count_tests {
         assert_eq!(format_count(12345), "1.2w");
         assert_eq!(format_count(150000), "15w");
         assert_eq!(format_count(99999), "10w");
-        assert_eq!(format_count(u32::MAX), "429496.7w");
+        assert_eq!(format_count(u32::MAX.into()), "429496.7w");
+    }
+
+    #[test]
+    fn hidden_negative_stats_render_as_placeholder() {
+        assert_eq!(format_count(-1), "--");
     }
 }

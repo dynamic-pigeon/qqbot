@@ -457,11 +457,33 @@ fn convert_page_data(data: SpaceData) -> DynamicsPage {
 /// 注意: B 站 web dynamic 接口风控较严，依赖 host 的 User-Agent + Referer +
 /// WBI 签名和游客 Cookie。从被风控的 IP 调用仍可能返回 HTML 验证码页、
 /// HTTP 412 或 `-352` 错误码；首次命中时会刷新匿名会话并重试一次。
+async fn fetch_page_with_browser_retry(
+    uid: u64,
+    offset: Option<&str>,
+) -> Result<DynamicsPage, DynamicsError> {
+    match fetch_page_with_browser(uid, offset).await {
+        Err(error) if error.is_risk_control() => {
+            tracing::warn!("Bilibili Chromium 后备触发风控，刷新页面后重试一次: {error}");
+            fetch_page_with_browser(uid, offset).await
+        }
+        result => result,
+    }
+}
+
 pub async fn fetch_user_dynamics(
     uid: u64,
     offset: Option<&str>,
 ) -> Result<DynamicsPage, DynamicsError> {
-    let session = web_session(false).await?;
+    let session = match web_session(false).await {
+        Ok(session) => session,
+        Err(error) => {
+            // 会话引导（finger/spi、nav）被风控时拿不到 cookie / mixin_key，
+            // 风控页会让 JSON 解码失败或返回 -352/-412。Chromium 后备不依赖
+            // 直连会话，是此时的唯一可用路径。
+            tracing::warn!("Bilibili 匿名会话初始化失败，切换 Chromium 后备: {error}");
+            return fetch_page_with_browser_retry(uid, offset).await;
+        }
+    };
     match fetch_page(uid, offset, &session).await {
         Err(error) if error.is_risk_control() => {
             // `-101` 是登录态失效而非风控：环境变量 cookie 过期时刷新会话仍是坏 cookie，
@@ -475,21 +497,19 @@ pub async fn fetch_user_dynamics(
                 tracing::warn!("BILIBILI_COOKIE 登录态已失效，回退游客会话");
             }
             tracing::warn!("Bilibili 动态请求触发风控，刷新匿名会话后重试一次: {error}");
-            let refreshed = web_session(true).await?;
+            let refreshed = match web_session(true).await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!("Bilibili 会话刷新失败，切换 Chromium 后备: {error}");
+                    return fetch_page_with_browser_retry(uid, offset).await;
+                }
+            };
             match fetch_page(uid, offset, &refreshed).await {
                 Err(error) if error.is_risk_control() => {
                     tracing::warn!(
                         "Bilibili 动态 HTTP 请求持续触发风控，切换 Chromium 后备: {error}"
                     );
-                    match fetch_page_with_browser(uid, offset).await {
-                        Err(error) if error.is_risk_control() => {
-                            tracing::warn!(
-                                "Bilibili Chromium 后备触发风控，刷新页面后重试一次: {error}"
-                            );
-                            fetch_page_with_browser(uid, offset).await
-                        }
-                        result => result,
-                    }
+                    fetch_page_with_browser_retry(uid, offset).await
                 }
                 result => result,
             }
