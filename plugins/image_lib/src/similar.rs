@@ -197,23 +197,30 @@ fn dct1_32(input: &[f64; 32], output: &mut [f64; 32]) {
 }
 
 pub fn hamming(a: &[u64; FINGERPRINT_WORDS], b: &[u64; FINGERPRINT_WORDS]) -> u32 {
+    // musl 基线目标不含 popcnt，count_ones 会被编译成软件实现（慢数倍）；
+    // 部署机 CPU 均支持该指令，运行时检测后走硬件路径。
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_POPCNT: LazyLock<bool> =
+            LazyLock::new(|| std::arch::is_x86_feature_detected!("popcnt"));
+        if *HAS_POPCNT {
+            return unsafe { hamming_popcnt(a, b) };
+        }
+    }
     a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
-fn duplicate_distance(a: Fingerprint, b: Fingerprint) -> u32 {
-    hamming(&a.dhash, &b.dhash).max(hamming(&a.phash, &b.phash))
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn hamming_popcnt(a: &[u64; FINGERPRINT_WORDS], b: &[u64; FINGERPRINT_WORDS]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
-fn maybe_distance(a: Fingerprint, b: Fingerprint) -> u32 {
-    hamming(&a.dhash, &b.dhash).min(hamming(&a.phash, &b.phash))
-}
-
-fn is_duplicate(a: Fingerprint, b: Fingerprint, limit: u32) -> bool {
-    duplicate_distance(a, b) <= limit
-}
-
-fn is_maybe(a: Fingerprint, b: Fingerprint, duplicate_limit: u32, maybe_limit: u32) -> bool {
-    !is_duplicate(a, b, duplicate_limit) && maybe_distance(a, b) <= maybe_limit
+/// 一次算出两路汉明距离的 (max, min)：max 是重复判据，min 是「也许像」判据。
+fn pair_distances(a: Fingerprint, b: Fingerprint) -> (u32, u32) {
+    let d = hamming(&a.dhash, &b.dhash);
+    let p = hamming(&a.phash, &b.phash);
+    (d.max(p), d.min(p))
 }
 
 pub(crate) fn percent_from_distance(distance: u32) -> u8 {
@@ -260,13 +267,9 @@ pub fn cluster(
     let mut dup_edges: Vec<(usize, usize, u32)> = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
-            if is_duplicate(
-                images[i].fingerprint,
-                images[j].fingerprint,
-                duplicate_limit,
-            ) {
-                let dist = duplicate_distance(images[i].fingerprint, images[j].fingerprint);
-                dup_edges.push((i, j, dist));
+            let (dup_dist, _) = pair_distances(images[i].fingerprint, images[j].fingerprint);
+            if dup_dist <= duplicate_limit {
+                dup_edges.push((i, j, dup_dist));
                 union(&mut parent, i, j);
             }
         }
@@ -320,21 +323,18 @@ pub fn cluster(
             if in_duplicate[j] {
                 continue;
             }
-            if !is_maybe(
-                images[i].fingerprint,
-                images[j].fingerprint,
-                duplicate_limit,
-                maybe_limit,
-            ) {
+            let (dup_dist, maybe_dist) =
+                pair_distances(images[i].fingerprint, images[j].fingerprint);
+            // 重复判据先过：已是重复组成员的图不参与「也许像」配对。
+            if dup_dist <= duplicate_limit || maybe_dist > maybe_limit {
                 continue;
             }
-            let dist = maybe_distance(images[i].fingerprint, images[j].fingerprint);
             let mut hashes = vec![images[i].hash.clone(), images[j].hash.clone()];
             hashes.sort();
             groups.push(SimilarGroup {
                 kind: GroupKind::Maybe,
                 hashes,
-                percent: percent_from_distance(dist),
+                percent: percent_from_distance(maybe_dist),
                 truncated: false,
             });
             maybe_groups += 1;
@@ -388,6 +388,10 @@ mod tests {
 
     fn fp(bytes: &[u8]) -> Fingerprint {
         fingerprint_bytes(bytes).expect("fingerprint")
+    }
+
+    fn duplicate_distance(a: Fingerprint, b: Fingerprint) -> u32 {
+        pair_distances(a, b).0
     }
 
     /// 把单个 u64 复制成 4 个词，供手工构造指纹的距离关系测试。
