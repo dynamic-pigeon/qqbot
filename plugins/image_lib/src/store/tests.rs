@@ -308,6 +308,20 @@ async fn fingerprints_cover_library_and_skip_undecodable() {
     let (alias, again) = store.fingerprints_for_library(group, "喵").await.unwrap();
     assert_eq!(alias, "猫");
     assert_eq!(again.len(), 2);
+    // 落库断言：指纹必须持久化，否则每次查重都会全量重算。
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join(group.to_string()).join("index.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM perceptual")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "指纹未落库");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -431,4 +445,53 @@ fn weight_halves_per_extra_draw() {
     assert_eq!(weight(min + 1, min), 1 << 11);
     assert_eq!(weight(min + 12, min), 1);
     assert_eq!(weight(min + 13, min), 1);
+}
+
+#[tokio::test]
+async fn narrow_fingerprint_table_is_rebuilt_on_open() {
+    let (store, dir) = temp_store();
+    let group = 77;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE perceptual (
+            hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
+            dhash BLOB NOT NULL CHECK (length(dhash) = 16),
+            phash BLOB NOT NULL CHECK (length(phash) = 16)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // 任意一次库操作都会走 ensure_pool → init_schema，触发换代重建。
+    store.stats(group).await.err();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .read_only(true);
+    let check = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let sql =
+        sqlx::query_scalar::<_, String>("SELECT sql FROM sqlite_master WHERE name = 'perceptual'")
+            .fetch_one(&check)
+            .await
+            .unwrap();
+    assert!(
+        sql.contains("length(dhash) = 32"),
+        "narrow table not rebuilt: {sql}"
+    );
+    check.close().await;
+    let _ = std::fs::remove_dir_all(dir);
 }
