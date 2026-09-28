@@ -31,15 +31,35 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_aliases_target ON aliases(target)")
         .execute(pool)
         .await?;
+    migrate_fingerprint_width(pool).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS perceptual (
             hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
-            dhash INTEGER NOT NULL,
-            phash INTEGER NOT NULL
+            dhash BLOB NOT NULL CHECK (length(dhash) = 16),
+            phash BLOB NOT NULL CHECK (length(phash) = 16)
         )",
     )
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// 64-bit 时代的旧表把指纹存成两列 INTEGER，256-bit 指纹改存 BLOB。
+/// 指纹可从 blobs 懒补齐，直接弃表重建，首次查重时重算即可。
+async fn migrate_fingerprint_width(pool: &SqlitePool) -> Result<(), StoreError> {
+    let rows = sqlx::query("PRAGMA table_info(perceptual)")
+        .fetch_all(pool)
+        .await?;
+    let legacy = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .is_ok_and(|name| name == "dhash")
+            && row
+                .try_get::<String, _>("type")
+                .is_ok_and(|ty| ty == "INTEGER")
+    });
+    if legacy {
+        sqlx::query("DROP TABLE perceptual").execute(pool).await?;
+    }
     Ok(())
 }
 
