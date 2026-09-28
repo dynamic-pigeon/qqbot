@@ -35,8 +35,8 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS perceptual (
             hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
-            dhash BLOB NOT NULL CHECK (length(dhash) = 16),
-            phash BLOB NOT NULL CHECK (length(phash) = 16)
+            dhash BLOB NOT NULL CHECK (length(dhash) = 32),
+            phash BLOB NOT NULL CHECK (length(phash) = 32)
         )",
     )
     .execute(pool)
@@ -44,20 +44,22 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// 64-bit 时代的旧表把指纹存成两列 INTEGER，256-bit 指纹改存 BLOB。
-/// 指纹可从 blobs 懒补齐，直接弃表重建，首次查重时重算即可。
+/// 指纹表换代：64-bit 时代的两列 INTEGER，以及 CHECK 写错成 16 字节的
+/// BLOB 表（256-bit 指针是 4×u64 = 32 字节，当时插入全被约束拒绝又被
+/// OR IGNORE 静默吞掉，表必为空）。两者都直接弃表重建，指纹由 blobs
+/// 懒补齐重算。
 async fn migrate_fingerprint_width(pool: &SqlitePool) -> Result<(), StoreError> {
-    let rows = sqlx::query("PRAGMA table_info(perceptual)")
-        .fetch_all(pool)
-        .await?;
-    let legacy = rows.iter().any(|row| {
-        row.try_get::<String, _>("name")
-            .is_ok_and(|name| name == "dhash")
-            && row
-                .try_get::<String, _>("type")
-                .is_ok_and(|ty| ty == "INTEGER")
-    });
-    if legacy {
+    let sql = sqlx::query_scalar::<_, String>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'perceptual'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    let legacy_integer = sql.contains("INTEGER");
+    let legacy_narrow = sql.contains("length(dhash) = 16");
+    if legacy_integer || legacy_narrow {
         sqlx::query("DROP TABLE perceptual").execute(pool).await?;
     }
     Ok(())
