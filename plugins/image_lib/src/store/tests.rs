@@ -492,6 +492,41 @@ async fn narrow_fingerprint_table_is_rebuilt_on_open() {
         sql.contains("length(dhash) = 32"),
         "narrow table not rebuilt: {sql}"
     );
+    let version =
+        sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = 'perceptual'")
+            .fetch_one(&check)
+            .await
+            .unwrap();
+    assert_eq!(version, "v2");
     check.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn newer_fingerprint_schema_is_rejected() {
+    let (store, dir) = temp_store();
+    let group = 78;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE schema_meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_meta VALUES ('perceptual', 'v9')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let result = store.stats(group).await;
+    assert!(result.is_err(), "新版本库不应被旧代码打开");
     let _ = std::fs::remove_dir_all(dir);
 }
