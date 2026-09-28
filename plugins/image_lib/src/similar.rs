@@ -1,12 +1,16 @@
 use image::{DynamicImage, GrayImage, ImageReader, Limits, imageops::FilterType};
 use std::{io::Cursor, sync::LazyLock};
 
-/// 64-bit 感知哈希。dHash 看邻域差分，pHash 看低频 DCT。
+/// 256-bit 感知哈希。dHash 看邻域差分，pHash 看低频 DCT。
+/// 比特按行主序切成 4 个 u64 词，`bit / 64` 定词、`bit % 64` 定位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fingerprint {
-    pub dhash: u64,
-    pub phash: u64,
+    pub dhash: [u64; FINGERPRINT_WORDS],
+    pub phash: [u64; FINGERPRINT_WORDS],
 }
+
+/// 每路哈希的 64-bit 词数，两路共 512 bit。
+pub(crate) const FINGERPRINT_WORDS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HashedImage {
@@ -30,11 +34,11 @@ pub struct SimilarGroup {
     pub truncated: bool,
 }
 
-const DHASH_WIDTH: u32 = 9;
-const DHASH_HEIGHT: u32 = 8;
+const DHASH_WIDTH: u32 = 17;
+const DHASH_HEIGHT: u32 = 16;
 const PHASH_SIZE: u32 = 32;
-const PHASH_WINDOW: usize = 8;
-const HASH_BITS: u32 = 64;
+const PHASH_WINDOW: usize = 16;
+const HASH_BITS: u32 = 256;
 /// 单个重复组的成员上限。并查集可把整库近似图并成一桶，展示端逐张读 blob，必须设界。
 const MAX_GROUP_MEMBERS: usize = 30;
 /// 「也许像」组数上限。最坏两两成对是 O(n²)，全量生成会撑爆查重会话内存。
@@ -89,26 +93,27 @@ fn fingerprint_image(image: &DynamicImage) -> Option<Fingerprint> {
     })
 }
 
-/// 缩到 9×8 后比较左右邻像素。对再压缩和轻微缩放稳定。
-fn difference_hash(gray: &GrayImage) -> u64 {
+/// 缩到 17×16 后比较左右邻像素，16 行 × 每行 16 次比较 = 256 bit。
+/// 对再压缩和轻微缩放稳定。
+fn difference_hash(gray: &GrayImage) -> [u64; FINGERPRINT_WORDS] {
     let small = image::imageops::resize(gray, DHASH_WIDTH, DHASH_HEIGHT, FilterType::Triangle);
-    let mut bits = 0u64;
-    let mut bit = 0u32;
+    let mut bits = [0u64; FINGERPRINT_WORDS];
     for y in 0..DHASH_HEIGHT {
         for x in 0..DHASH_WIDTH - 1 {
             let left = small.get_pixel(x, y).0[0];
             let right = small.get_pixel(x + 1, y).0[0];
+            let bit = (y * (DHASH_WIDTH - 1) + x) as usize;
             if left > right {
-                bits |= 1 << bit;
+                bits[bit / 64] |= 1 << (bit % 64);
             }
-            bit += 1;
         }
     }
     bits
 }
 
-/// 32×32 DCT 后取最低频 8×8 AC 系数。对滤镜、调色比纯差分稳。
-fn perceptual_hash(gray: &GrayImage) -> u64 {
+/// 32×32 DCT 后取 (1,1) 起的 16×16 AC 系数 = 256 bit。
+/// 比旧的 8×8 窗口多收中频结构，对低频格局撞车的图区分度更高。
+fn perceptual_hash(gray: &GrayImage) -> [u64; FINGERPRINT_WORDS] {
     let small = image::imageops::resize(gray, PHASH_SIZE, PHASH_SIZE, FilterType::Triangle);
     let mut values = [[0.0f64; PHASH_SIZE as usize]; PHASH_SIZE as usize];
     for y in 0..PHASH_SIZE {
@@ -120,7 +125,7 @@ fn perceptual_hash(gray: &GrayImage) -> u64 {
 
     let mut coeffs = [0.0f64; PHASH_WINDOW * PHASH_WINDOW];
     let mut i = 0;
-    // 丢掉 DC，从 (1,1) 取 8×8，避免平均亮度主导比特。
+    // 丢掉 DC，从 (1,1) 取 16×16，避免平均亮度主导比特。
     for row in dct.iter().skip(1).take(PHASH_WINDOW) {
         for coeff in row.iter().skip(1).take(PHASH_WINDOW) {
             coeffs[i] = *coeff;
@@ -129,12 +134,12 @@ fn perceptual_hash(gray: &GrayImage) -> u64 {
     }
     let mut sorted = coeffs;
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let median = (sorted[31] + sorted[32]) / 2.0;
+    let median = (sorted[127] + sorted[128]) / 2.0;
 
-    let mut bits = 0u64;
+    let mut bits = [0u64; FINGERPRINT_WORDS];
     for (bit, coeff) in coeffs.iter().enumerate() {
         if *coeff > median {
-            bits |= 1 << bit;
+            bits[bit / 64] |= 1 << (bit % 64);
         }
     }
     bits
@@ -191,16 +196,16 @@ fn dct1_32(input: &[f64; 32], output: &mut [f64; 32]) {
     }
 }
 
-pub fn hamming(a: u64, b: u64) -> u32 {
-    (a ^ b).count_ones()
+pub fn hamming(a: &[u64; FINGERPRINT_WORDS], b: &[u64; FINGERPRINT_WORDS]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
 fn duplicate_distance(a: Fingerprint, b: Fingerprint) -> u32 {
-    hamming(a.dhash, b.dhash).max(hamming(a.phash, b.phash))
+    hamming(&a.dhash, &b.dhash).max(hamming(&a.phash, &b.phash))
 }
 
 fn maybe_distance(a: Fingerprint, b: Fingerprint) -> u32 {
-    hamming(a.dhash, b.dhash).min(hamming(a.phash, b.phash))
+    hamming(&a.dhash, &b.dhash).min(hamming(&a.phash, &b.phash))
 }
 
 fn is_duplicate(a: Fingerprint, b: Fingerprint, limit: u32) -> bool {
@@ -385,10 +390,18 @@ mod tests {
         fingerprint_bytes(bytes).expect("fingerprint")
     }
 
+    /// 把单个 u64 复制成 4 个词，供手工构造指纹的距离关系测试。
+    fn words(value: u64) -> [u64; FINGERPRINT_WORDS] {
+        [value; FINGERPRINT_WORDS]
+    }
+
     fn hashed(hash: &str, dhash: u64, phash: u64) -> HashedImage {
         HashedImage {
             hash: hash.into(),
-            fingerprint: Fingerprint { dhash, phash },
+            fingerprint: Fingerprint {
+                dhash: words(dhash),
+                phash: words(phash),
+            },
         }
     }
 
@@ -410,7 +423,7 @@ mod tests {
         let high = fp(&jpeg_bytes(&image, 90));
         let low = fp(&jpeg_bytes(&image, 40));
         assert!(
-            duplicate_distance(high, low) <= 8,
+            duplicate_distance(high, low) <= 32,
             "distance {}",
             duplicate_distance(high, low)
         );
@@ -421,7 +434,7 @@ mod tests {
         let a = fp(&png_bytes(&patterned(1)));
         let b = fp(&png_bytes(&patterned(200)));
         assert!(
-            duplicate_distance(a, b) > 16,
+            duplicate_distance(a, b) > 64,
             "distance {}",
             duplicate_distance(a, b)
         );
@@ -479,7 +492,7 @@ mod tests {
         let images: Vec<_> = (0..40)
             .map(|i| hashed(&format!("d{i}"), 0x1111, 0x1111))
             .collect();
-        let groups = cluster(&images, 8, 16);
+        let groups = cluster(&images, 32, 64);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].hashes.len(), MAX_GROUP_MEMBERS);
         assert!(groups[0].truncated);
@@ -501,12 +514,12 @@ mod tests {
         for i in 0..images.len() {
             for j in (i + 1)..images.len() {
                 assert!(
-                    hamming(images[i].fingerprint.dhash, images[j].fingerprint.dhash) > 8,
+                    hamming(&images[i].fingerprint.dhash, &images[j].fingerprint.dhash) > 32,
                     "测试构造不满足两两不重复的前提"
                 );
             }
         }
-        let groups = cluster(&images, 8, 16);
+        let groups = cluster(&images, 32, 64);
         assert!(groups.iter().all(|g| g.kind == GroupKind::Maybe));
         assert_eq!(groups.len(), MAX_MAYBE_GROUPS);
     }
@@ -523,7 +536,7 @@ mod tests {
             hashed("f", 0x1111, u64::MAX),
         ];
 
-        let groups = cluster(&images, 8, 16);
+        let groups = cluster(&images, 32, 64);
         let dups: Vec<_> = groups
             .iter()
             .filter(|g| g.kind == GroupKind::Duplicate)
@@ -541,8 +554,8 @@ mod tests {
     #[test]
     fn percent_round_trips_through_title_distance() {
         assert_eq!(percent_from_distance(0), 100);
-        assert_eq!(percent_from_distance(8), 87);
-        assert_eq!(distance_from_percent(87), 8);
+        assert_eq!(percent_from_distance(32), 87);
+        assert_eq!(distance_from_percent(87), 33);
         assert_eq!(
             u32::from(percent_from_distance(distance_from_percent(90))),
             90
