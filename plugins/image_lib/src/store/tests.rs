@@ -284,6 +284,16 @@ fn patterned_png(seed: u32) -> Vec<u8> {
     buf.into_inner()
 }
 
+#[test]
+fn small_blob_stays_in_parallel_lane() {
+    let dir = std::env::temp_dir().join("image_lib_head_probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("small.png");
+    std::fs::write(&path, patterned_png(3)).unwrap();
+    assert!(!is_large_blob(&path));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn fingerprints_cover_library_and_skip_undecodable() {
     let (store, dir) = temp_store();
