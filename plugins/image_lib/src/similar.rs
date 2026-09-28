@@ -82,6 +82,15 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> Option<Fingerprint> {
     fingerprint_image(&image)
 }
 
+/// 只读文件头拿像素尺寸（JPEG SOF、PNG IHDR 等），不解码。
+/// 大图分道用它估算解码后的内存占用——文件字节是被压缩过的，做不了主。
+pub(crate) fn pixel_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
+}
+
 fn fingerprint_image(image: &DynamicImage) -> Option<Fingerprint> {
     let gray = image.to_luma8();
     if gray.width() == 0 || gray.height() == 0 || is_flat(&gray) {
@@ -407,6 +416,14 @@ mod tests {
                 phash: words(phash),
             },
         }
+    }
+
+    #[test]
+    fn pixel_dimensions_reads_headers() {
+        let image = patterned(3);
+        assert_eq!(pixel_dimensions(&png_bytes(&image)), Some((64, 64)));
+        assert_eq!(pixel_dimensions(&jpeg_bytes(&image, 80)), Some((64, 64)));
+        assert_eq!(pixel_dimensions(b"not an image"), None);
     }
 
     #[test]

@@ -714,10 +714,34 @@ impl Store {
     }
 }
 
-/// 超过此字节数的图不进并行队列，交给单独的串行队列：
-/// 大图解码后的像素缓冲可接近 128 MiB 的分配上限，多张同时解会把
-/// 峰值内存叠到数倍，在无 swap、余量紧张的部署机上不可接受。
-const PARALLEL_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+/// 解码后的像素缓冲（RGB + luma 副本按每像素 4 字节估算）超过此值的图
+/// 不进并行队列，交给单独的串行队列：多张大缓冲同时解会把峰值内存叠到
+/// 数倍，在无 swap、余量紧张的部署机上不可接受。文件字节是被压缩过的
+/// 差代理（一张 4 MiB 的 JPEG 也能解出 6000×8000），分道看解码后大小。
+const PARALLEL_DECODE_LIMIT: u64 = 32 * 1024 * 1024;
+
+/// 头部预读字节数：PNG IHDR 在前 33 字节，JPEG 的 SOF 通常也在头部；
+/// 带 Exif 缩略图的 JPEG 段可能更长，解析不出时退回文件字节兜底。
+const DIMENSION_HEAD: usize = 64 * 1024;
+
+/// 读文件头估出解码后大小，决定走并行还是串行队列。
+/// blob 按内容寻址、写入后不变，头部足以定案。
+fn is_large_blob(path: &PathBuf) -> bool {
+    let mut head = vec![0u8; DIMENSION_HEAD];
+    let read =
+        std::fs::File::open(path).and_then(|mut file| std::io::Read::read(&mut file, &mut head));
+    match read {
+        Ok(n) => {
+            head.truncate(n);
+            match crate::similar::pixel_dimensions(&head) {
+                Some((w, h)) => u64::from(w) * u64::from(h) * 4 > PARALLEL_DECODE_LIMIT,
+                // 头解析不出：退回文件字节判据，宁可串行也不放进并行。
+                None => std::fs::metadata(path).is_ok_and(|meta| meta.len() > 4 * 1024 * 1024),
+            }
+        }
+        Err(_) => true,
+    }
+}
 
 /// 单个解码 worker：固定数量的 async 任务，从队列动态领活，同一时刻
 /// 只挂一个 blocking 解码，所以占用的解码线程数恒等于 worker 数。
@@ -751,15 +775,11 @@ async fn fingerprint_missing(
     if missing.is_empty() {
         return Ok(Vec::new());
     }
-    // blob 按内容寻址、写入后不变，stat 的长度就是读出的长度，
-    // 分组可以在读盘前完成。
+    // blob 按内容寻址、写入后不变，读头部即可在载入前完成分道。
     let mut small = Vec::with_capacity(missing.len());
     let mut large = Vec::new();
     for entry in missing {
-        let is_large = std::fs::metadata(&entry.1)
-            .map(|meta| meta.len() > PARALLEL_FILE_LIMIT)
-            .unwrap_or(false);
-        if is_large {
+        if is_large_blob(&entry.1) {
             large.push(entry);
         } else {
             small.push(entry);
