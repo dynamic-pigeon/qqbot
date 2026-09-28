@@ -4,6 +4,10 @@ use sqlx::{Row, SqlitePool};
 
 use super::StoreError;
 
+/// 指纹表结构版本，存进 schema_meta，换代只看它：
+/// v1 是 64-bit 指纹的两列 INTEGER；v2 是 256-bit 指纹的两列 32 字节 BLOB。
+const FINGERPRINT_SCHEMA: &str = "v2";
+
 pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS images (
@@ -31,9 +35,40 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_aliases_target ON aliases(target)")
         .execute(pool)
         .await?;
-    migrate_fingerprint_width(pool).await?;
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS perceptual (
+        "CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT NOT NULL PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    migrate_fingerprint_schema(pool).await?;
+    Ok(())
+}
+
+/// 没有版本记录的库——全新库、v1 的 INTEGER 表、CHECK 误写成 16 的
+/// 中间态——统一弃表重建；指纹可从 blobs 懒补齐，无损。库里的版本
+/// 比代码新时报错拒开，防止旧二进制把新表写坏。
+async fn migrate_fingerprint_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = 'perceptual'")
+            .fetch_optional(pool)
+            .await?;
+    match current.as_deref() {
+        Some(FINGERPRINT_SCHEMA) => return Ok(()),
+        Some(newer) => {
+            return Err(StoreError::Other(anyhow::anyhow!(
+                "指纹表版本 {newer} 比当前代码支持的 {FINGERPRINT_SCHEMA} 新，请先升级程序"
+            )));
+        }
+        None => {}
+    }
+    sqlx::query("DROP TABLE IF EXISTS perceptual")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE perceptual (
             hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
             dhash BLOB NOT NULL CHECK (length(dhash) = 32),
             phash BLOB NOT NULL CHECK (length(phash) = 32)
@@ -41,27 +76,13 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     )
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-/// 指纹表换代：64-bit 时代的两列 INTEGER，以及 CHECK 写错成 16 字节的
-/// BLOB 表（256-bit 指针是 4×u64 = 32 字节，当时插入全被约束拒绝又被
-/// OR IGNORE 静默吞掉，表必为空）。两者都直接弃表重建，指纹由 blobs
-/// 懒补齐重算。
-async fn migrate_fingerprint_width(pool: &SqlitePool) -> Result<(), StoreError> {
-    let sql = sqlx::query_scalar::<_, String>(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'perceptual'",
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES ('perceptual', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
-    .fetch_optional(pool)
+    .bind(FINGERPRINT_SCHEMA)
+    .execute(pool)
     .await?;
-    let Some(sql) = sql else {
-        return Ok(());
-    };
-    let legacy_integer = sql.contains("INTEGER");
-    let legacy_narrow = sql.contains("length(dhash) = 16");
-    if legacy_integer || legacy_narrow {
-        sqlx::query("DROP TABLE perceptual").execute(pool).await?;
-    }
     Ok(())
 }
 
