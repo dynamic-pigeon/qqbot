@@ -159,9 +159,19 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
     ///
     /// 直接 drop 旧 lease 再 [`get`](Self::get) 时，销毁回调在最后一个 lease
     /// 释放时异步触发、无人等待，新实例可能在旧实例还没彻底销毁时就构建。
-    /// 对依赖独占外部资源（如浏览器 profile 锁）的实例，二者会互相冲突。
+    /// 对依赖独占外部资源（如浏览器 profile 锁）的实例，二者会相互冲突。
     /// 本方法保证新实例一定在旧实例销毁完成后才构建。
     pub async fn replace(&self, mut resource: ManagedResource<T>) -> Result<ManagedResource<T>> {
+        let runtime = Handle::try_current()
+            .map_err(|_| anyhow!("ResourceManager::replace 必须在 Tokio runtime 中调用"))?;
+
+        // take-销毁-重建-写回全程持有 build_lock：并发 get 要么早已命中缓存实例，
+        // 要么在锁上等待、拿锁后命中写回的新实例。若在锁外 take，缓存空窗期里
+        // 并发 get 会构建出新实例写回缓存，replace 结束时的写回直接把它顶掉；
+        // 被顶掉的实例若已空闲，其 cleanup 任务会因 generation 不匹配静默退出，
+        // destructor 永远不执行（进程与 profile 目录泄漏）。
+        let _build_guard = self.inner.build_lock.lock().await;
+
         // 从缓存取出旧实例；缓存为空或传入 lease 与缓存实例不一致时无法原地
         // 替换，退化为普通 get。std MutexGuard 非 Send，取出的动作放在独立块里，
         // 让守卫在进入任何 await 之前释放。
@@ -175,7 +185,6 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
                         .is_some_and(|r| Arc::ptr_eq(r, &cached)) =>
                 {
                     state.cancel_cleanup();
-                    state.generation = state.generation.wrapping_add(1);
                     Some(cached)
                 }
                 Some(cached) => {
@@ -186,6 +195,8 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
             }
         };
         let Some(old) = old else {
+            // 已持有 build_lock，AsyncMutex 不可重入，先释放再走 get。
+            drop(_build_guard);
             drop(resource);
             return self.get().await;
         };
@@ -196,16 +207,15 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
         drop(resource);
         drop(lease_ref);
 
-        let _build_guard = self.inner.build_lock.lock().await;
         if let Ok(old_value) = Arc::try_unwrap(old) {
             (self.inner.destructor)(old_value).await;
         } else {
             debug!("resource manager: replace 时旧实例仍有其他引用，跳过显式销毁");
         }
 
-        let runtime = Handle::try_current()?;
         let new_resource = Arc::new((self.inner.builder)().await?);
         let mut state = lock_state(&self.inner.state);
+        state.cancel_cleanup();
         state.resource = Some(Arc::clone(&new_resource));
         state.generation = state.generation.wrapping_add(1);
         Ok(ManagedResource {
@@ -494,6 +504,118 @@ mod tests {
         assert_eq!(*new_lease, 42);
         // replace 返回时销毁回调已跑完。
         assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+    }
+
+    /// replace 进行中（销毁旧实例阶段）并发的 get 必须等 build_lock、拿到
+    /// replace 写回的新实例，不得自建。
+    #[tokio::test]
+    async fn get_during_replace_waits_for_new_instance() {
+        use tokio::sync::oneshot;
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let destroyed = Arc::new(AtomicUsize::new(0));
+        // 实例 1 的销毁先通知测试再等放行信号，把 replace 停在销毁阶段。
+        // oneshot Sender 的 send 消耗自身，包进 Mutex<Option<_>> 让 Fn 闭包可重入。
+        let (destroy_started_tx, destroy_started_rx) = oneshot::channel::<()>();
+        let notify: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(destroy_started_tx)));
+        let gate: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        let manager = ResourceManager::new_with_destructor(
+            Duration::from_secs(10),
+            {
+                let builds = Arc::clone(&builds);
+                move || {
+                    let builds = Arc::clone(&builds);
+                    async move { Ok(builds.fetch_add(1, Ordering::SeqCst) + 1) }
+                }
+            },
+            {
+                let destroyed = Arc::clone(&destroyed);
+                let gate = Arc::clone(&gate);
+                let notify = Arc::clone(&notify);
+                move |value| {
+                    let destroyed = Arc::clone(&destroyed);
+                    let gate = Arc::clone(&gate);
+                    let notify = Arc::clone(&notify);
+                    async move {
+                        if value == 1 {
+                            if let Some(tx) = notify.lock().await.take() {
+                                let _ = tx.send(());
+                            }
+                            if let Some(release) = gate.lock().await.take() {
+                                let _ = release.await;
+                            }
+                        }
+                        destroyed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
+        );
+
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        *gate.lock().await = Some(release_rx);
+
+        let lease = manager.get().await.unwrap();
+        assert_eq!(*lease, 1);
+
+        let replace_manager = manager.clone();
+        let replace = tokio::spawn(async move { replace_manager.replace(lease).await.unwrap() });
+
+        // 等 replace 真正进入销毁阶段（缓存已 take）再发起并发 get；
+        // get 抢在 take 之前跑会直接命中旧缓存，测不到交叠。
+        destroy_started_rx.await.unwrap();
+        tokio::spawn(async move {
+            let _ = release_tx.send(());
+        });
+
+        let got = manager.get().await.unwrap();
+        let new_lease = replace.await.unwrap();
+
+        assert_eq!(*got, 2, "并发 get 必须拿到 replace 写回的新实例");
+        assert_eq!(*new_lease, 2);
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "并发 get 不得自建实例");
+        assert_eq!(destroyed.load(Ordering::SeqCst), 1);
+    }
+
+    /// 多线程 runtime 下 replace 与 get 并发交错时，每个构建出的实例都必须走到
+    /// 销毁路径，drops == builds。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_replace_and_get_never_leak_instances() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let manager = ResourceManager::new(Duration::from_millis(1), {
+            let builds = Arc::clone(&builds);
+            let drops = Arc::clone(&drops);
+            move || {
+                let builds = Arc::clone(&builds);
+                let drops = Arc::clone(&drops);
+                async move {
+                    Ok(TrackedResource {
+                        value: builds.fetch_add(1, Ordering::SeqCst) + 1,
+                        drops,
+                    })
+                }
+            }
+        });
+
+        for _ in 0..100 {
+            let lease = manager.get().await.unwrap();
+            let (replaced, g1, g2) =
+                tokio::join!(manager.replace(lease), manager.get(), manager.get(),);
+            drop(replaced.unwrap());
+            drop(g1.unwrap());
+            drop(g2.unwrap());
+        }
+
+        // idle_timeout 只有 1ms，留出时间让空闲回收与延迟销毁任务全部落地。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            drops.load(Ordering::SeqCst),
+            "构建出的实例必须全部销毁，不允许静默泄漏"
+        );
     }
 
     #[tokio::test(start_paused = true)]
