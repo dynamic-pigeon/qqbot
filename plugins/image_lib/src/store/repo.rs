@@ -5,7 +5,21 @@ use std::collections::{HashMap, HashSet};
 use sqlx::{Row, SqlitePool};
 
 use super::{StagedImage, StoreError};
-use crate::similar::Fingerprint;
+use crate::similar::{FINGERPRINT_WORDS, Fingerprint};
+
+/// 指纹词组序列化成大端 BLOB，与建表的 `length = 16` 约束对齐。
+fn pack_words(words: &[u64; FINGERPRINT_WORDS]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_be_bytes()).collect()
+}
+
+fn unpack_words(bytes: &[u8]) -> Option<[u64; FINGERPRINT_WORDS]> {
+    let mut words = [0u64; FINGERPRINT_WORDS];
+    for (i, word) in words.iter_mut().enumerate() {
+        let start = i * 8;
+        *word = u64::from_be_bytes(bytes.get(start..start + 8)?.try_into().ok()?);
+    }
+    Some(words)
+}
 
 pub(super) async fn resolve_library(pool: &SqlitePool, name: &str) -> Result<String, StoreError> {
     let target = sqlx::query_scalar::<_, String>("SELECT target FROM aliases WHERE alias = ?")
@@ -106,8 +120,8 @@ pub(super) async fn insert_fingerprints(
     for (hash, fingerprint) in fingerprints {
         sqlx::query("INSERT OR IGNORE INTO perceptual (hash, dhash, phash) VALUES (?, ?, ?)")
             .bind(hash)
-            .bind(fingerprint.dhash as i64)
-            .bind(fingerprint.phash as i64)
+            .bind(pack_words(&fingerprint.dhash))
+            .bind(pack_words(&fingerprint.phash))
             .execute(pool)
             .await?;
     }
@@ -137,15 +151,18 @@ pub(super) async fn library_fingerprints(
     .await?;
     let mut found = HashMap::new();
     for row in rows {
-        found.insert(
-            row.try_get::<String, _>("hash")?,
-            Fingerprint {
-                dhash: row.try_get::<i64, _>("dhash")? as u64,
-                phash: row.try_get::<i64, _>("phash")? as u64,
-            },
-        );
+        let hash = row.try_get::<String, _>("hash")?;
+        let dhash = unpack_words(&row.try_get::<Vec<u8>, _>("dhash")?)
+            .ok_or_else(|| corrupt_fingerprint(&hash))?;
+        let phash = unpack_words(&row.try_get::<Vec<u8>, _>("phash")?)
+            .ok_or_else(|| corrupt_fingerprint(&hash))?;
+        found.insert(hash, Fingerprint { dhash, phash });
     }
     Ok(found)
+}
+
+fn corrupt_fingerprint(hash: &str) -> StoreError {
+    StoreError::Other(anyhow::anyhow!("指纹 BLOB 长度异常: {hash}"))
 }
 
 pub(super) async fn insert_images(
