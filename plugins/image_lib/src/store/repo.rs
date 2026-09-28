@@ -7,7 +7,7 @@ use sqlx::{Row, SqlitePool};
 use super::{StagedImage, StoreError};
 use crate::similar::{FINGERPRINT_WORDS, Fingerprint};
 
-/// 指纹词组序列化成大端 BLOB，与建表的 `length = 16` 约束对齐。
+/// 指纹词组序列化成大端 BLOB：4×u64 = 32 字节，与建表 CHECK 对齐。
 fn pack_words(words: &[u64; FINGERPRINT_WORDS]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_be_bytes()).collect()
 }
@@ -118,12 +118,17 @@ pub(super) async fn insert_fingerprints(
     fingerprints: &[(String, Fingerprint)],
 ) -> Result<(), StoreError> {
     for (hash, fingerprint) in fingerprints {
-        sqlx::query("INSERT OR IGNORE INTO perceptual (hash, dhash, phash) VALUES (?, ?, ?)")
-            .bind(hash)
-            .bind(pack_words(&fingerprint.dhash))
-            .bind(pack_words(&fingerprint.phash))
-            .execute(pool)
-            .await?;
+        // 只忽略主键冲突（并发补指纹的幂等）；CHECK 违约必须报错，
+        // 不能像 OR IGNORE 那样把约束错误也静默吞掉。
+        sqlx::query(
+            "INSERT INTO perceptual (hash, dhash, phash) VALUES (?, ?, ?)
+             ON CONFLICT(hash) DO NOTHING",
+        )
+        .bind(hash)
+        .bind(pack_words(&fingerprint.dhash))
+        .bind(pack_words(&fingerprint.phash))
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
