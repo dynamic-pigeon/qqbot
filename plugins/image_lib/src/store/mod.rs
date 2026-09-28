@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use kovi::tokio::sync::{Mutex, mpsc};
+use kovi::tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rand::seq::IndexedRandom;
@@ -575,46 +575,59 @@ impl Store {
     }
 
     /// 解析库名（含别名），补齐缺失的感知哈希后返回可比较的图。
+    /// 重算缺失指纹是读盘加解码的重活：锁内只做快照与写回，解码在群锁外
+    /// 并行进行，首查重全库重算期间同群的抽图/加图不会被卡住。
     pub async fn fingerprints_for_library(
         &self,
         group_id: i64,
         name: &str,
     ) -> Result<(String, Vec<HashedImage>), StoreError> {
         let blobs = self.blobs_dir(group_id);
-        self.with_group(group_id, |pool| async move {
-            let library = resolve_library(&pool, name).await?;
-            if !library_exists(&pool, &library).await? {
-                return Err(StoreError::LibraryMissing);
-            }
-            let hashes: Vec<String> = library_hashes(&pool, &library).await?.into_iter().collect();
-            let mut fingerprints = library_fingerprints(&pool, &library).await?;
-            let missing: Vec<(String, PathBuf)> = hashes
-                .iter()
-                .filter(|hash| !fingerprints.contains_key(*hash))
-                .filter_map(|hash| {
-                    blob_file(&blobs, hash)
-                        .ok()
-                        .map(|path| (hash.clone(), path))
-                })
-                .collect();
+        let (library, hashes, mut fingerprints, missing) = self
+            .with_group(group_id, |pool| async move {
+                let library = resolve_library(&pool, name).await?;
+                if !library_exists(&pool, &library).await? {
+                    return Err(StoreError::LibraryMissing);
+                }
+                let hashes: Vec<String> =
+                    library_hashes(&pool, &library).await?.into_iter().collect();
+                let fingerprints = library_fingerprints(&pool, &library).await?;
+                // 锁外算指纹期间可能有并发删除，算完的孤儿行由对账任务清理。
+                let missing: Vec<(String, PathBuf)> = hashes
+                    .iter()
+                    .filter(|hash| !fingerprints.contains_key(*hash))
+                    .filter_map(|hash| {
+                        blob_file(&blobs, hash)
+                            .ok()
+                            .map(|path| (hash.clone(), path))
+                    })
+                    .collect();
+                Ok((library, hashes, fingerprints, missing))
+            })
+            .await?;
 
-            let computed = fingerprint_missing(missing).await?;
-            insert_fingerprints(&pool, &computed).await?;
-            for (hash, fingerprint) in computed {
-                fingerprints.insert(hash, fingerprint);
-            }
+        let computed = fingerprint_missing(missing).await?;
 
-            let images = hashes
-                .into_iter()
-                .filter_map(|hash| {
-                    fingerprints
-                        .remove(&hash)
-                        .map(|fingerprint| HashedImage { hash, fingerprint })
-                })
-                .collect();
-            Ok((library, images))
-        })
-        .await
+        if !computed.is_empty() {
+            let to_write = &computed;
+            self.with_group(group_id, |pool| async move {
+                insert_fingerprints(&pool, to_write).await
+            })
+            .await?;
+        }
+        for (hash, fingerprint) in computed {
+            fingerprints.insert(hash, fingerprint);
+        }
+
+        let images = hashes
+            .into_iter()
+            .filter_map(|hash| {
+                fingerprints
+                    .remove(&hash)
+                    .map(|fingerprint| HashedImage { hash, fingerprint })
+            })
+            .collect();
+        Ok((library, images))
     }
 
     pub(crate) async fn reconcile_all(&self) {
@@ -701,36 +714,100 @@ impl Store {
     }
 }
 
-/// 读盘走 async，解码只占一条 blocking 线程。
-/// 通道容量 1：进行中和解码排队的各一张，峰值大约两张 blob。
+/// 超过此字节数的图不进并行队列，交给单独的串行队列：
+/// 大图解码后的像素缓冲可接近 128 MiB 的分配上限，多张同时解会把
+/// 峰值内存叠到数倍，在无 swap、余量紧张的部署机上不可接受。
+const PARALLEL_FILE_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// 单个解码 worker：固定数量的 async 任务，从队列动态领活，同一时刻
+/// 只挂一个 blocking 解码，所以占用的解码线程数恒等于 worker 数。
+/// 队列关闭（发送端全部 drop）且排空后 `recv` 返回 Err，worker 自然退出。
+fn spawn_hash_worker(
+    rx: async_channel::Receiver<(String, Vec<u8>)>,
+) -> kovi::tokio::task::JoinHandle<anyhow::Result<Vec<(String, Fingerprint)>>> {
+    kovi::tokio::spawn(async move {
+        let mut computed = Vec::new();
+        while let Ok((hash, bytes)) = rx.recv().await {
+            let fingerprint = kovi::tokio::task::spawn_blocking(move || fingerprint_bytes(&bytes))
+                .await
+                .map_err(|e| anyhow::anyhow!("计算感知哈希失败: {e}"))?;
+            if let Some(fingerprint) = fingerprint {
+                computed.push((hash, fingerprint));
+            }
+        }
+        Ok(computed)
+    })
+}
+
+/// 读盘走 async，解码占 blocking 线程。队列是 async-channel（MPMC，
+/// Receiver 可 Clone）：一条小图队列 workers 个 worker 动态领活、谁快
+/// 谁多拿；一条大图队列单 worker，同一时刻最多一张大图在解码。两条
+/// 队列同为容量 1：在途水位 = 每队列一张排队 + worker 在手的各一张。
+/// 大图的读盘与发送单独成一个任务——大图读得慢、大图队列又被慢解码
+/// 顶住背压，混在一个发送循环里会周期性断掉小图的供给。
 async fn fingerprint_missing(
     missing: Vec<(String, PathBuf)>,
 ) -> Result<Vec<(String, Fingerprint)>, StoreError> {
     if missing.is_empty() {
         return Ok(Vec::new());
     }
-    let (tx, mut rx) = mpsc::channel::<(String, Vec<u8>)>(1);
-    let worker = kovi::tokio::task::spawn_blocking(move || {
-        let mut computed = Vec::new();
-        while let Some((hash, bytes)) = rx.blocking_recv() {
-            if let Some(fingerprint) = fingerprint_bytes(&bytes) {
-                computed.push((hash, fingerprint));
-            }
+    // blob 按内容寻址、写入后不变，stat 的长度就是读出的长度，
+    // 分组可以在读盘前完成。
+    let mut small = Vec::with_capacity(missing.len());
+    let mut large = Vec::new();
+    for entry in missing {
+        let is_large = std::fs::metadata(&entry.1)
+            .map(|meta| meta.len() > PARALLEL_FILE_LIMIT)
+            .unwrap_or(false);
+        if is_large {
+            large.push(entry);
+        } else {
+            small.push(entry);
         }
-        computed
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .min(4);
+    let (small_tx, small_rx) = async_channel::bounded::<(String, Vec<u8>)>(1);
+    let (large_tx, large_rx) = async_channel::bounded::<(String, Vec<u8>)>(1);
+    let mut handles = Vec::with_capacity(workers + 1);
+    for _ in 0..workers {
+        handles.push(spawn_hash_worker(small_rx.clone()));
+    }
+    handles.push(spawn_hash_worker(large_rx));
+
+    let large_sender = kovi::tokio::spawn(async move {
+        for (hash, path) in large {
+            let Ok(bytes) = kovi::tokio::fs::read(path).await else {
+                continue;
+            };
+            // worker 崩溃才 send 失败，此时统一由下面的 JoinHandle 报错。
+            let _ = large_tx.send((hash, bytes)).await;
+        }
+        // large_tx 随任务结束 drop，大图 worker 排空后自然退出。
     });
-    for (hash, path) in missing {
+
+    for (hash, path) in small {
         let Ok(bytes) = kovi::tokio::fs::read(path).await else {
             continue;
         };
-        if tx.send((hash, bytes)).await.is_err() {
-            break;
-        }
+        let _ = small_tx.send((hash, bytes)).await;
     }
-    drop(tx);
-    worker
+    drop(small_tx);
+
+    large_sender
         .await
-        .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))
+        .map_err(|e| StoreError::Other(anyhow::anyhow!("发送大图指纹任务失败: {e}")))?;
+    let mut all = Vec::new();
+    for handle in handles {
+        let computed = handle
+            .await
+            .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))??;
+        all.extend(computed);
+    }
+    Ok(all)
 }
 
 /// 权重 `4096 >> (次数 - 库内最小次数)`，最少的那档是 4096，最多落后 12 次仍为 1。

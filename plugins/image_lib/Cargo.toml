@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel.workspace = true
 anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "webp"] }
 kovi.workspace = true
