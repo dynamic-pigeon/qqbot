@@ -98,5 +98,15 @@ mod tests {
         };
         assert_eq!(scan.path(), ["图库", "查重"]);
         assert_eq!(scan.permission(), Permission::BotAdmin);
+
+        // 「确认」「取消」必须走完整的「图库 确认」：裸发不触发，防止群里
+        // 随口说「确认」执行待确认的清空；给它们加 expose_as_root 会在此红。
+        assert!(matches!(tree.resolve("确认"), ResolveOutcome::Ignored));
+        assert!(matches!(tree.resolve("取消"), ResolveOutcome::Ignored));
+        let ResolveOutcome::Matched(confirm) = tree.resolve("图库 确认") else {
+            panic!("expected 图库 确认");
+        };
+        assert_eq!(confirm.path(), ["图库", "确认"]);
+        assert_eq!(confirm.permission(), Permission::BotAdmin);
     }
 }
