@@ -96,7 +96,7 @@ fn delete_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
 fn confirm_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
     Command::new("确认")
         .description("确认执行登记的清空图库操作")
-        .usage("确认")
+        .usage("图库 确认")
         .scope(MessageScope::Group)
         .permission(Permission::BotAdmin)
         .handler(move |ctx| {
@@ -109,7 +109,7 @@ fn confirm_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command 
 fn cancel_command(wipes: Arc<WipeConfirmations>) -> Command {
     Command::new("取消")
         .description("撤销登记的清空图库操作")
-        .usage("取消")
+        .usage("图库 取消")
         .scope(MessageScope::Group)
         .permission(Permission::BotAdmin)
         .handler(move |ctx| {
@@ -423,12 +423,14 @@ async fn handle_confirm(
             "没有待确认的清空操作，或已超时。可先发送「删除 <库名>」",
         ));
     };
-    match store.wipe_library(group_id, &library).await {
+    match store.wipe_canonical_library(group_id, &library).await {
         Ok(canonical) => {
             ctx.reply(format!("已清空「{canonical}」"));
             Ok(())
         }
-        Err(StoreError::LibraryMissing) => Err(CommandError::user(format!("「{library}」不存在"))),
+        Err(StoreError::LibraryMissing) => Err(CommandError::user(format!(
+            "「{library}」已不存在（可能已被清空或改名），请重新发送「删除 <库名>」"
+        ))),
         Err(error) => Err(map_store_user_error(error)),
     }
 }

@@ -105,4 +105,10 @@ mod tests {
 
         assert_eq!(confirmations.take(&key).as_deref(), Some("狗"));
     }
+
+    /// 提示文案按分钟展示时效，TTL 必须是整分钟。
+    #[test]
+    fn ttl_is_whole_minutes() {
+        assert_eq!(PENDING_TTL.as_secs() % 60, 0);
+    }
 }

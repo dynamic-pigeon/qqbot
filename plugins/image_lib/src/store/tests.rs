@@ -99,7 +99,7 @@ async fn adds_dedups_shares_blob_and_deletes() {
     assert!(store.pick_random(group, "狗").await.is_ok());
     assert_eq!(store.stats(group).await.unwrap().libraries.len(), 1);
 
-    store.wipe_library(group, "狗").await.unwrap();
+    store.wipe_canonical_library(group, "狗").await.unwrap();
     assert!(store.stats(group).await.unwrap().libraries.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -158,7 +158,12 @@ async fn alias_resolves_rejects_and_wipe_clears_canonical() {
     assert_eq!(cat.aliases, vec!["喵".to_owned()]);
     assert_eq!(cat.count, 2);
 
-    let wiped = store.wipe_library(group, "喵").await.unwrap();
+    // 生产路径是「登记时解析别名、确认时直清规范名」，这里两步模拟。
+    let canonical = store.resolve_name(group, "喵").await.unwrap();
+    let wiped = store
+        .wipe_canonical_library(group, &canonical)
+        .await
+        .unwrap();
     assert_eq!(wiped, "猫");
     assert_eq!(store.stats(group).await.unwrap().libraries.len(), 1);
     assert!(matches!(
@@ -265,6 +270,34 @@ async fn overview_resolves_alias_counts_and_rejects_missing() {
         store.library_overview(group, "不存在").await,
         Err(StoreError::LibraryMissing)
     ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn canonical_wipe_ignores_alias_repointing_after_merge() {
+    let (store, dir) = temp_store();
+    let group = 10;
+    add_images(&store, group, "猫", vec![png_like(1)])
+        .await
+        .unwrap();
+    add_images(&store, group, "狗", vec![png_like(2)])
+        .await
+        .unwrap();
+    // 登记待确认之后、执行之前，「别名 猫 狗 合并」把「猫」改成「狗」的别名。
+    store.set_alias(group, "猫", "狗", true).await.unwrap();
+
+    // 确认路径按规范名直清：「猫」已不是库，不得顺着别名清掉「狗」。
+    assert!(matches!(
+        store.wipe_canonical_library(group, "猫").await,
+        Err(StoreError::LibraryMissing)
+    ));
+    let stats = store.stats(group).await.unwrap();
+    assert_eq!(stats.libraries.len(), 1);
+    assert_eq!(stats.libraries[0].name, "狗");
+    assert_eq!(stats.libraries[0].count, 2);
+
+    store.wipe_canonical_library(group, "狗").await.unwrap();
+    assert!(store.stats(group).await.unwrap().libraries.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
