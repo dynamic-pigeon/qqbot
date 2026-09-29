@@ -28,6 +28,8 @@ async fn main() {
         let mut interval = kovi::tokio::time::interval(Duration::from_secs(24 * 60 * 60));
         loop {
             interval.tick().await;
+            // 先备份当日快照再对账:对账清掉的东西当天备份里还能找到。
+            reconcile_store.backup_daily().await;
             reconcile_store.reconcile_all().await;
         }
     });
