@@ -4,7 +4,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -101,6 +101,14 @@ pub struct GroupStats {
     pub libraries: Vec<LibraryStat>,
     pub unique_count: usize,
     pub unique_bytes: u64,
+}
+
+/// 清空整库前的确认信息：库名已解析到规范名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryOverview {
+    pub canonical: String,
+    pub count: usize,
+    pub bytes: u64,
 }
 
 pub struct Store {
@@ -291,46 +299,89 @@ impl Store {
         .await
     }
 
-    pub async fn wipe_library(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
-        let blobs = self.blobs_dir(group_id);
+    /// 清空整库前的确认信息。bytes 口径与「图库」列表一致（SUM(size)，共享图在多个库各计一次）。
+    pub async fn library_overview(
+        &self,
+        group_id: i64,
+        name: &str,
+    ) -> Result<LibraryOverview, StoreError> {
         self.with_group(group_id, |pool| async move {
             let canonical = resolve_library(&pool, name).await?;
-            if !library_exists(&pool, &canonical).await? {
-                return Err(StoreError::LibraryMissing);
-            }
-            let exclusive = hashes_only_in_library(&pool, &canonical).await?;
-            let mut tx = pool.begin().await?;
-            sqlx::query(
-                "DELETE FROM perceptual WHERE hash IN (
-                     SELECT mine.hash FROM images AS mine
-                     WHERE mine.library = ?
-                       AND NOT EXISTS (
-                           SELECT 1 FROM images AS other
-                           WHERE other.hash = mine.hash AND other.library != mine.library
-                       )
-                 )",
+            let row = sqlx::query(
+                "SELECT COUNT(*) AS count, SUM(size) AS bytes FROM images WHERE library = ?",
             )
             .bind(&canonical)
-            .execute(&mut *tx)
+            .fetch_one(&pool)
             .await?;
-            sqlx::query("DELETE FROM images WHERE library = ?")
-                .bind(&canonical)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
-                .bind(&canonical)
-                .bind(&canonical)
-                .execute(&mut *tx)
-                .await?;
-            tx.commit().await?;
-            for hash in exclusive {
-                if let Ok(path) = blob_file(&blobs, &hash) {
-                    let _ = kovi::tokio::fs::remove_file(path).await;
-                }
+            let count = row.try_get::<i64, _>("count")? as usize;
+            if count == 0 {
+                return Err(StoreError::LibraryMissing);
             }
-            Ok(canonical)
+            let bytes = row.try_get::<Option<i64>, _>("bytes")?.unwrap_or(0) as u64;
+            Ok(LibraryOverview {
+                canonical,
+                count,
+                bytes,
+            })
         })
         .await
+    }
+
+    /// 二次确认的执行路径：清空登记时解析好的规范库名，跳过别名解析。
+    /// 否则登记到确认之间，任何人用「别名 合并」都能把该名字改指别的库，
+    /// 让确认清掉提示里没展示的那个库。
+    pub async fn wipe_canonical_library(
+        &self,
+        group_id: i64,
+        canonical: &str,
+    ) -> Result<String, StoreError> {
+        let blobs = self.blobs_dir(group_id);
+        self.with_group(group_id, |pool| async move {
+            Self::wipe_resolved(&pool, &blobs, canonical).await
+        })
+        .await
+    }
+
+    /// 清空一个已解析到规范名的库：删独占指纹、行、别名，再删独占 blob 文件。
+    async fn wipe_resolved(
+        pool: &SqlitePool,
+        blobs: &Path,
+        canonical: &str,
+    ) -> Result<String, StoreError> {
+        if !library_exists(pool, canonical).await? {
+            return Err(StoreError::LibraryMissing);
+        }
+        let exclusive = hashes_only_in_library(pool, canonical).await?;
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM perceptual WHERE hash IN (
+                 SELECT mine.hash FROM images AS mine
+                 WHERE mine.library = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM images AS other
+                       WHERE other.hash = mine.hash AND other.library != mine.library
+                   )
+             )",
+        )
+        .bind(canonical)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM images WHERE library = ?")
+            .bind(canonical)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
+            .bind(canonical)
+            .bind(canonical)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        for hash in exclusive {
+            if let Ok(path) = blob_file(blobs, &hash) {
+                let _ = kovi::tokio::fs::remove_file(path).await;
+            }
+        }
+        Ok(canonical.to_owned())
     }
 
     pub async fn pick_random(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
