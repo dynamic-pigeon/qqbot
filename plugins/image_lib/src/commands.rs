@@ -7,6 +7,7 @@ use utils::command::{
 };
 use utils::{RateLimiter, sha256_hex};
 
+use crate::confirm::{ConfirmKey, WipeConfirmations};
 use crate::fetch::{
     AddImageSource, FetchError, MAX_ADD_IMAGES, load_image_bytes, parse_message_segments,
     resolve_add_source, select_images, stage_image,
@@ -27,6 +28,7 @@ const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     let scans = Arc::new(ScanSessions::new());
+    let wipes = Arc::new(WipeConfirmations::new());
     Command::new("图库")
         .description("管理本群图库")
         .usage("图库")
@@ -40,7 +42,9 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
         })
         .subcommand(add_command(Arc::clone(&store)))
         .subcommand(draw_command(Arc::clone(&store), limiter))
-        .subcommand(delete_command(Arc::clone(&store)))
+        .subcommand(delete_command(Arc::clone(&store), Arc::clone(&wipes)))
+        .subcommand(confirm_command(Arc::clone(&store), Arc::clone(&wipes)))
+        .subcommand(cancel_command(wipes))
         .subcommand(alias_command(Arc::clone(&store)))
         .subcommand(unalias_command(Arc::clone(&store)))
         .subcommand(send_hash_command(Arc::clone(&store)))
@@ -73,15 +77,44 @@ fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
         })
 }
 
-fn delete_command(store: Arc<Store>) -> Command {
+fn delete_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
     Command::new("删除")
-        .description("带图或回复一张图删除该图；管理员删除库名或别名则清空整个库")
+        .description(
+            "带图或回复一张图删除该图；管理员删除库名或别名会登记待清空，需「图库 确认」执行",
+        )
         .usage("删除\n删除 <库名或别名>")
         .expose_as_root()
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
-            async move { handle_delete(ctx, &store).await }
+            let wipes = Arc::clone(&wipes);
+            async move { handle_delete(ctx, &store, &wipes).await }
+        })
+}
+
+/// 不 expose_as_root：确认入口必须走完整的「图库 确认」，避免群里随口说「确认」误触发。
+fn confirm_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
+    Command::new("确认")
+        .description("确认执行登记的清空图库操作")
+        .usage("确认")
+        .scope(MessageScope::Group)
+        .permission(Permission::BotAdmin)
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            let wipes = Arc::clone(&wipes);
+            async move { handle_confirm(ctx, &store, &wipes).await }
+        })
+}
+
+fn cancel_command(wipes: Arc<WipeConfirmations>) -> Command {
+    Command::new("取消")
+        .description("撤销登记的清空图库操作")
+        .usage("取消")
+        .scope(MessageScope::Group)
+        .permission(Permission::BotAdmin)
+        .handler(move |ctx| {
+            let wipes = Arc::clone(&wipes);
+            async move { handle_cancel(ctx, &wipes).await }
         })
 }
 
@@ -345,7 +378,11 @@ async fn handle_draw(
     Ok(())
 }
 
-async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
+async fn handle_delete(
+    ctx: CommandContext,
+    store: &Store,
+    wipes: &WipeConfirmations,
+) -> CommandResult {
     ctx.ensure_no_extra_args(1)?;
     let group_id = ctx.group_id()?;
     match ctx.arg(0) {
@@ -353,9 +390,16 @@ async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
         Some(name) => {
             ctx.require_admin()?;
             let name = parse_library_name(name)?;
-            match store.wipe_library(group_id, name).await {
-                Ok(canonical) => {
-                    ctx.reply(format!("已清空「{canonical}」"));
+            match store.library_overview(group_id, name).await {
+                Ok(overview) => {
+                    wipes.begin(confirm_key(&ctx, group_id), overview.canonical.clone());
+                    ctx.reply(format!(
+                        "「{}」有 {} 张图（约 {}）。确认清空请发送「图库 确认」，发送「图库 取消」可撤销，{} 分钟内有效",
+                        overview.canonical,
+                        overview.count,
+                        format_bytes(overview.bytes),
+                        wipes.pending_ttl_minutes(),
+                    ));
                     Ok(())
                 }
                 Err(StoreError::LibraryMissing) => {
@@ -364,6 +408,47 @@ async fn handle_delete(ctx: CommandContext, store: &Store) -> CommandResult {
                 Err(error) => Err(map_store_user_error(error)),
             }
         }
+    }
+}
+
+async fn handle_confirm(
+    ctx: CommandContext,
+    store: &Store,
+    wipes: &WipeConfirmations,
+) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.group_id()?;
+    let Some(library) = wipes.take(&confirm_key(&ctx, group_id)) else {
+        return Err(CommandError::user(
+            "没有待确认的清空操作，或已超时。可先发送「删除 <库名>」",
+        ));
+    };
+    match store.wipe_library(group_id, &library).await {
+        Ok(canonical) => {
+            ctx.reply(format!("已清空「{canonical}」"));
+            Ok(())
+        }
+        Err(StoreError::LibraryMissing) => Err(CommandError::user(format!("「{library}」不存在"))),
+        Err(error) => Err(map_store_user_error(error)),
+    }
+}
+
+async fn handle_cancel(ctx: CommandContext, wipes: &WipeConfirmations) -> CommandResult {
+    ctx.ensure_no_extra_args(0)?;
+    let group_id = ctx.group_id()?;
+    match wipes.take(&confirm_key(&ctx, group_id)) {
+        Some(library) => {
+            ctx.reply(format!("已取消清空「{library}」"));
+            Ok(())
+        }
+        None => Err(CommandError::user("没有待取消的清空操作")),
+    }
+}
+
+fn confirm_key(ctx: &CommandContext, group_id: i64) -> ConfirmKey {
+    ConfirmKey {
+        group_id,
+        user_id: ctx.event().user_id,
     }
 }
 

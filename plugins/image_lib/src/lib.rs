@@ -7,6 +7,7 @@ use utils::command::CommandRouter;
 
 mod commands;
 mod config;
+mod confirm;
 mod fetch;
 mod name;
 mod scan;

@@ -243,6 +243,32 @@ async fn merge_aligns_draw_counts_to_the_lower_min() {
 }
 
 #[tokio::test]
+async fn overview_resolves_alias_counts_and_rejects_missing() {
+    let (store, dir) = temp_store();
+    let group = 9;
+    add_images(&store, group, "猫", vec![png_like(1), png_like(2)])
+        .await
+        .unwrap();
+    store.set_alias(group, "喵", "猫", false).await.unwrap();
+
+    let overview = store.library_overview(group, "喵").await.unwrap();
+    assert_eq!(
+        overview,
+        LibraryOverview {
+            canonical: "猫".to_owned(),
+            count: 2,
+            bytes: (png_like(1).len() + png_like(2).len()) as u64,
+        }
+    );
+
+    assert!(matches!(
+        store.library_overview(group, "不存在").await,
+        Err(StoreError::LibraryMissing)
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn rejects_when_group_quota_would_exceed() {
     let dir = std::env::temp_dir().join(format!("image_lib_quota_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
