@@ -17,6 +17,7 @@ use sqlx::{Row, SqlitePool};
 
 use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
 
+mod backup;
 mod blob_fs;
 mod repo;
 mod schema;
