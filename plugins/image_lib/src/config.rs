@@ -13,6 +13,8 @@ pub(crate) const DEFAULT_DRAW_MAX_PER_WINDOW: usize = 5;
 pub(crate) const DEFAULT_DUPLICATE_DISTANCE: u32 = 32;
 /// 至少一路不超过此值、又没到重复阈值时，标成「也许像」。
 pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 64;
+/// 未配置时备份与对账回收的 cron（本地时区，每天凌晨四点）。
+pub(crate) const DEFAULT_BACKUP_CRON: &str = "0 4 * * *";
 
 /// 根目录 `config.toml` 的 `[image_lib]`。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -24,6 +26,10 @@ pub(crate) struct StaticConfig {
     pub draw_max_per_window: usize,
     pub duplicate_distance: u32,
     pub maybe_distance: u32,
+    /// 图库备份与对账回收的触发时刻，本地时区。备份目录名和保护表按
+    /// UTC 日期记，本地凌晨触发时 UTC 仍是前一天，目录名会比本地日期
+    /// 早一天；内部自洽，仅观感。
+    pub backup_cron: String,
 }
 
 impl Default for StaticConfig {
@@ -35,6 +41,7 @@ impl Default for StaticConfig {
             draw_max_per_window: DEFAULT_DRAW_MAX_PER_WINDOW,
             duplicate_distance: DEFAULT_DUPLICATE_DISTANCE,
             maybe_distance: DEFAULT_MAYBE_DISTANCE,
+            backup_cron: DEFAULT_BACKUP_CRON.into(),
         }
     }
 }
@@ -73,4 +80,16 @@ pub(crate) fn static_config() -> &'static StaticConfig {
     static CONFIG: LazyLock<StaticConfig> =
         LazyLock::new(|| utils::config::parse_or_panic("image_lib"));
     &CONFIG
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_has_valid_backup_cron() {
+        // 与 kovi(croner,秒位可选)约定的五字段表达式;注册时解析失败
+        // 会在启动期 panic,默认值必须始终可解析。
+        assert_eq!(StaticConfig::default().backup_cron, "0 4 * * *");
+    }
 }
