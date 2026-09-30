@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use kovi::PluginBuilder as plugin;
 use utils::RateLimiter;
@@ -23,16 +22,17 @@ async fn main() {
     let image_config = config::static_config();
     let bot = plugin::get_runtime_bot();
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));
-    let reconcile_store = Arc::clone(&store);
-    kovi::tokio::spawn(async move {
-        let mut interval = kovi::tokio::time::interval(Duration::from_secs(24 * 60 * 60));
-        loop {
-            interval.tick().await;
-            // 先备份当日快照再对账:对账清掉的东西当天备份里还能找到。
-            reconcile_store.backup_daily().await;
-            reconcile_store.reconcile_all().await;
+    let cron_store = Arc::clone(&store);
+    // 先备份当日快照再对账:对账清掉的东西当天备份里还能找到。
+    // cron 重复触发的坑由「同日已备跳过」幂等吸收,不需要额外去抖。
+    plugin::cron(&image_config.backup_cron, move || {
+        let store = Arc::clone(&cron_store);
+        async move {
+            store.backup_daily().await;
+            store.reconcile_all().await;
         }
-    });
+    })
+    .expect("注册图库备份 cron 失败");
     let limiter = Arc::new(RateLimiter::new(
         image_config.draw_window(),
         image_config.draw_max_per_window(),
