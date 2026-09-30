@@ -45,7 +45,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     let help = wait_until_help_ready(&server).await;
     assert!(help.contains("📚 可用命令"), "{help}");
     for needle in [
-        "/help", "/wordle", "/live", "/dynamic", "图库", "!md", "/查卡",
+        "/help", "/wordle", "/live", "/dynamic", "图库", "!md", "/查卡", "/周报",
     ] {
         assert!(help.contains(needle), "帮助缺少 {needle}: {help}");
     }
@@ -65,6 +65,21 @@ async fn plugin_commands_reply_on_mock_onebot() {
     assert_contains(&server, "/wordcloud status", "词云功能已启用").await;
     assert_contains(&server, "/查卡", "缺少参数 `卡片名称`").await;
     assert_contains(&server, "!md", "缺少参数 `Markdown 内容`").await;
+
+    // 周报放在 B 话榜之前：两者共享每群 30 秒冷却，先测周报才能走到真实分支
+    // 而不是「刚跑完」。测试消息都落在今天，上周窗口必然为空。
+    assert_contains(&server, "/周报", "上周暂无发言数据").await;
+    assert_contains(&server, "/周报 status", "定时周报未启用").await;
+    assert_contains(&server, "/周报 enable", "定时周报已启用").await;
+    assert_contains(&server, "/周报 status", "定时周报已启用").await;
+    assert_contains(&server, "/周报 disable", "定时周报已停用").await;
+    let weekly_denied = server.ask_from(STRANGER, "/周报 enable", REPLY).await;
+    assert!(
+        weekly_denied.text.contains("管理员专用"),
+        "非管理员不应能开周报推送: {}",
+        weekly_denied.text
+    );
+
     let rank = server.ask("/今日B话榜", SLOW).await;
     assert!(
         rank.has_image || rank.text.contains("命令执行失败") || rank.text.contains("刚跑完"),
@@ -119,6 +134,28 @@ async fn plugin_commands_reply_on_mock_onebot() {
         "哈希: {hashed:?}"
     );
     assert_contains(&server, "取消别名 喵", "已取消别名").await;
+
+    assert_contains(&server, "删除 狗", "「狗」不存在").await;
+    let wipe = server.ask("删除 猫", REPLY).await;
+    assert!(
+        wipe.text.contains("张图") && wipe.text.contains("图库 确认"),
+        "删除整库应先登记待确认: {wipe:?}"
+    );
+    assert_contains(&server, "图库 取消", "已取消清空「猫」").await;
+    assert_contains(&server, "图库 确认", "没有待确认的清空操作").await;
+
+    let removed = server
+        .ask_with_image(ADMIN, "删除", &iso.sample_a, REPLY)
+        .await
+        .expect("删除带图应回复");
+    assert!(
+        removed.text.contains("已从「猫」删除这张图"),
+        "按本消息图片删除失败: {removed:?}"
+    );
+
+    assert_contains(&server, "删除 猫", "图库 确认").await;
+    assert_contains(&server, "图库 确认", "已清空「猫」").await;
+    assert_contains(&server, "图库", "本群还没有图库").await;
 
     let start = server.ask("/wordle start", SLOW).await;
     assert!(
