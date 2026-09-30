@@ -1,13 +1,19 @@
-//! 图库每日备份:日期目录快照 + 滚动保留七天。
+//! 图库每日备份:日期目录快照 + 保护表 + 统一回收。
 //!
-//! 布局 `<root>/backups/<YYYY-MM-DD>/<群号>/`,内含 `index.db`(VACUUM INTO
-//! 的一致快照)和 `blobs/<sha256>`(硬链接到正式 blob,同盘零拷贝,不占
-//! 图片空间)。正式目录里删图的各条路径只 `remove_file` 自己那份链接,
-//! 备份还链着的图数据就仍在:误删的图在保留窗口内可恢复;备份过期滚动
-//! 删除时最后一个链接消失,磁盘空间才真正释放。
+//! 备份由两部分组成:`<root>/backups/<YYYY-MM-DD>/<群号>/index.db` 是
+//! `VACUUM INTO` 出的一致快照(索引、别名、指纹、保护表都在里面);
+//! 群库 `index.db` 的 `backup_refs` 表记录每个 hash 最后被哪天的备份指向。
+//!
+//! 删除命令只删索引行,从不动文件——被删出索引的 blob 成为孤儿,由每日
+//! 对账任务统一回收,且回收前先查保护表:距今不足保留天数的记录视为
+//! 「备份还指向这张图」,文件保留;过期记录连同文件一起清掉。因此误删
+//! 的图在保护期内数据一直在原位,把快照 db 拷回即可恢复;超过保护期才
+//! 真正释放磁盘。物理删除只有对账一个入口,与文件系统是否支持硬链接
+//! 无关。
 //!
 //! 恢复(手动):停 bot,把某天 `<群号>/index.db` 拷回 `data/image_lib/<群号>/`,
-//! 该快照引用而正式 blobs 目录缺失的图从备份 `blobs/` 复制回去,再启动。
+//! 快照引用的图在保护期内都还在正式 blobs 目录里,直接启动即可;超期的
+//! 图数据已被回收,索引行会在对账时清掉。
 
 use std::{
     collections::BTreeSet,
@@ -18,9 +24,10 @@ use std::{
 use anyhow::{Context as _, Result};
 
 use super::Store;
+use super::repo::refresh_backup_refs;
 
-/// 保留最近多少个日期目录,每天一份,即保留天数。
-const RETAINED_DAYS: usize = 7;
+/// 保留最近多少个日期目录,即备份份数,也是孤儿文件的保护天数。
+pub(super) const RETAINED_DAYS: usize = 7;
 
 impl Store {
     /// 每日任务入口:先备份当日快照,失败只记日志,不影响主流程。
@@ -54,7 +61,7 @@ impl Store {
             let _ = kovi::tokio::fs::remove_dir_all(&tmp_dir).await;
             kovi::tokio::fs::create_dir_all(&tmp_dir).await?;
             for group_id in self.list_group_ids().await? {
-                if let Err(error) = self.backup_group(group_id, &tmp_dir).await {
+                if let Err(error) = self.backup_group(group_id, today, &tmp_dir).await {
                     tracing::error!("图库备份群 {group_id} 失败,已跳过: {error}");
                     let _ =
                         kovi::tokio::fs::remove_dir_all(tmp_dir.join(group_id.to_string())).await;
@@ -67,16 +74,16 @@ impl Store {
         prune_old_backups(&backups).await
     }
 
-    /// 备份单个群:群锁内 VACUUM INTO 出一致快照,锁外把盘上 blob 逐个
-    /// 硬链接进备份目录。链接比快照便宜得多,链的是当时盘上的全部 blob,
-    /// 不查索引——被删命令刚清掉行、文件还在的图也一并保底。
-    async fn backup_group(&self, group_id: i64, tmp_root: &Path) -> Result<()> {
+    /// 备份单个群:群锁内先刷新保护记录再做快照,顺序保证快照连当天
+    /// 的保护表一起带走,恢复出的库自带保护期。
+    async fn backup_group(&self, group_id: i64, today: i64, tmp_root: &Path) -> Result<()> {
         let group_tmp = tmp_root.join(group_id.to_string());
         let snapshot = group_tmp.join("index.db");
         kovi::tokio::fs::create_dir_all(&group_tmp).await?;
         self.with_group(group_id, {
             let snapshot = snapshot.clone();
             move |pool| async move {
+                refresh_backup_refs(&pool, today).await?;
                 sqlx::query("VACUUM INTO ?")
                     .bind(snapshot.to_string_lossy().into_owned())
                     .execute(&pool)
@@ -86,29 +93,6 @@ impl Store {
         })
         .await?;
         utils::restrict_mode_0600(&snapshot).context("收紧备份数据库权限失败")?;
-
-        let blobs = self.blobs_dir(group_id);
-        let backup_blobs = group_tmp.join("blobs");
-        kovi::tokio::fs::create_dir_all(&backup_blobs).await?;
-        let mut entries = kovi::tokio::fs::read_dir(&blobs)
-            .await
-            .with_context(|| format!("列出图片目录失败: {}", blobs.display()))?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            // staged 临时文件都带扩展名,正式 blob 是 64 位十六进制裸名。
-            if path.extension().is_some() {
-                continue;
-            }
-            let name = entry.file_name();
-            if let Err(error) = kovi::tokio::fs::hard_link(&path, backup_blobs.join(&name)).await {
-                // 备份期间被并发删掉的图链不上是正常竞态,其余错误不致命:
-                // 该图恢复时缺失,但不拖垮整份备份。
-                tracing::warn!(
-                    "图库备份链接图片失败 group_id={group_id} file={}: {error}",
-                    name.to_string_lossy()
-                );
-            }
-        }
         Ok(())
     }
 }

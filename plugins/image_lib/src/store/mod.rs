@@ -4,7 +4,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -27,9 +27,10 @@ mod tests;
 
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use repo::{
-    additional_unique_bytes, delete_fingerprint, hash_still_used, hashes_only_in_library,
+    additional_unique_bytes, backed_up_hashes, delete_fingerprint, hash_still_used,
     insert_fingerprints, insert_images, library_exists, library_fingerprints, library_hashes,
-    merge_library, prune_dangling_aliases, resolve_library, unique_image_bytes, upsert_alias,
+    merge_library, prune_dangling_aliases, purge_expired_backup_refs, resolve_library,
+    unique_image_bytes, upsert_alias,
 };
 use schema::init_schema;
 
@@ -274,8 +275,9 @@ impl Store {
         result
     }
 
+    /// 按哈希从本群所有库删图。只删索引行，不动文件：被删出索引的 blob
+    /// 成为孤儿，由每日对账在备份保护期之外统一回收，误删的保护期内可恢复。
     pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
-        let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
             let mut libraries = sqlx::query_scalar::<_, String>(
                 "DELETE FROM images WHERE hash = ? RETURNING library",
@@ -289,10 +291,7 @@ impl Store {
             libraries.sort();
             libraries.dedup();
             prune_dangling_aliases(&pool).await?;
-            if !hash_still_used(&pool, hash).await?
-                && let Ok(path) = blob_file(&blobs, hash)
-            {
-                let _ = kovi::tokio::fs::remove_file(path).await;
+            if !hash_still_used(&pool, hash).await? {
                 delete_fingerprint(&pool, hash).await?;
             }
             Ok(libraries)
@@ -336,23 +335,18 @@ impl Store {
         group_id: i64,
         canonical: &str,
     ) -> Result<String, StoreError> {
-        let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
-            Self::wipe_resolved(&pool, &blobs, canonical).await
+            Self::wipe_resolved(&pool, canonical).await
         })
         .await
     }
 
-    /// 清空一个已解析到规范名的库：删独占指纹、行、别名，再删独占 blob 文件。
-    async fn wipe_resolved(
-        pool: &SqlitePool,
-        blobs: &Path,
-        canonical: &str,
-    ) -> Result<String, StoreError> {
+    /// 清空一个已解析到规范名的库：只删独占指纹、行和别名，blob 文件
+    /// 留给对账按备份保护期回收。
+    async fn wipe_resolved(pool: &SqlitePool, canonical: &str) -> Result<String, StoreError> {
         if !library_exists(pool, canonical).await? {
             return Err(StoreError::LibraryMissing);
         }
-        let exclusive = hashes_only_in_library(pool, canonical).await?;
         let mut tx = pool.begin().await?;
         sqlx::query(
             "DELETE FROM perceptual WHERE hash IN (
@@ -377,11 +371,6 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        for hash in exclusive {
-            if let Ok(path) = blob_file(blobs, &hash) {
-                let _ = kovi::tokio::fs::remove_file(path).await;
-            }
-        }
         Ok(canonical.to_owned())
     }
 
@@ -683,6 +672,10 @@ impl Store {
     }
 
     pub(crate) async fn reconcile_all(&self) {
+        self.reconcile_all_at(backup::today_utc_days()).await;
+    }
+
+    pub(crate) async fn reconcile_all_at(&self, today: i64) {
         let groups = match self.list_group_ids().await {
             Ok(groups) => groups,
             Err(error) => {
@@ -691,7 +684,7 @@ impl Store {
             }
         };
         for group_id in groups {
-            if let Err(error) = self.reconcile_group(group_id).await {
+            if let Err(error) = self.reconcile_group(group_id, today).await {
                 tracing::error!("图库对账失败 group_id={group_id}: {error}");
             }
         }
@@ -714,9 +707,14 @@ impl Store {
         Ok(ids)
     }
 
-    async fn reconcile_group(&self, group_id: i64) -> Result<(), StoreError> {
+    /// 对账是 blob 文件唯一的物理删除点：删除命令只清索引行，孤儿文件
+    /// 在这里按备份保护期决定去留——备份还指向的保留，其余回收。
+    async fn reconcile_group(&self, group_id: i64, today: i64) -> Result<(), StoreError> {
         let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
+            purge_expired_backup_refs(&pool, backup::RETAINED_DAYS as i64, today).await?;
+            let protected = backed_up_hashes(&pool).await?;
+
             let disk = blob_hashes_on_disk(&blobs).await?;
 
             let indexed: HashSet<String> = sqlx::query_scalar("SELECT DISTINCT hash FROM images")
@@ -727,6 +725,9 @@ impl Store {
 
             let mut removed_files = 0u64;
             for hash in disk.difference(&indexed) {
+                if protected.contains(hash) {
+                    continue;
+                }
                 if let Ok(path) = blob_file(&blobs, hash)
                     && kovi::tokio::fs::remove_file(&path).await.is_ok()
                 {
