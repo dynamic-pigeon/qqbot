@@ -43,6 +43,14 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS backup_refs (
+            hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
+            last_backup_day INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
     migrate_fingerprint_schema(pool).await?;
     Ok(())
 }
