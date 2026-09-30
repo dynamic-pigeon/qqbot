@@ -671,8 +671,12 @@ impl Store {
         Ok((library, images))
     }
 
-    pub(crate) async fn reconcile_all(&self) {
-        self.reconcile_all_at(backup::today_utc_days()).await;
+    /// 每日维护入口:同一天数先备份再对账。「今天」只取一次传给两者,
+    /// 避免备份跨 UTC 午夜后对账多算一天,把还有目录护着的记录提前清掉。
+    pub(crate) async fn run_daily_maintenance(&self) {
+        let today = backup::today_utc_days();
+        self.backup_daily_at(today).await;
+        self.reconcile_all_at(today).await;
     }
 
     pub(crate) async fn reconcile_all_at(&self, today: i64) {

@@ -43,3 +43,6 @@ draw_max_per_window = 5
 # 「查重」默认汉明距离（越小越像）。命令「查重 猫 90%」可按百分比覆盖重复阈值。
 duplicate_distance = 8
 maybe_distance = 16
+# 备份与对账回收的触发时刻（本地时区，五字段 cron）。备份保留七天，
+# 备份还指向的图不会被回收。
+backup_cron = "0 4 * * *"

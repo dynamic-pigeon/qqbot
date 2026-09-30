@@ -11,9 +11,12 @@
 //! 真正释放磁盘。物理删除只有对账一个入口,与文件系统是否支持硬链接
 //! 无关。
 //!
-//! 恢复(手动):停 bot,把某天 `<群号>/index.db` 拷回 `data/image_lib/<群号>/`,
-//! 快照引用的图在保护期内都还在正式 blobs 目录里,直接启动即可;超期的
-//! 图数据已被回收,索引行会在对账时清掉。
+//! 恢复(手动):停 bot,把某天 `<群号>/index.db` 拷回 `data/image_lib/<群号>/`
+//! (若群目录残留 `index.db-journal` 之类的崩溃遗留热日志,拷回前一并
+//! 删掉),快照引用的图在保护期内都还在正式 blobs 目录里,直接启动即可;
+//! 超期的图数据已被回收,索引行会在对账时清掉。注意恢复等于回滚:
+//! 快照日之后新入库的图不在快照的保护表里,恢复后失去保护,下次对账
+//! 立即回收。
 
 use std::{
     collections::BTreeSet,
@@ -30,11 +33,6 @@ use super::repo::refresh_backup_refs;
 pub(super) const RETAINED_DAYS: usize = 7;
 
 impl Store {
-    /// 每日任务入口:先备份当日快照,失败只记日志,不影响主流程。
-    pub(crate) async fn backup_daily(&self) {
-        self.backup_daily_at(today_utc_days()).await;
-    }
-
     pub(crate) async fn backup_daily_at(&self, today: i64) {
         if let Err(error) = self.run_daily_backup(today).await {
             tracing::error!("图库每日备份失败: {error}");
@@ -71,11 +69,13 @@ impl Store {
             tracing::info!("图库每日备份完成: {date}");
         }
 
-        prune_old_backups(&backups).await
+        prune_old_backups(&backups, today).await
     }
 
-    /// 备份单个群:群锁内先刷新保护记录再做快照,顺序保证快照连当天
-    /// 的保护表一起带走,恢复出的库自带保护期。
+    /// 备份单个群:群锁内先做快照、快照落成后才刷保护记录——refs 指向
+    /// 今天当且仅当今天的快照存在。反过来先刷表再 VACUUM,磁盘满时会
+    /// 恰好停在「有保护期却无快照」的状态。代价是快照里带到的是前一天
+    /// 的 refs,恢复出的库保护期最多少一天。
     async fn backup_group(&self, group_id: i64, today: i64, tmp_root: &Path) -> Result<()> {
         let group_tmp = tmp_root.join(group_id.to_string());
         let snapshot = group_tmp.join("index.db");
@@ -83,11 +83,11 @@ impl Store {
         self.with_group(group_id, {
             let snapshot = snapshot.clone();
             move |pool| async move {
-                refresh_backup_refs(&pool, today).await?;
                 sqlx::query("VACUUM INTO ?")
                     .bind(snapshot.to_string_lossy().into_owned())
                     .execute(&pool)
                     .await?;
+                refresh_backup_refs(&pool, today).await?;
                 Ok(())
             }
         })
@@ -120,9 +120,12 @@ async fn clean_stale_tmp(backups: &Path) {
     }
 }
 
-/// 只保留最近 RETAINED_DAYS 个日期目录。目录名排序即时间序(定宽
-/// YYYY-MM-DD);名字不像日期的条目不动,避免误删人工放进去的东西。
-async fn prune_old_backups(backups: &Path) -> Result<()> {
+/// 删除日期已过保留期的备份目录,与对账清保护记录用同一个谓词
+/// (`目录日 + RETAINED_DAYS <= today`)。两者必须同日失效,「备份目录
+/// 还在 ⟺ 其指向的文件还受保护」才在停机隔天等非连续备份下也成立;
+/// 按份数滚动会在停机后把时间跨度拉长,让记录先于目录过期。名字不像
+/// 日期的条目不动,避免误删人工放进去的东西。
+async fn prune_old_backups(backups: &Path, today: i64) -> Result<()> {
     let mut dates = BTreeSet::new();
     let mut entries = kovi::tokio::fs::read_dir(backups).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -132,8 +135,10 @@ async fn prune_old_backups(backups: &Path) -> Result<()> {
             dates.insert(name.to_owned());
         }
     }
-    while dates.len() > RETAINED_DAYS {
-        let oldest = dates.pop_first().expect("len > RETAINED_DAYS");
+    while let Some(oldest) = dates.first()
+        && date_epoch_day(oldest) + RETAINED_DAYS as i64 <= today
+    {
+        let oldest = dates.pop_first().expect("first 刚校验过");
         kovi::tokio::fs::remove_dir_all(backups.join(&oldest))
             .await
             .with_context(|| format!("删除过期备份失败: {oldest}"))?;
@@ -175,6 +180,26 @@ pub(super) fn date_string(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// 日期目录名转回 epoch 天数;名字必须先通过 [`looks_like_date`]。
+fn date_epoch_day(name: &str) -> i64 {
+    let year: i64 = name[..4].parse().expect("looks_like_date 已校验");
+    let month: u32 = name[5..7].parse().expect("looks_like_date 已校验");
+    let day: u32 = name[8..10].parse().expect("looks_like_date 已校验");
+    days_from_civil(year, month, day)
+}
+
+/// 公历年月日转 epoch 天数(Howard Hinnant days_from_civil),
+/// 与 [`civil_from_days`] 互逆。
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// epoch 天数转公历年月日(Howard Hinnant civil_from_days),纯整数运算,
 /// 覆盖任意可表示日期。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -205,6 +230,18 @@ mod tests {
         assert_eq!(date_string(19_782), "2024-02-29");
         assert_eq!(date_string(20_725), "2026-09-29");
         assert_eq!(date_string(-1), "1969-12-31");
+    }
+
+    #[test]
+    fn date_roundtrip_survives_month_and_era_edges() {
+        for days in [0, -1, -720, 19_723, 19_782, 20_725, 100_000, -100_000] {
+            let name = date_string(days);
+            assert!(
+                looks_like_date(&name),
+                "date_string 应产出合法目录名: {name}"
+            );
+            assert_eq!(date_epoch_day(&name), days, "roundtrip 失败: {name}");
+        }
     }
 
     #[test]
