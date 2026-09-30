@@ -33,7 +33,7 @@ Unix 上会把 `.env`、`kovi.conf.toml`、`config.toml`、插件 `config.json`�
 - 周报：`/周报` 出上周报告（发言榜、全勤、每日消息量、夜聊王/早起王、热词）；管理员 `/周报 enable` 开启定时推送（同时开始采集），`disable` 只停推送。推送 cron 与榜单人数见 `[msg_rank]`，夜聊/早起按本地 23:00–06:00 / 06:00–09:00 统计。
 - 图片 OCR 每条最多 3 张，需在 `[ocr]` 填写腾讯云密钥，否则跳过。
 - 中文词云字体：`data/msg_rank/font.otf`；没有则用 wordcloud-rs 内嵌英文字体。可选遮罩同目录 `mask.png` / `mask.jpg`。
-- 图库容量、单图上限和抽图限流见 `[image_lib]`；数据在 `data/image_lib/`。
+- 图库容量、单图上限和抽图限流见 `[image_lib]`；数据在 `data/image_lib/`。备份与回收由 `backup_cron` 触发（默认 `0 4 * * *`，本地时区），快照存 `data/image_lib/backups/<日期>/`（保留七天）；删图只清索引，文件由对账在七天备份保护期外统一回收，误删保护期内可直接恢复（方法见 `plugins/image_lib/src/store/backup.rs` 模块注释），磁盘回收因此最多滞后七天。
 - Wordle 词库首次使用时下载到 `data/wordle/`，也可预放 `answers.txt` / `allowed.txt`。结束时展示答案的中文释义（2315 个标准答案词已内置）；自定义词库可放可选的 `meanings.txt`（每行 `word<TAB>释义`）覆盖或补充释义。
 
 ## 开发检查

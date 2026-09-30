@@ -87,24 +87,6 @@ pub(super) async fn additional_unique_bytes(
         .sum())
 }
 
-pub(super) async fn hashes_only_in_library(
-    pool: &SqlitePool,
-    library: &str,
-) -> Result<Vec<String>, StoreError> {
-    let hashes = sqlx::query_scalar::<_, String>(
-        "SELECT mine.hash FROM images AS mine
-         WHERE mine.library = ?
-           AND NOT EXISTS (
-               SELECT 1 FROM images AS other
-               WHERE other.hash = mine.hash AND other.library != mine.library
-           )",
-    )
-    .bind(library)
-    .fetch_all(pool)
-    .await?;
-    Ok(hashes)
-}
-
 pub(super) async fn hash_still_used(pool: &SqlitePool, hash: &str) -> Result<bool, StoreError> {
     let found = sqlx::query_scalar::<_, i64>("SELECT 1 FROM images WHERE hash = ? LIMIT 1")
         .bind(hash)
@@ -275,4 +257,40 @@ pub(super) async fn prune_dangling_aliases(pool: &SqlitePool) -> Result<(), Stor
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// 备份时刷新保护记录：索引里现存的每个 hash 都被今天的备份指向。
+/// SELECT 带上 WHERE true:不带 WHERE 的 INSERT...SELECT 直接跟 ON
+/// CONFLICT 会被 SQLite 当成语法错误(解析歧义)。
+pub(super) async fn refresh_backup_refs(pool: &SqlitePool, day: i64) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO backup_refs (hash, last_backup_day)
+         SELECT DISTINCT hash, ? FROM images WHERE true
+         ON CONFLICT(hash) DO UPDATE SET last_backup_day = excluded.last_backup_day",
+    )
+    .bind(day)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 清掉已过保护期的记录。先清再判定，之后表里剩的都是仍在保护期内的引用。
+pub(super) async fn purge_expired_backup_refs(
+    pool: &SqlitePool,
+    retain_days: i64,
+    today: i64,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM backup_refs WHERE last_backup_day + ? <= ?")
+        .bind(retain_days)
+        .bind(today)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn backed_up_hashes(pool: &SqlitePool) -> Result<HashSet<String>, StoreError> {
+    let hashes = sqlx::query_scalar::<_, String>("SELECT hash FROM backup_refs")
+        .fetch_all(pool)
+        .await?;
+    Ok(hashes.into_iter().collect())
 }
