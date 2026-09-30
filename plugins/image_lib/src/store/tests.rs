@@ -772,3 +772,113 @@ async fn backup_rolls_to_last_seven_days_and_keeps_foreign_dirs() {
     assert!(backups.join("manual-copy").is_dir());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn wiped_library_keeps_files_until_protection_expires() {
+    let (store, dir) = temp_store();
+    let group = 47;
+    let a = png_like(1);
+    add_images(&store, group, "猫", vec![a.clone()])
+        .await
+        .unwrap();
+    let day = 20_000;
+    store.backup_daily_at(day).await;
+    let hash = sha256_hex(&a);
+    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+
+    store.wipe_canonical_library(group, "猫").await.unwrap();
+    assert!(live_blob.is_file(), "清库不得物理删除文件");
+
+    store.reconcile_all_at(day + 3).await;
+    assert!(live_blob.is_file(), "保护期内对账不得回收清库后的文件");
+    store.reconcile_all_at(day + RETAINED_DAYS as i64).await;
+    assert!(!live_blob.exists(), "保护期外文件应被回收");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn backup_covers_all_groups_and_skips_broken_one() {
+    let (store, dir) = temp_store();
+    add_images(&store, 48, "猫", vec![png_like(1)])
+        .await
+        .unwrap();
+    // 群 49 的 index.db 是坏文件,备份应跳过它而不拖垮整份备份。
+    let broken = dir.join("49");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("index.db"), b"not a sqlite db").unwrap();
+
+    store.backup_daily_at(20_000).await;
+    let day = dir.join("backups").join(date_string(20_000));
+    assert!(day.join("48").join("index.db").is_file(), "正常群应进备份");
+    assert!(!day.join("49").exists(), "坏群的半成品不得进正式备份");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn snapshot_carries_previous_day_refs() {
+    let (store, dir) = temp_store();
+    let group = 50;
+    add_images(&store, group, "猫", vec![png_like(1)])
+        .await
+        .unwrap();
+    store.backup_daily_at(20_000).await;
+    add_images(&store, group, "猫", vec![png_like(2)])
+        .await
+        .unwrap();
+    store.backup_daily_at(20_001).await;
+
+    // 刷 refs 在快照落成之后,快照里带到的是截至上次备份日的表:D0
+    // 后新增的图不在其中,只有 D0 时已在库里的图带着 D0 的记录。顺带
+    // 回归这条顺序——refs 指向今天,当且仅当今天的快照已经存在。
+    let snap = dir
+        .join("backups")
+        .join(date_string(20_001))
+        .join(group.to_string())
+        .join("index.db");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&snap)
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT COUNT(*) AS n, MAX(last_backup_day) AS d FROM backup_refs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<i64, _>("n").unwrap(), 1);
+    assert_eq!(row.try_get::<Option<i64>, _>("d").unwrap(), Some(20_000));
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn backup_gap_keeps_directory_and_protection_in_lockstep() {
+    let (store, dir) = temp_store();
+    let group = 51;
+    let a = png_like(1);
+    add_images(&store, group, "猫", vec![a.clone()])
+        .await
+        .unwrap();
+    let hash = sha256_hex(&a);
+    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    // 真实顺序:备份过,然后删除,随后停机。
+    store.backup_daily_at(20_000).await;
+    store.delete_hash(group, &hash).await.unwrap();
+    store.backup_daily_at(20_006).await;
+    let backups = dir.join("backups");
+    assert!(backups.join(date_string(20_000)).is_dir());
+    store.reconcile_all_at(20_006).await;
+    assert!(live_blob.is_file(), "D0 目录还在,其指向的图不得被回收");
+
+    // D7:过期目录与保护记录同日失效,「目录在 ⟺ 数据在」保持一致。
+    store.backup_daily_at(20_007).await;
+    store.reconcile_all_at(20_007).await;
+    assert!(
+        !backups.join(date_string(20_000)).exists(),
+        "过期的备份目录应被滚动删除"
+    );
+    assert!(!live_blob.exists(), "记录过期后文件应被回收");
+    let _ = std::fs::remove_dir_all(dir);
+}
