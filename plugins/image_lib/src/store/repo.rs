@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use sqlx::{Row, SqlitePool};
 
 use super::{StagedImage, StoreError};
-use crate::similar::{FINGERPRINT_WORDS, Fingerprint};
+use crate::similar::{
+    FINGERPRINT_WORDS, Fingerprint, SiftFeatures, sift_from_bytes, sift_to_bytes,
+};
 
 /// 指纹词组序列化成大端 BLOB：4×u64 = 32 字节，与建表 CHECK 对齐。
 fn pack_words(words: &[u64; FINGERPRINT_WORDS]) -> Vec<u8> {
@@ -150,6 +152,56 @@ pub(super) async fn library_fingerprints(
 
 fn corrupt_fingerprint(hash: &str) -> StoreError {
     StoreError::Other(anyhow::anyhow!("指纹 BLOB 长度异常: {hash}"))
+}
+
+pub(super) async fn insert_sifts(
+    pool: &SqlitePool,
+    features: &[(String, SiftFeatures)],
+) -> Result<(), StoreError> {
+    for (hash, features) in features {
+        // 与指纹同款：只忽略主键冲突（并发补特征的幂等）。
+        sqlx::query(
+            "INSERT INTO sift (hash, features) VALUES (?, ?)
+             ON CONFLICT(hash) DO NOTHING",
+        )
+        .bind(hash)
+        .bind(sift_to_bytes(features))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn delete_sift(pool: &SqlitePool, hash: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM sift WHERE hash = ?")
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn library_sifts(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<HashMap<String, SiftFeatures>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT s.hash AS hash, s.features AS features
+         FROM sift s
+         INNER JOIN images i ON i.hash = s.hash
+         WHERE i.library = ?",
+    )
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    let mut found = HashMap::new();
+    for row in rows {
+        let hash = row.try_get::<String, _>("hash")?;
+        let bytes = row.try_get::<Vec<u8>, _>("features")?;
+        let features = sift_from_bytes(&bytes)
+            .ok_or_else(|| StoreError::Other(anyhow::anyhow!("SIFT BLOB 异常: {hash}")))?;
+        found.insert(hash, features);
+    }
+    Ok(found)
 }
 
 pub(super) async fn insert_images(

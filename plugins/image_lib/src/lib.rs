@@ -100,6 +100,12 @@ mod tests {
         assert_eq!(scan.path(), ["图库", "查重"]);
         assert_eq!(scan.permission(), Permission::BotAdmin);
 
+        let ResolveOutcome::Matched(crop) = tree.resolve("查裁剪 猫") else {
+            panic!("expected 查裁剪");
+        };
+        assert_eq!(crop.path(), ["图库", "查裁剪"]);
+        assert_eq!(crop.permission(), Permission::BotAdmin);
+
         // 「确认」「取消」必须走完整的「图库 确认」：裸发不触发，防止群里
         // 随口说「确认」执行待确认的清空；给它们加 expose_as_root 会在此红。
         assert!(matches!(tree.resolve("确认"), ResolveOutcome::Ignored));

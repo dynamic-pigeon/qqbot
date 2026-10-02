@@ -22,6 +22,8 @@ pub struct HashedImage {
 pub enum GroupKind {
     Duplicate,
     Maybe,
+    /// hashes 固定两张：第一张是整体，第二张是疑似裁出来的局部。
+    Crop,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -361,6 +363,321 @@ pub fn cluster(
     groups
 }
 
+// ===== 裁剪检测 =====
+// 全局感知哈希对裁剪天然失明：构图一变频谱就漂移，实测中心裁剪保留 96%
+// 时 pHash 距离已 88/256。裁剪的判据换成局部特征：B 是 A 的裁剪 ⇔ B 的
+// SIFT 特征几乎全部能按一张单应矩阵映射进 A；findHomography 的 RANSAC
+// inlier 数就是几何一致的证据，随机图凑不出。链接的 OpenCV 版本由
+// pkg-config 决定（指向见 .cargo/config.toml，未入库），SONAME 必须与
+// 目标机一致。
+
+use opencv::core::{DMatch, KeyPoint, Mat, NORM_L2, Point2f, Vector};
+use opencv::features2d::{BFMatcher, DescriptorMatcherTrait, Feature2DTrait, SIFT};
+use opencv::prelude::*;
+
+/// SIFT 归一化画布边长。统一 512×512 再提特征，让单应 RANSAC 的像素
+/// 阈值对不同分辨率的图可比；量化后的关键点坐标也落在这个范围。
+const SIFT_CANVAS: u32 = 512;
+/// 每图最多保留的 SIFT 特征数（按响应排序取前 N）。256 点对单应估计
+/// 绰绰有余，同时把每图存储压到 34KB 以内。
+const SIFT_MAX_FEATURES: i32 = 512;
+/// Lowe 比率测试：最优距离 / 次优距离低于它才算可靠匹配。
+const SIFT_LOWE_RATIO: f32 = 0.8;
+/// findHomography RANSAC 的重投影阈值（归一化画布上的像素）。
+const HOMOGRAPHY_THRESHOLD: f64 = 4.0;
+/// 判据双保险：inlier 绝对数（RANSAC 的 4 点解加 2 个独立确认），以及
+/// 好匹配的几何内聚率——part 放大后特征密度天然膨胀，inlier 占 part 全部
+/// 特征的比例不可用；占好匹配的比例才是「匹配是否几何一致」的度量。
+/// 随机对的错误匹配凑不出一致的仿射，内聚率上不去。
+const CROP_MIN_INLIERS: u64 = 6;
+const CROP_MIN_COHESION_PERCENT: u64 = 40;
+/// 全局指纹预筛（通道一）：构图仍相近的轻裁剪，dHash 距离实测 57~124；
+/// 随机对 128±11，min 距离超 112 的进不了这通道。
+const CROP_PREFILTER: u32 = 112;
+/// 中心档预筛（通道二）：重裁剪的构图已经变了，但裁剪图的全图 dHash 应
+/// 接近整体图某档中心裁剪的 dHash——直接比内容，随机对撞不上。
+/// 档位近似覆盖中心 keep ∈ [33%, 75%]；偏移（非中心）的重裁剪两条通道
+/// 都可能漏，是明确的取舍：宁可漏检也不让全库两两跑特征匹配。
+const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
+const CENTER_PREFILTER: u32 = 96;
+/// 裁剪对展示上限，语义同 MAX_MAYBE_GROUPS：防止海量对撑爆查重会话内存。
+const MAX_CROP_PAIRS: usize = 500;
+/// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
+const SIFT_DIMS: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiftFeatures {
+    /// 归一化画布上的关键点坐标，与 descriptors 按下标对齐。
+    pub points: Vec<(u16, u16)>,
+    /// 量化到 u8 的 128 维描述子。
+    pub descriptors: Vec<[u8; SIFT_DIMS]>,
+    /// 三档中心裁剪的 256-bit dHash，按下标对应 [`CENTER_KEEPS`]。
+    pub centers: [[u64; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiftableImage {
+    pub hash: String,
+    pub fingerprint: Fingerprint,
+    pub sift: SiftFeatures,
+}
+
+/// 一次解码同时产出全局指纹与 SIFT 特征：懒回填管道里两张表共用这次解码。
+pub fn fingerprint_and_sift(bytes: &[u8]) -> Option<(Fingerprint, SiftFeatures)> {
+    let image = decode_limited(bytes)?;
+    Some((fingerprint_image(&image)?, sift_features(&image)?))
+}
+
+/// 提取 SIFT 特征。解码限额由 [`decode_limited`] 把关，这里只把灰度像素
+/// 装进 CV_8U Mat，不走 imdecode。
+fn sift_features(image: &DynamicImage) -> Option<SiftFeatures> {
+    // Lanczos3 保边缘锐度：放大图上采样后的特征描述子要和原图的对应点
+    // 匹配，软核（Triangle）会把边缘抹软、好匹配大幅减少。
+    let gray = image::imageops::resize(
+        &image.to_luma8(),
+        SIFT_CANVAS,
+        SIFT_CANVAS,
+        FilterType::Lanczos3,
+    );
+    let mat =
+        Mat::new_rows_cols_with_data(SIFT_CANVAS as i32, SIFT_CANVAS as i32, gray.as_raw()).ok()?;
+    let mut sift = SIFT::create(SIFT_MAX_FEATURES, 3, 0.03, 10.0, 1.0).ok()?;
+    let mut keypoints = Vector::<KeyPoint>::new();
+    let mut descriptors = Mat::default();
+    sift.detect_and_compute(
+        &mat,
+        &Mat::default(),
+        &mut keypoints,
+        &mut descriptors,
+        false,
+    )
+    .ok()?;
+    let mut points = Vec::with_capacity(keypoints.len());
+    for keypoint in keypoints.iter() {
+        points.push((keypoint.pt().x as u16, keypoint.pt().y as u16));
+    }
+    let rows = descriptors.rows();
+    if rows < 1 || points.len() != rows as usize {
+        return None;
+    }
+    let mut quants = Vec::with_capacity(rows as usize);
+    for r in 0..rows {
+        let mut row = [0u8; SIFT_DIMS];
+        for (c, slot) in row.iter_mut().enumerate() {
+            let value = *descriptors.at_2d::<f32>(r, c as i32).ok()?;
+            // SIFT 描述子 L2 归一化后元素幅值在 [-1, 1]，线性量化到 u8。
+            *slot = ((value + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+        }
+        quants.push(row);
+    }
+    Some(SiftFeatures {
+        points,
+        descriptors: quants,
+        centers: center_hashes(image),
+    })
+}
+
+/// 三档中心裁剪各自的 256-bit dHash。裁剪检测的预筛拿它和候选局部的
+/// 全图 dHash 直接比内容。
+fn center_hashes(image: &DynamicImage) -> [[u64; FINGERPRINT_WORDS]; CENTER_KEEPS.len()] {
+    let gray = image.to_luma8();
+    let (width, height) = (gray.width(), gray.height());
+    let mut out = [[0u64; FINGERPRINT_WORDS]; CENTER_KEEPS.len()];
+    for (slot, &keep) in out.iter_mut().zip(&CENTER_KEEPS) {
+        let crop_w = (width * keep / 100).max(1).min(width);
+        let crop_h = (height * keep / 100).max(1).min(height);
+        let crop = image::imageops::crop_imm(
+            &gray,
+            (width - crop_w) / 2,
+            (height - crop_h) / 2,
+            crop_w,
+            crop_h,
+        )
+        .to_image();
+        *slot = difference_hash(&crop);
+    }
+    out
+}
+
+/// 全库裁剪两两检测。已是「重复」距离的图对跳过（归查重管）；输出组固定
+/// 两张：hashes[0] 是整体、hashes[1] 是局部。
+pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<SimilarGroup> {
+    let n = images.len();
+    let mut pairs = Vec::new();
+    'outer: for i in 0..n {
+        for j in (i + 1)..n {
+            let (dup_dist, maybe_dist) =
+                pair_distances(images[i].fingerprint, images[j].fingerprint);
+            if dup_dist <= duplicate_limit {
+                continue;
+            }
+            // 预筛双通道：轻裁剪构图仍近（全局指纹），重裁剪看中心档内容。
+            let i_contains_j = maybe_dist <= CROP_PREFILTER || center_hit(&images[j], &images[i]);
+            let j_contains_i = maybe_dist <= CROP_PREFILTER || center_hit(&images[i], &images[j]);
+            if !i_contains_j && !j_contains_i {
+                continue;
+            }
+            if i_contains_j && let Some(percent) = match_crop_pair(&images[j].sift, &images[i].sift)
+            {
+                pairs.push(crop_group(&images[i].hash, &images[j].hash, percent));
+            } else if j_contains_i
+                && let Some(percent) = match_crop_pair(&images[i].sift, &images[j].sift)
+            {
+                pairs.push(crop_group(&images[j].hash, &images[i].hash, percent));
+            }
+            if pairs.len() >= MAX_CROP_PAIRS {
+                break 'outer;
+            }
+        }
+    }
+    pairs.sort_by(|a, b| {
+        b.percent
+            .cmp(&a.percent)
+            .then_with(|| a.hashes.cmp(&b.hashes))
+    });
+    pairs
+}
+
+/// part 的全图 dHash 是否命中 whole 的某档中心 dHash。
+fn center_hit(part: &SiftableImage, whole: &SiftableImage) -> bool {
+    whole
+        .sift
+        .centers
+        .iter()
+        .any(|center| hamming(&part.fingerprint.dhash, center) <= CENTER_PREFILTER)
+}
+
+fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
+    SimilarGroup {
+        kind: GroupKind::Crop,
+        hashes: vec![whole.to_owned(), part.to_owned()],
+        percent,
+        truncated: false,
+    }
+}
+
+/// 判定 part 是否 whole 的裁剪局部：Lowe 比率筛出可靠匹配，用 RANSAC
+/// 单应的 inlier 数下结论。返回 inlier 占两侧较少一侧特征数的百分比。
+fn match_crop_pair(part: &SiftFeatures, whole: &SiftFeatures) -> Option<u8> {
+    let n_part = part.points.len();
+    let n_whole = whole.points.len();
+    if n_part < 4 || n_whole < 4 {
+        return None;
+    }
+    // Mat 的数据指针借用底下的 Vec，两者必须活到匹配结束，不能封成函数返回。
+    let part_floats = dequantize(&part.descriptors);
+    let whole_floats = dequantize(&whole.descriptors);
+    let part_desc =
+        Mat::new_rows_cols_with_data(n_part as i32, SIFT_DIMS as i32, &part_floats).ok()?;
+    let whole_desc =
+        Mat::new_rows_cols_with_data(n_whole as i32, SIFT_DIMS as i32, &whole_floats).ok()?;
+    let mut matcher = BFMatcher::new(NORM_L2, false).ok()?;
+    matcher.add(&whole_desc).ok()?;
+    matcher.train().ok()?;
+    let mut matches = Vector::<Vector<DMatch>>::new();
+    matcher
+        .knn_match(&part_desc, &mut matches, 2, &Mat::default(), false)
+        .ok()?;
+    let mut src = Vector::<Point2f>::new();
+    let mut dst = Vector::<Point2f>::new();
+    for i in 0..matches.len() {
+        let pair = matches.get(i).ok()?;
+        if pair.len() < 2 {
+            continue;
+        }
+        let best = pair.get(0).ok()?;
+        let second = pair.get(1).ok()?;
+        if best.distance < SIFT_LOWE_RATIO * second.distance {
+            let (px, py) = part.points[i];
+            let (wx, wy) = whole.points[best.train_idx as usize];
+            src.push(Point2f::new(f32::from(px), f32::from(py)));
+            dst.push(Point2f::new(f32::from(wx), f32::from(wy)));
+        }
+    }
+    if src.len() < 4 {
+        return None;
+    }
+    let mut mask = Mat::default();
+    opencv::calib3d::find_homography(
+        &src,
+        &dst,
+        &mut mask,
+        opencv::calib3d::RANSAC,
+        HOMOGRAPHY_THRESHOLD,
+    )
+    .ok()?;
+    let mut inliers = 0u64;
+    for i in 0..mask.rows() {
+        if *mask.at::<u8>(i).ok()? != 0 {
+            inliers += 1;
+        }
+    }
+    let good = src.len() as u64;
+    if inliers < CROP_MIN_INLIERS || inliers * 100 < good * CROP_MIN_COHESION_PERCENT {
+        return None;
+    }
+    u8::try_from(inliers * 100 / good).ok()
+}
+
+/// 量化描述子还原成浮点（BFMatcher 的 L2 距离要 CV_32F）。
+fn dequantize(descriptors: &[[u8; SIFT_DIMS]]) -> Vec<f32> {
+    let mut floats = Vec::with_capacity(descriptors.len() * SIFT_DIMS);
+    for row in descriptors {
+        for &quant in row {
+            floats.push(f32::from(quant) / 127.5 - 1.0);
+        }
+    }
+    floats
+}
+
+/// 序列化：三档中心哈希 + u16 点数 + 每点 (x, y, 128 字节描述子)，全大端。
+pub(crate) fn sift_to_bytes(features: &SiftFeatures) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + features.points.len() * (4 + SIFT_DIMS));
+    for center in &features.centers {
+        for word in center {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&(features.points.len() as u16).to_be_bytes());
+    for ((x, y), descriptor) in features.points.iter().zip(&features.descriptors) {
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(descriptor);
+    }
+    out
+}
+
+pub(crate) fn sift_from_bytes(bytes: &[u8]) -> Option<SiftFeatures> {
+    let center_bytes = CENTER_KEEPS.len() * FINGERPRINT_WORDS * 8;
+    let mut centers = [[0u64; FINGERPRINT_WORDS]; CENTER_KEEPS.len()];
+    for (grid, slot) in centers.iter_mut().enumerate() {
+        for (word, i) in slot.iter_mut().zip(0..FINGERPRINT_WORDS) {
+            let start = grid * FINGERPRINT_WORDS * 8 + i * 8;
+            *word = u64::from_be_bytes(bytes.get(start..start + 8)?.try_into().ok()?);
+        }
+    }
+    let body = &bytes[center_bytes..];
+    let count = u16::from_be_bytes(body.get(..2)?.try_into().ok()?) as usize;
+    let stride = 4 + SIFT_DIMS;
+    if body.len() != 2 + count * stride {
+        return None;
+    }
+    let mut points = Vec::with_capacity(count);
+    let mut descriptors = Vec::with_capacity(count);
+    for i in 0..count {
+        let record = &body[2 + i * stride..2 + (i + 1) * stride];
+        let x = u16::from_be_bytes(record[..2].try_into().ok()?);
+        let y = u16::from_be_bytes(record[2..4].try_into().ok()?);
+        points.push((x, y));
+        descriptors.push(record[4..].try_into().ok()?);
+    }
+    Some(SiftFeatures {
+        points,
+        descriptors,
+        centers,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +898,146 @@ mod tests {
             u32::from(percent_from_distance(distance_from_percent(90))),
             90
         );
+    }
+
+    // ===== 裁剪检测 =====
+
+    /// 8×8 块状底 + 每 cell 独立斜率的线性斜坡 + 细节抖动：块角是强角点、
+    /// 各角周围梯度组合互不相同（纯块状图的角点描述子彼此同构，Lowe
+    /// 比率会把裁剪对的好匹配也滤掉），平滑噪声则一个角点都提不出来。
+    fn photo_like(seed: u32) -> RgbImage {
+        let control = |gx: u32, gy: u32, slot: u32| -> f64 {
+            let h = seed
+                .wrapping_mul(0x9E37_79B9)
+                .wrapping_add(gx.wrapping_mul(0x85EB_CA6B))
+                .wrapping_add(gy.wrapping_mul(0xC2B2_AE35))
+                .wrapping_add(slot.wrapping_mul(0x27D4_EB2F));
+            ((h ^ (h >> 16)) % 1000) as f64 / 1000.0
+        };
+        RgbImage::from_fn(512, 512, |x, y| {
+            let (gx, gy) = (x / 16, y / 16);
+            let fx = (x % 16) as f64 / 16.0;
+            let fy = (y % 16) as f64 / 16.0;
+            let base = control(gx, gy, 0) * 200.0;
+            // 斜坡幅度要小于块间落差：角点靠块差存活，斜坡只负责让
+            // 各角点邻域的梯度组合互不相同。
+            let slope = control(gx, gy, 1) * 40.0 - 20.0;
+            let detail = ((x.wrapping_mul(31) ^ y.wrapping_mul(17)) % 16) as f64 / 16.0;
+            let v = (base + slope * (fx - fy) + detail * 12.0 + 12.0).clamp(0.0, 255.0) as u8;
+            Rgb([v, v / 2 + 40, 220u8.saturating_sub(v / 3)])
+        })
+    }
+
+    fn center_crop(base: &RgbImage, keep_percent: u32) -> RgbImage {
+        let side = 512 * keep_percent / 100;
+        let offset = (512 - side) / 2;
+        image::imageops::crop_imm(base, offset, offset, side, side).to_image()
+    }
+
+    fn siftable(hash: &str, bytes: &[u8]) -> SiftableImage {
+        let (fingerprint, sift) = fingerprint_and_sift(bytes).expect("fingerprint_and_sift");
+        SiftableImage {
+            hash: hash.into(),
+            fingerprint,
+            sift,
+        }
+    }
+
+    #[test]
+    fn center_crops_are_detected_with_whole_first() {
+        let base = photo_like(3);
+        let whole = siftable("w", &jpeg_bytes(&base, 85));
+        for keep in [50u32, 30] {
+            let part = siftable("p", &jpeg_bytes(&center_crop(&base, keep), 85));
+            let groups = detect_crops(&[whole.clone(), part], 32);
+            assert_eq!(groups.len(), 1, "keep={keep}");
+            assert_eq!(groups[0].kind, GroupKind::Crop);
+            assert_eq!(groups[0].hashes, vec!["w".to_owned(), "p".to_owned()]);
+            assert!(
+                groups[0].percent >= CROP_MIN_COHESION_PERCENT as u8,
+                "keep={keep} percent={}",
+                groups[0].percent
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_images_produce_no_crop_groups() {
+        let a = siftable("a", &jpeg_bytes(&photo_like(1), 85));
+        let b = siftable("b", &jpeg_bytes(&photo_like(200), 85));
+        assert!(detect_crops(&[a, b], 32).is_empty());
+    }
+
+    #[test]
+    fn solid_color_has_no_fingerprint_or_sift() {
+        let image = RgbImage::from_pixel(16, 16, Rgb([12, 34, 56]));
+        assert!(fingerprint_and_sift(&png_bytes(&image)).is_none());
+    }
+
+    #[test]
+    fn sift_bytes_round_trip() {
+        let features = SiftFeatures {
+            points: vec![(1, 2), (60000, 511)],
+            descriptors: vec![[7; SIFT_DIMS], [250; SIFT_DIMS]],
+            centers: [[0x1111; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
+        };
+        let bytes = sift_to_bytes(&features);
+        assert_eq!(sift_from_bytes(&bytes), Some(features));
+        assert!(sift_from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        assert!(sift_from_bytes(&[0; 96]).is_none());
+    }
+
+    /// 手工特征：12 个互异描述子。点铺成 2D 网格——共线点集会让单应
+    /// 求解退化，OpenCV 直接把全部点判成 outlier。centers 全零会挡掉
+    /// 中心档预筛，配合 cap 测试里全同 dHash 走通道一。
+    fn manual_features() -> SiftFeatures {
+        const SPOTS: [(u16, u16); 12] = [
+            (60, 60),
+            (300, 60),
+            (60, 300),
+            (300, 300),
+            (180, 180),
+            (420, 180),
+            (180, 420),
+            (420, 420),
+            (60, 180),
+            (180, 60),
+            (300, 420),
+            (420, 300),
+        ];
+        SiftFeatures {
+            points: SPOTS.to_vec(),
+            descriptors: (0..12u8).map(|i| [i * 17; SIFT_DIMS]).collect(),
+            centers: [[0; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
+        }
+    }
+
+    #[test]
+    fn few_shared_features_do_not_form_crop() {
+        let mut sparse = manual_features();
+        sparse.points.truncate(3);
+        sparse.descriptors.truncate(3);
+        let whole = manual_features();
+        assert_eq!(match_crop_pair(&sparse, &whole), None);
+    }
+
+    #[test]
+    fn crop_pairs_are_capped() {
+        // 同特征两两全命中，C(501,2) 远超上限，验证截断。指纹用黄金比例
+        // 拉开 phash 距离避开「重复」跳过，dhash 全同保预筛通过。
+        let mut images = Vec::with_capacity(MAX_CROP_PAIRS + 1);
+        for i in 0..=MAX_CROP_PAIRS {
+            images.push(SiftableImage {
+                hash: format!("c{i}"),
+                fingerprint: Fingerprint {
+                    dhash: words(0),
+                    phash: words((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                },
+                sift: manual_features(),
+            });
+        }
+        let groups = detect_crops(&images, 32);
+        assert_eq!(groups.len(), MAX_CROP_PAIRS);
+        assert!(groups.iter().all(|g| g.kind == GroupKind::Crop));
     }
 }
