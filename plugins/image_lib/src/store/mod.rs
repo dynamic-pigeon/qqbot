@@ -15,7 +15,7 @@ use rand::seq::IndexedRandom;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
+use crate::similar::{HashedImage, SiftableImage, fingerprint_and_sift, fingerprint_bytes};
 
 mod backup;
 mod blob_fs;
@@ -27,10 +27,10 @@ mod tests;
 
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use repo::{
-    additional_unique_bytes, backed_up_hashes, delete_fingerprint, hash_still_used,
-    insert_fingerprints, insert_images, library_exists, library_fingerprints, library_hashes,
-    merge_library, prune_dangling_aliases, purge_expired_backup_refs, resolve_library,
-    unique_image_bytes, upsert_alias,
+    additional_unique_bytes, backed_up_hashes, delete_fingerprint, delete_sift, hash_still_used,
+    insert_fingerprints, insert_images, insert_sifts, library_exists, library_fingerprints,
+    library_hashes, library_sifts, merge_library, prune_dangling_aliases,
+    purge_expired_backup_refs, resolve_library, unique_image_bytes, upsert_alias,
 };
 use schema::init_schema;
 
@@ -293,6 +293,7 @@ impl Store {
             prune_dangling_aliases(&pool).await?;
             if !hash_still_used(&pool, hash).await? {
                 delete_fingerprint(&pool, hash).await?;
+                delete_sift(&pool, hash).await?;
             }
             Ok(libraries)
         })
@@ -350,6 +351,19 @@ impl Store {
         let mut tx = pool.begin().await?;
         sqlx::query(
             "DELETE FROM perceptual WHERE hash IN (
+                 SELECT mine.hash FROM images AS mine
+                 WHERE mine.library = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM images AS other
+                       WHERE other.hash = mine.hash AND other.library != mine.library
+                   )
+             )",
+        )
+        .bind(canonical)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM sift WHERE hash IN (
                  SELECT mine.hash FROM images AS mine
                  WHERE mine.library = ?
                    AND NOT EXISTS (
@@ -647,7 +661,7 @@ impl Store {
             })
             .await?;
 
-        let computed = fingerprint_missing(missing).await?;
+        let computed = derive_missing(missing, fingerprint_bytes).await?;
 
         if !computed.is_empty() {
             let to_write = &computed;
@@ -666,6 +680,80 @@ impl Store {
                 fingerprints
                     .remove(&hash)
                     .map(|fingerprint| HashedImage { hash, fingerprint })
+            })
+            .collect();
+        Ok((library, images))
+    }
+
+    /// 「查裁剪」的数据入口：补齐缺失的指纹与 SIFT 特征后返回可比较的图。
+    /// 两张表共用一次解码（[`fingerprint_and_sift`]），任一缺失的图都会
+    /// 重算——存量库升级后首次查裁剪等于全库重算一遍，与首查重同量级。
+    /// 锁外解码期间同群的抽图/加图不会被卡住（同上）。
+    pub async fn siftables_for_library(
+        &self,
+        group_id: i64,
+        name: &str,
+    ) -> Result<(String, Vec<SiftableImage>), StoreError> {
+        let blobs = self.blobs_dir(group_id);
+        let (library, hashes, mut fingerprints, mut sifts, missing) = self
+            .with_group(group_id, |pool| async move {
+                let library = resolve_library(&pool, name).await?;
+                if !library_exists(&pool, &library).await? {
+                    return Err(StoreError::LibraryMissing);
+                }
+                let hashes: Vec<String> =
+                    library_hashes(&pool, &library).await?.into_iter().collect();
+                let fingerprints = library_fingerprints(&pool, &library).await?;
+                let sifts = library_sifts(&pool, &library).await?;
+                let missing: Vec<(String, PathBuf)> = hashes
+                    .iter()
+                    .filter(|hash| !fingerprints.contains_key(*hash) || !sifts.contains_key(*hash))
+                    .filter_map(|hash| {
+                        blob_file(&blobs, hash)
+                            .ok()
+                            .map(|path| (hash.clone(), path))
+                    })
+                    .collect();
+                Ok((library, hashes, fingerprints, sifts, missing))
+            })
+            .await?;
+
+        let computed = derive_missing(missing, fingerprint_and_sift).await?;
+
+        if !computed.is_empty() {
+            let to_fingerprints: Vec<_> = computed
+                .iter()
+                .map(|(hash, (fingerprint, _))| (hash.clone(), *fingerprint))
+                .collect();
+            let to_sifts: Vec<_> = computed
+                .iter()
+                .map(|(hash, (_, sift))| (hash.clone(), sift.clone()))
+                .collect();
+            self.with_group(group_id, |pool| {
+                let to_fingerprints = &to_fingerprints;
+                let to_sifts = &to_sifts;
+                async move {
+                    insert_fingerprints(&pool, to_fingerprints).await?;
+                    insert_sifts(&pool, to_sifts).await
+                }
+            })
+            .await?;
+            for (hash, (fingerprint, sift)) in computed {
+                fingerprints.insert(hash.clone(), fingerprint);
+                sifts.insert(hash, sift);
+            }
+        }
+
+        let images = hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let fingerprint = fingerprints.remove(&hash)?;
+                let sift = sifts.remove(&hash)?;
+                Some(SiftableImage {
+                    hash,
+                    fingerprint,
+                    sift,
+                })
             })
             .collect();
         Ok((library, images))
@@ -760,6 +848,9 @@ impl Store {
             )
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM sift WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
 
             if removed_files > 0 || removed_rows > 0 {
@@ -803,17 +894,25 @@ fn is_large_blob(path: &PathBuf) -> bool {
 /// 单个解码 worker：固定数量的 async 任务，从队列动态领活，同一时刻
 /// 只挂一个 blocking 解码，所以占用的解码线程数恒等于 worker 数。
 /// 队列关闭（发送端全部 drop）且排空后 `recv` 返回 Err，worker 自然退出。
-fn spawn_hash_worker(
+fn spawn_derive_worker<T, F>(
     rx: async_channel::Receiver<(String, Vec<u8>)>,
-) -> kovi::tokio::task::JoinHandle<anyhow::Result<Vec<(String, Fingerprint)>>> {
+    compute: F,
+) -> kovi::tokio::task::JoinHandle<anyhow::Result<Vec<(String, T)>>>
+where
+    T: Send + 'static,
+    F: Fn(&[u8]) -> Option<T> + Send + Sync + Clone + 'static,
+{
     kovi::tokio::spawn(async move {
         let mut computed = Vec::new();
         while let Ok((hash, bytes)) = rx.recv().await {
-            let fingerprint = kovi::tokio::task::spawn_blocking(move || fingerprint_bytes(&bytes))
-                .await
-                .map_err(|e| anyhow::anyhow!("计算感知哈希失败: {e}"))?;
-            if let Some(fingerprint) = fingerprint {
-                computed.push((hash, fingerprint));
+            let derived = kovi::tokio::task::spawn_blocking({
+                let compute = compute.clone();
+                move || compute(&bytes)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("计算派生特征失败: {e}"))?;
+            if let Some(derived) = derived {
+                computed.push((hash, derived));
             }
         }
         Ok(computed)
@@ -826,9 +925,14 @@ fn spawn_hash_worker(
 /// 队列同为容量 1：在途水位 = 每队列一张排队 + worker 在手的各一张。
 /// 大图的读盘与发送单独成一个任务——大图读得慢、大图队列又被慢解码
 /// 顶住背压，混在一个发送循环里会周期性断掉小图的供给。
-async fn fingerprint_missing(
+async fn derive_missing<T, F>(
     missing: Vec<(String, PathBuf)>,
-) -> Result<Vec<(String, Fingerprint)>, StoreError> {
+    compute: F,
+) -> Result<Vec<(String, T)>, StoreError>
+where
+    T: Send + 'static,
+    F: Fn(&[u8]) -> Option<T> + Send + Sync + Clone + 'static,
+{
     if missing.is_empty() {
         return Ok(Vec::new());
     }
@@ -851,9 +955,9 @@ async fn fingerprint_missing(
     let (large_tx, large_rx) = async_channel::bounded::<(String, Vec<u8>)>(1);
     let mut handles = Vec::with_capacity(workers + 1);
     for _ in 0..workers {
-        handles.push(spawn_hash_worker(small_rx.clone()));
+        handles.push(spawn_derive_worker(small_rx.clone(), compute.clone()));
     }
-    handles.push(spawn_hash_worker(large_rx));
+    handles.push(spawn_derive_worker(large_rx, compute));
 
     let large_sender = kovi::tokio::spawn(async move {
         for (hash, path) in large {
@@ -881,7 +985,7 @@ async fn fingerprint_missing(
     for handle in handles {
         let computed = handle
             .await
-            .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))??;
+            .map_err(|e| StoreError::Other(anyhow::anyhow!("计算派生特征失败: {e}")))??;
         all.extend(computed);
     }
     Ok(all)

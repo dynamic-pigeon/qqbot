@@ -20,3 +20,5 @@ config.toml
 .tmp/
 .venv/
 .worktrees/
+/sysroot/
+/scripts/

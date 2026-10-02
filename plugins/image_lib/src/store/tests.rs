@@ -517,6 +517,147 @@ fn weight_halves_per_extra_draw() {
     assert_eq!(weight(min + 13, min), 1);
 }
 
+/// 块状噪声图：与 similar.rs 的测试 fixture 同思路，块角能提出 SIFT 特征。
+fn blocky_png(seed: u32) -> Vec<u8> {
+    use image::{DynamicImage, Rgb, RgbImage};
+    let control = |gx: u32, gy: u32, slot: u32| -> f64 {
+        let h = seed
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(gx.wrapping_mul(0x85EB_CA6B))
+            .wrapping_add(gy.wrapping_mul(0xC2B2_AE35))
+            .wrapping_add(slot.wrapping_mul(0x27D4_EB2F));
+        ((h ^ (h >> 16)) % 1000) as f64 / 1000.0
+    };
+    let image = RgbImage::from_fn(512, 512, |x, y| {
+        let (gx, gy) = (x / 16, y / 16);
+        let fx = (x % 16) as f64 / 16.0;
+        let fy = (y % 16) as f64 / 16.0;
+        let base = control(gx, gy, 0) * 200.0;
+        let slope = control(gx, gy, 1) * 40.0 - 20.0;
+        let detail = ((x.wrapping_mul(31) ^ y.wrapping_mul(17)) % 16) as f64 / 16.0;
+        let v = (base + slope * (fx - fy) + detail * 12.0 + 12.0).clamp(0.0, 255.0) as u8;
+        Rgb([v, v / 2 + 40, 220u8.saturating_sub(v / 3)])
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .unwrap();
+    buf.into_inner()
+}
+
+#[tokio::test]
+async fn sifts_cover_library_and_persist() {
+    let (store, dir) = temp_store();
+    let group = 17;
+    add_images(&store, group, "猫", vec![blocky_png(3), blocky_png(7)])
+        .await
+        .unwrap();
+    add_images(&store, group, "猫", vec![png_like(9)])
+        .await
+        .unwrap();
+
+    let (canonical, images) = store.siftables_for_library(group, "猫").await.unwrap();
+    assert_eq!(canonical, "猫");
+    // 无纹理的假 PNG 提不出指纹，与查重口径一致地跳过。
+    assert_eq!(images.len(), 2);
+    assert!(images.iter().all(|image| !image.sift.points.is_empty()));
+
+    // 落库断言：特征必须持久化，否则每次查裁剪都会全库重算。
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join(group.to_string()).join("index.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sift")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "SIFT 特征未落库");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn narrow_sift_table_is_rebuilt_on_open() {
+    let (store, dir) = temp_store();
+    let group = 87;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE sift (
+            hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
+            features BLOB NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // 任意一次库操作都会走 ensure_pool → init_schema，触发换代重建。
+    store.stats(group).await.err();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .read_only(true);
+    let check = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let sql = sqlx::query_scalar::<_, String>("SELECT sql FROM sqlite_master WHERE name = 'sift'")
+        .fetch_one(&check)
+        .await
+        .unwrap();
+    assert!(sql.contains("% 132 = 0"), "narrow table not rebuilt: {sql}");
+    let version =
+        sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = 'sift'")
+            .fetch_one(&check)
+            .await
+            .unwrap();
+    assert_eq!(version, "v1");
+    check.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn newer_sift_schema_is_rejected() {
+    let (store, dir) = temp_store();
+    let group = 88;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE schema_meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_meta VALUES ('sift', 'v9')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let result = store.stats(group).await;
+    assert!(result.is_err(), "新版本库不应被旧代码打开");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn narrow_fingerprint_table_is_rebuilt_on_open() {
     let (store, dir) = temp_store();
