@@ -62,6 +62,7 @@ async-channel = "2.3"
 opencv = { version = "0.101", default-features = false, features = [
     "calib3d",
     "features2d",
+    "flann",
 ] }
 reqwest = { version = "0.13", features = ["json", "rustls"] }
 utils = { path = "plugins/utils" }

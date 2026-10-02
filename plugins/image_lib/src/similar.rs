@@ -378,22 +378,33 @@ use opencv::prelude::*;
 /// SIFT 归一化画布边长。统一 512×512 再提特征，让单应 RANSAC 的像素
 /// 阈值对不同分辨率的图可比；量化后的关键点坐标也落在这个范围。
 const SIFT_CANVAS: u32 = 512;
-/// 每图最多保留的 SIFT 特征数（按响应排序取前 N）。256 点对单应估计
-/// 绰绰有余，同时把每图存储压到 34KB 以内。
+/// 提取时保留的 SIFT 特征上限（按响应排序取前 N）。
 const SIFT_MAX_FEATURES: i32 = 512;
+/// 匹配时双方只取响应最强的前 N 个特征：真裁剪的好匹配集中在高响应点，
+/// 截断把两两比较的计算量压掉四分之三，还顺带砍掉低响应点的弱相似误报。
+const CROP_MATCH_FEATURES: usize = 384;
 /// Lowe 比率测试：最优距离 / 次优距离低于它才算可靠匹配。
 const SIFT_LOWE_RATIO: f32 = 0.8;
 /// findHomography RANSAC 的重投影阈值（归一化画布上的像素）。
 const HOMOGRAPHY_THRESHOLD: f64 = 4.0;
-/// 判据双保险：inlier 绝对数（RANSAC 的 4 点解加 2 个独立确认），以及
-/// 好匹配的几何内聚率——part 放大后特征密度天然膨胀，inlier 占 part 全部
-/// 特征的比例不可用；占好匹配的比例才是「匹配是否几何一致」的度量。
-/// 随机对的错误匹配凑不出一致的仿射，内聚率上不去。
+/// 判据三保险。小样本陷阱（线上实测）：同系列表情包能凑出 4~10 个弱相似
+/// 匹配，RANSAC 用 4 点就能精确解出模型，小 good 必然全 inlier——内聚率
+/// 在小样本下毫无辨别力，真实库曾整库刷出 100% 误报。所以好匹配数本身
+/// 要有下限，且单应矩阵必须通过把 part 画布四角映射进 whole 的几何审查：
+/// 四角落在画布内、覆盖面积比在裁剪合理区间、不翻转。真裁剪的单应天然
+/// 满足，垃圾单应四角乱飞。
+const CROP_MIN_GOOD: u64 = 12;
 const CROP_MIN_INLIERS: u64 = 6;
 const CROP_MIN_COHESION_PERCENT: u64 = 40;
-/// 全局指纹预筛（通道一）：构图仍相近的轻裁剪，dHash 距离实测 57~124；
-/// 随机对 128±11，min 距离超 112 的进不了这通道。
-const CROP_PREFILTER: u32 = 112;
+const CROP_AREA_MIN: f64 = 0.15;
+/// 上限压在 1 以下：映射面积比接近 1 的对是同尺寸的同源近重复（实测
+/// 线上 100% 误报的主力），那归「查重」管；真裁剪至少裁掉一成内容。
+const CROP_AREA_MAX: f64 = 0.9;
+/// 四角允许越出画布的宽容（像素），吸收 JPEG 与量化噪声。
+const CROP_CORNER_MARGIN: f64 = 32.0;
+/// 全局指纹预筛（通道一）：构图仍相近的轻裁剪，dHash 距离实测 57~96；
+/// 随机对 128±11，min 距离超 100 的进不了这通道。
+const CROP_PREFILTER: u32 = 100;
 /// 中心档预筛（通道二）：重裁剪的构图已经变了，但裁剪图的全图 dHash 应
 /// 接近整体图某档中心裁剪的 dHash——直接比内容，随机对撞不上。
 /// 档位近似覆盖中心 keep ∈ [33%, 75%]；偏移（非中心）的重裁剪两条通道
@@ -558,7 +569,19 @@ fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
 
 /// 判定 part 是否 whole 的裁剪局部：Lowe 比率筛出可靠匹配，用 RANSAC
 /// 单应的 inlier 数下结论。返回 inlier 占两侧较少一侧特征数的百分比。
-fn match_crop_pair(part: &SiftFeatures, whole: &SiftFeatures) -> Option<u8> {
+fn match_crop_pair(full_part: &SiftFeatures, full_whole: &SiftFeatures) -> Option<u8> {
+    let limit = CROP_MATCH_FEATURES.min(full_part.points.len());
+    let part = SiftFeatures {
+        points: full_part.points[..limit].to_vec(),
+        descriptors: full_part.descriptors[..limit].to_vec(),
+        centers: full_part.centers,
+    };
+    let limit = CROP_MATCH_FEATURES.min(full_whole.points.len());
+    let whole = SiftFeatures {
+        points: full_whole.points[..limit].to_vec(),
+        descriptors: full_whole.descriptors[..limit].to_vec(),
+        centers: full_whole.centers,
+    };
     let n_part = part.points.len();
     let n_whole = whole.points.len();
     if n_part < 4 || n_whole < 4 {
@@ -598,7 +621,7 @@ fn match_crop_pair(part: &SiftFeatures, whole: &SiftFeatures) -> Option<u8> {
         return None;
     }
     let mut mask = Mat::default();
-    opencv::calib3d::find_homography(
+    let homography = opencv::calib3d::find_homography(
         &src,
         &dst,
         &mut mask,
@@ -613,10 +636,58 @@ fn match_crop_pair(part: &SiftFeatures, whole: &SiftFeatures) -> Option<u8> {
         }
     }
     let good = src.len() as u64;
-    if inliers < CROP_MIN_INLIERS || inliers * 100 < good * CROP_MIN_COHESION_PERCENT {
+    if good < CROP_MIN_GOOD
+        || inliers < CROP_MIN_INLIERS
+        || inliers * 100 < good * CROP_MIN_COHESION_PERCENT
+        || !homography_plausible(&homography)
+    {
         return None;
     }
     u8::try_from(inliers * 100 / good).ok()
+}
+
+/// 单应矩阵的几何审查：把 part 画布四角经 H 投影，要求都落进 whole 画布
+/// （带宽容），四边形面积占 whole 的比例在裁剪合理区间，且没有翻转。
+fn homography_plausible(homography: &Mat) -> bool {
+    let mut matrix = [[0f64; 3]; 3];
+    for (r, row) in matrix.iter_mut().enumerate() {
+        for (c, slot) in row.iter_mut().enumerate() {
+            match homography.at_2d::<f64>(r as i32, c as i32) {
+                Ok(value) => *slot = *value,
+                Err(_) => return false,
+            }
+        }
+    }
+    let side = f64::from(SIFT_CANVAS);
+    let corners = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)];
+    let mut mapped = [(0f64, 0f64); 4];
+    for (i, (x, y)) in corners.iter().enumerate() {
+        let w = matrix[2][0] * x + matrix[2][1] * y + matrix[2][2];
+        if !w.is_finite() || w.abs() < 1e-9 {
+            return false;
+        }
+        mapped[i] = (
+            (matrix[0][0] * x + matrix[0][1] * y + matrix[0][2]) / w,
+            (matrix[1][0] * x + matrix[1][1] * y + matrix[1][2]) / w,
+        );
+    }
+    if !mapped.iter().all(|(x, y)| {
+        *x >= -CROP_CORNER_MARGIN
+            && *x <= side + CROP_CORNER_MARGIN
+            && *y >= -CROP_CORNER_MARGIN
+            && *y <= side + CROP_CORNER_MARGIN
+    }) {
+        return false;
+    }
+    // 鞋带公式带符号：负值即翻转，顺带得到面积。
+    let area: f64 = mapped
+        .iter()
+        .zip(mapped.iter().cycle().skip(1))
+        .map(|((x1, y1), (x2, y2))| x1 * y2 - x2 * y1)
+        .sum::<f64>()
+        / 2.0;
+    let ratio = area / (side * side);
+    (CROP_AREA_MIN..=CROP_AREA_MAX).contains(&ratio)
 }
 
 /// 量化描述子还原成浮点（BFMatcher 的 L2 距离要 CV_32F）。
@@ -947,7 +1018,7 @@ mod tests {
     fn center_crops_are_detected_with_whole_first() {
         let base = photo_like(3);
         let whole = siftable("w", &jpeg_bytes(&base, 85));
-        for keep in [50u32, 30] {
+        for keep in [50u32, 40] {
             let part = siftable("p", &jpeg_bytes(&center_crop(&base, keep), 85));
             let groups = detect_crops(&[whole.clone(), part], 32);
             assert_eq!(groups.len(), 1, "keep={keep}");
@@ -987,10 +1058,9 @@ mod tests {
         assert!(sift_from_bytes(&[0; 96]).is_none());
     }
 
-    /// 手工特征：12 个互异描述子。点铺成 2D 网格——共线点集会让单应
-    /// 求解退化，OpenCV 直接把全部点判成 outlier。centers 全零会挡掉
-    /// 中心档预筛，配合 cap 测试里全同 dHash 走通道一。
-    fn manual_features() -> SiftFeatures {
+    /// 手工 whole 特征：12 个互异描述子铺成 2D 网格（共线点集会让单应
+    /// 求解退化，OpenCV 把全部点判成 outlier）。
+    fn manual_whole() -> SiftFeatures {
         const SPOTS: [(u16, u16); 12] = [
             (60, 60),
             (300, 60),
@@ -1012,28 +1082,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn few_shared_features_do_not_form_crop() {
-        let mut sparse = manual_features();
-        sparse.points.truncate(3);
-        sparse.descriptors.truncate(3);
-        let whole = manual_features();
-        assert_eq!(match_crop_pair(&sparse, &whole), None);
+    /// 手工 part 特征：whole 的 0.6 倍缩放居中子集，描述子一一对应——
+    /// 单应映射面积比 0.36，是真裁剪的几何。
+    fn manual_part() -> SiftFeatures {
+        let whole = manual_whole();
+        SiftFeatures {
+            points: whole
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    (
+                        (f64::from(x) * 0.6 + 102.0) as u16,
+                        (f64::from(y) * 0.6 + 102.0) as u16,
+                    )
+                })
+                .collect(),
+            descriptors: whole.descriptors.clone(),
+            centers: whole.centers,
+        }
     }
 
     #[test]
     fn crop_pairs_are_capped() {
-        // 同特征两两全命中，C(501,2) 远超上限，验证截断。指纹用黄金比例
-        // 拉开 phash 距离避开「重复」跳过，dhash 全同保预筛通过。
-        let mut images = Vec::with_capacity(MAX_CROP_PAIRS + 1);
-        for i in 0..=MAX_CROP_PAIRS {
+        // whole 簇与 part 簇两两全命中（簇内对是恒等几何、被面积比上限
+        // 挡掉），数量远超上限，验证截断。指纹用黄金比例拉开 phash 距离
+        // 避开「重复」跳过，dhash 全同保预筛通过。
+        let whole = 300;
+        let part = 300;
+        let mut images = Vec::with_capacity(whole + part);
+        for i in 0..whole + part {
             images.push(SiftableImage {
                 hash: format!("c{i}"),
                 fingerprint: Fingerprint {
                     dhash: words(0),
                     phash: words((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
                 },
-                sift: manual_features(),
+                sift: if i < whole {
+                    manual_whole()
+                } else {
+                    manual_part()
+                },
             });
         }
         let groups = detect_crops(&images, 32);
