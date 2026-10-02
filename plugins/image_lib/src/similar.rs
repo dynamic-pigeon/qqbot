@@ -402,15 +402,10 @@ const CROP_AREA_MIN: f64 = 0.15;
 const CROP_AREA_MAX: f64 = 0.9;
 /// 四角允许越出画布的宽容（像素），吸收 JPEG 与量化噪声。
 const CROP_CORNER_MARGIN: f64 = 32.0;
-/// 全局指纹预筛（通道一）：构图仍相近的轻裁剪，dHash 距离实测 57~96；
-/// 随机对 128±11，min 距离超 100 的进不了这通道。
-const CROP_PREFILTER: u32 = 100;
-/// 中心档预筛（通道二）：重裁剪的构图已经变了，但裁剪图的全图 dHash 应
-/// 接近整体图某档中心裁剪的 dHash——直接比内容，随机对撞不上。
-/// 档位近似覆盖中心 keep ∈ [33%, 75%]；偏移（非中心）的重裁剪两条通道
-/// 都可能漏，是明确的取舍：宁可漏检也不让全库两两跑特征匹配。
+/// 中心档数。历史上有过用它做哈希预筛的版本——实测对「偏移 + 非等比 +
+/// 保留 <1/3」的裁剪整对漏检（同质风格库里也没有任何更便宜的信号可用），
+/// 预筛已删，检测走全库两两特征匹配；常量保留是因为序列化布局依赖它。
 const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
-const CENTER_PREFILTER: u32 = 96;
 /// 裁剪对展示上限，语义同 MAX_MAYBE_GROUPS：防止海量对撑爆查重会话内存。
 const MAX_CROP_PAIRS: usize = 500;
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
@@ -514,48 +509,55 @@ fn center_hashes(image: &DynamicImage) -> [[u64; FINGERPRINT_WORDS]; CENTER_KEEP
 /// 两张：hashes[0] 是整体、hashes[1] 是局部。
 pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<SimilarGroup> {
     let n = images.len();
-    let mut pairs = Vec::new();
-    'outer: for i in 0..n {
-        for j in (i + 1)..n {
-            let (dup_dist, maybe_dist) =
-                pair_distances(images[i].fingerprint, images[j].fingerprint);
-            if dup_dist <= duplicate_limit {
-                continue;
-            }
-            // 预筛双通道：轻裁剪构图仍近（全局指纹），重裁剪看中心档内容。
-            let i_contains_j = maybe_dist <= CROP_PREFILTER || center_hit(&images[j], &images[i]);
-            let j_contains_i = maybe_dist <= CROP_PREFILTER || center_hit(&images[i], &images[j]);
-            if !i_contains_j && !j_contains_i {
-                continue;
-            }
-            if i_contains_j && let Some(percent) = match_crop_pair(&images[j].sift, &images[i].sift)
-            {
-                pairs.push(crop_group(&images[i].hash, &images[j].hash, percent));
-            } else if j_contains_i
-                && let Some(percent) = match_crop_pair(&images[i].sift, &images[j].sift)
-            {
-                pairs.push(crop_group(&images[j].hash, &images[i].hash, percent));
-            }
-            if pairs.len() >= MAX_CROP_PAIRS {
-                break 'outer;
-            }
-        }
+    if n < 2 {
+        return Vec::new();
     }
+    // 不做任何预筛：同质风格的表情包库里，哈希/词袋/降维粗匹配全都
+    // 分不开「内容重叠」和「风格相似」（实测五种方案全部失效），
+    // 预筛只会漏检。全量两两特征匹配单对约 1ms，千张库并行数分钟可完成。
+    // 交错取行分片，各线程负载均衡；match_crop_pair 是纯函数，可并行。
+    let workers = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let mut shards: Vec<Vec<SimilarGroup>> = vec![Vec::new(); workers];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for (t, shard) in shards.iter_mut().enumerate() {
+            handles.push(scope.spawn(move || {
+                let mut i = t;
+                while i < n {
+                    for j in (i + 1)..n {
+                        let (dup_dist, _) =
+                            pair_distances(images[i].fingerprint, images[j].fingerprint);
+                        // 「重复」距离的对归查重管，不算裁剪。
+                        if dup_dist > duplicate_limit {
+                            if let Some(percent) = match_crop_pair(&images[j].sift, &images[i].sift)
+                            {
+                                shard.push(crop_group(&images[i].hash, &images[j].hash, percent));
+                            } else if let Some(percent) =
+                                match_crop_pair(&images[i].sift, &images[j].sift)
+                            {
+                                shard.push(crop_group(&images[j].hash, &images[i].hash, percent));
+                            }
+                        }
+                    }
+                    i += workers;
+                }
+            }));
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+    let mut pairs: Vec<SimilarGroup> = shards.into_iter().flatten().collect();
     pairs.sort_by(|a, b| {
         b.percent
             .cmp(&a.percent)
             .then_with(|| a.hashes.cmp(&b.hashes))
     });
+    pairs.truncate(MAX_CROP_PAIRS);
     pairs
-}
-
-/// part 的全图 dHash 是否命中 whole 的某档中心 dHash。
-fn center_hit(part: &SiftableImage, whole: &SiftableImage) -> bool {
-    whole
-        .sift
-        .centers
-        .iter()
-        .any(|center| hamming(&part.fingerprint.dhash, center) <= CENTER_PREFILTER)
 }
 
 fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {

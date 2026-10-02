@@ -234,6 +234,15 @@ async fn handle_crop_scan(
     let user_id = ctx.event().user_id;
     match op {
         CropOp::Start { name } => {
+            // 全库两两特征匹配要数分钟，先回一条免得像卡死；resolve 便宜，
+            // 提示里用规范库名。
+            let canonical = store
+                .resolve_name(group_id, name)
+                .await
+                .map_err(|error| missing_library(name, error))?;
+            ctx.reply(format!(
+                "正在全量扫「{canonical}」的裁剪局部，每张图都要和全库两两比对，大库要几分钟，别急"
+            ));
             let (canonical, images) = store
                 .siftables_for_library(group_id, name)
                 .await
