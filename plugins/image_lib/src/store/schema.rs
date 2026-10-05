@@ -3,6 +3,7 @@
 use sqlx::{Row, SqlitePool};
 
 use super::StoreError;
+use crate::similar::CROP_CACHE_VERSION;
 
 /// 指纹表结构版本，存进 schema_meta，换代只看它：
 /// v1 是 64-bit 指纹的两列 INTEGER；v2 是 256-bit 指纹的两列 32 字节 BLOB。
@@ -54,8 +55,30 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        // 查裁剪的配对缓存：正结果对（whole 在前、part 在后）。
+        "CREATE TABLE IF NOT EXISTS crop_pairs (
+            whole TEXT NOT NULL CHECK (length(whole) = 64),
+            part TEXT NOT NULL CHECK (length(part) = 64),
+            percent INTEGER NOT NULL CHECK (percent BETWEEN 0 AND 100),
+            PRIMARY KEY (whole, part)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        // 每库一行的覆盖标记：covered 是 64 位 hex 哈希直接拼接，
+        // 记录最近一次完整扫描时的成员全集，两端都在其中的对视为已比对。
+        "CREATE TABLE IF NOT EXISTS crop_scan_state (
+            library TEXT NOT NULL PRIMARY KEY,
+            covered TEXT NOT NULL CHECK (length(covered) % 64 = 0)
+        )",
+    )
+    .execute(pool)
+    .await?;
     migrate_fingerprint_schema(pool).await?;
     migrate_sift_schema(pool).await?;
+    migrate_crop_cache(pool).await?;
     Ok(())
 }
 
@@ -133,6 +156,37 @@ async fn migrate_sift_schema(pool: &SqlitePool) -> Result<(), StoreError> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     )
     .bind(SIFT_SCHEMA)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 配对缓存的失效标记：值 = "<CROP_CACHE_VERSION>:<duplicate_distance>"。
+/// 检测判据演进或阈值改配置都会换值，缓存整体弃掉——正结果可由特征重算，
+/// 无损。与指纹/SIFT 表不同，这里不拒绝「版本比代码新」：缓存是纯派生
+/// 数据，降级二进制弃掉重建比拒开更安全。
+async fn migrate_crop_cache(pool: &SqlitePool) -> Result<(), StoreError> {
+    let expected = format!(
+        "{}:{}",
+        CROP_CACHE_VERSION,
+        crate::config::static_config().duplicate_distance()
+    );
+    let current =
+        sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = 'crop_cache'")
+            .fetch_optional(pool)
+            .await?;
+    if current.as_deref() == Some(expected.as_str()) {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM crop_pairs").execute(pool).await?;
+    sqlx::query("DELETE FROM crop_scan_state")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO schema_meta (key, value) VALUES ('crop_cache', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&expected)
     .execute(pool)
     .await?;
     Ok(())

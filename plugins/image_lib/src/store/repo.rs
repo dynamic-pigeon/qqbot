@@ -204,6 +204,140 @@ pub(super) async fn library_sifts(
     Ok(found)
 }
 
+/// 读一个库的覆盖标记：covered 是 64 位 hex 哈希直接拼接，定长切块还原。
+pub(super) async fn crop_covered(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<String>, StoreError> {
+    let covered =
+        sqlx::query_scalar::<_, String>("SELECT covered FROM crop_scan_state WHERE library = ?")
+            .bind(library)
+            .fetch_optional(pool)
+            .await?;
+    let Some(covered) = covered else {
+        return Ok(Vec::new());
+    };
+    covered
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| {
+            std::str::from_utf8(chunk)
+                .map(str::to_owned)
+                .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记 BLOB 异常: {library}")))
+        })
+        .collect()
+}
+
+/// 整轮扫描完成后写入覆盖标记：本轮成员全集即「已两两比对过」的范围。
+pub(super) async fn save_crop_covered(
+    pool: &SqlitePool,
+    library: &str,
+    covered: &[String],
+) -> Result<(), StoreError> {
+    let mut blob = String::with_capacity(covered.len() * 64);
+    for hash in covered {
+        blob.push_str(hash);
+    }
+    sqlx::query(
+        "INSERT INTO crop_scan_state (library, covered) VALUES (?, ?)
+         ON CONFLICT(library) DO UPDATE SET covered = excluded.covered",
+    )
+    .bind(library)
+    .bind(blob)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 新查出的正结果对落库。只忽略主键冲突（并发扫描的幂等），与指纹同款。
+pub(super) async fn insert_crop_pairs(
+    pool: &SqlitePool,
+    pairs: &[(String, String, u8)],
+) -> Result<(), StoreError> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (whole, part, percent) in pairs {
+        sqlx::query(
+            "INSERT INTO crop_pairs (whole, part, percent) VALUES (?, ?, ?)
+             ON CONFLICT(whole, part) DO NOTHING",
+        )
+        .bind(whole)
+        .bind(part)
+        .bind(u64::from(*percent) as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 该库成员之间的全部正结果对。EXISTS 子查询借 images 主键索引过滤，
+/// 已删出的哈希自然不在结果里；对的结果只依赖两张图的内容，跨库共享。
+pub(super) async fn library_crop_pairs(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<(String, String, u8)>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT c.whole AS whole, c.part AS part, c.percent AS percent
+         FROM crop_pairs c
+         WHERE EXISTS (SELECT 1 FROM images i WHERE i.library = ? AND i.hash = c.whole)
+           AND EXISTS (SELECT 1 FROM images i WHERE i.library = ? AND i.hash = c.part)",
+    )
+    .bind(library)
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("whole")?,
+                row.try_get::<String, _>("part")?,
+                row.try_get::<i64, _>("percent")? as u8,
+            ))
+        })
+        .collect()
+}
+
+pub(super) async fn delete_crop_state<'e, E>(executor: E, library: &str) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
+        .bind(library)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// 哈希彻底出库时清掉它参与的正结果对。
+pub(super) async fn delete_crop_pairs_for_hash(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM crop_pairs WHERE whole = ? OR part = ?")
+        .bind(hash)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 作废引用了某哈希的覆盖标记。哈希与 covered 槽位同为 64 字节、按槽对齐
+/// 拼接，instr 只可能整槽命中，不会误伤相邻哈希。不清会让「删掉再加回
+/// 同一张图」的对被当成已比对——正结果行已随哈希回收，那会漏检。
+pub(super) async fn invalidate_crop_covered(
+    pool: &SqlitePool,
+    hash: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM crop_scan_state WHERE instr(covered, ?) > 0")
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn insert_images(
     pool: &SqlitePool,
     library: &str,
@@ -295,6 +429,9 @@ pub(super) async fn merge_library(
         .bind(source)
         .execute(&mut **tx)
         .await?;
+    // 源库的覆盖标记随成员一起并走：目标库的标记不含并进来的图，
+    // 下次查裁剪会按增量补算它们的对。
+    delete_crop_state(&mut **tx, source).await?;
     sqlx::query("UPDATE aliases SET target = ? WHERE target = ?")
         .bind(dest)
         .bind(source)

@@ -20,8 +20,8 @@ use crate::scan::{
 use crate::send::{
     forward_node, image_message, report_send_fail, send_group_forward_wait, send_group_wait,
 };
-use crate::similar::{cluster, detect_crops, distance_from_percent};
-use crate::store::{StagedImage, Store, StoreError};
+use crate::similar::{cluster, distance_from_percent};
+use crate::store::{CropPlan, StagedImage, Store, StoreError};
 
 /// 查重展示单组读入内存的原始字节预算。大组逐张全读可放大到数百 MiB 常驻。
 const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
@@ -234,32 +234,22 @@ async fn handle_crop_scan(
     let user_id = ctx.event().user_id;
     match op {
         CropOp::Start { name } => {
-            // 全库两两特征匹配要数分钟，先回一条免得像卡死；resolve 便宜，
-            // 提示里用规范库名。
-            let canonical = store
-                .resolve_name(group_id, name)
+            let (canonical, plan) = store
+                .crop_scan_prepare(group_id, name)
                 .await
                 .map_err(|error| missing_library(name, error))?;
-            ctx.reply(format!(
-                "正在全量扫「{canonical}」的裁剪局部，每张图都要和全库两两比对，大库要几分钟，别急"
-            ));
-            let (canonical, images) = store
-                .siftables_for_library(group_id, name)
-                .await
-                .map_err(|error| missing_library(name, error))?;
-            if images.len() < 2 {
-                ctx.reply(format!("「{canonical}」里没有裁剪关系的图"));
-                return Ok(());
+            // 缓存全命中时不回提示，结果直接出；只有真要算的库才说「别急」。
+            if let CropPlan::Incremental { had_coverage, .. } = &plan {
+                ctx.reply(if *had_coverage {
+                    format!("正在补算「{canonical}」新增图片的裁剪比对，稍等")
+                } else {
+                    format!("正在全量扫「{canonical}」的裁剪局部，每张图都要和全库两两比对，大库要几分钟，别急")
+                });
             }
-            let config = crate::config::static_config();
-            let duplicate = config.duplicate_distance();
-            // 特征两两匹配是纯 CPU 的 O(n²) 比较，同查重一样让出 async worker。
-            let groups =
-                kovi::tokio::task::spawn_blocking(move || detect_crops(&images, duplicate))
-                    .await
-                    .map_err(|e| {
-                        CommandError::internal(anyhow::anyhow!("查裁剪计算线程失败: {e}"))
-                    })?;
+            let groups = store
+                .crop_scan_run(group_id, plan)
+                .await
+                .map_err(CommandError::internal)?;
             if groups.is_empty() {
                 ctx.reply(format!("「{canonical}」里没有裁剪关系的图"));
                 return Ok(());
