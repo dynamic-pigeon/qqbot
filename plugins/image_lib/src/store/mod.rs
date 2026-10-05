@@ -31,10 +31,10 @@ mod tests;
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use repo::{
     additional_unique_bytes, backed_up_hashes, crop_covered, delete_crop_pairs_for_hash,
-    delete_crop_state, delete_fingerprint, delete_sift, hash_still_used, insert_crop_pairs,
-    insert_fingerprints, insert_images, insert_sifts, invalidate_crop_covered, library_crop_pairs,
-    library_exists, library_fingerprints, library_hashes, library_sifts, merge_library,
-    prune_dangling_aliases, purge_expired_backup_refs, resolve_library, save_crop_covered,
+    delete_fingerprint, delete_sift, hash_still_used, insert_crop_pairs, insert_fingerprints,
+    insert_images, insert_sifts, library_crop_pairs, library_exists, library_fingerprints,
+    library_hashes, library_sifts, merge_library, prune_dangling_aliases,
+    purge_expired_backup_refs, resolve_library, save_crop_covered, shrink_hash_from_covered,
     unique_image_bytes, upsert_alias,
 };
 use schema::init_schema;
@@ -319,10 +319,10 @@ impl Store {
             if !hash_still_used(&pool, hash).await? {
                 delete_fingerprint(&pool, hash).await?;
                 delete_sift(&pool, hash).await?;
-                // 配对缓存的账也随哈希作废：正结果对回收，引用它的覆盖标记
-                // 整行清除，防止同内容图再加回时对被误当已比对而漏检。
-                delete_crop_pairs_for_hash(&pool, hash).await?;
-                invalidate_crop_covered(&pool, hash).await?;
+                // 配对缓存不随逻辑删除动：正结果对与覆盖标记保留，删图后
+                // 重查直接命中（被删哈希由结果重建的 EXISTS 过滤），同内容
+                // 图在 blob 保护期内加回也零成本。作废绑定在磁盘物理回收
+                // 上，见 reconcile_group。
             }
             Ok(libraries)
         })
@@ -408,9 +408,8 @@ impl Store {
             .bind(canonical)
             .execute(&mut *tx)
             .await?;
-        // 覆盖标记随库清空作废；正结果对可能被其他库共享，留给对账按
-        // 「哈希彻底出库」回收。
-        delete_crop_state(&mut *tx, canonical).await?;
+        // 覆盖标记与正结果对都保留：库清空后标记惰性无害（成员为空），
+        // 用同批图重建时依然全命中；blob 被对账回收时才收缩。
         sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
             .bind(canonical)
             .bind(canonical)
@@ -790,8 +789,9 @@ impl Store {
 
     /// 「查裁剪」的缓存判定：覆盖集（最近一次完整扫描的成员全集）包含全部
     /// 成员时，直接从正结果缓存拼出结果；否则给出增量计划，只补算有新
-    /// 端点的对。blob 按内容寻址不可变，算过的对永远有效，覆盖集只会因
-    /// 删图/换阈值作废，不作日常收缩。
+    /// 端点的对。blob 按内容寻址不可变，算过的对永远有效：逻辑删图与清库
+    /// 零成本（被删哈希由结果重建的 EXISTS 过滤），覆盖集只在 blob 被
+    /// 对账物理回收时收缩、换阈值/算法版本时整体作废。
     pub async fn crop_scan_prepare(
         &self,
         group_id: i64,
@@ -943,6 +943,10 @@ impl Store {
                 .collect();
 
             let mut removed_files = 0u64;
+            // blob 物理消失的哈希（这里删掉孤儿文件，或下面索引指向但盘上
+            // 已没有）：配对缓存的正结果对与覆盖槽位同批作废，此后同内容
+            // 图再加回按增量只重算它的对。逻辑删图不动缓存（见 delete_hash）。
+            let mut reclaimed: HashSet<String> = HashSet::new();
             for hash in disk.difference(&indexed) {
                 if protected.contains(hash) {
                     continue;
@@ -951,12 +955,14 @@ impl Store {
                     && kovi::tokio::fs::remove_file(&path).await.is_ok()
                 {
                     removed_files += 1;
+                    reclaimed.insert(hash.clone());
                 }
             }
 
             let mut tx = pool.begin().await?;
             let mut removed_rows = 0u64;
             for hash in indexed.difference(&disk) {
+                reclaimed.insert(hash.clone());
                 let result = sqlx::query("DELETE FROM images WHERE hash = ?")
                     .bind(hash)
                     .execute(&mut *tx)
@@ -978,30 +984,9 @@ impl Store {
             sqlx::query("DELETE FROM sift WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(
-                "DELETE FROM crop_pairs
-                 WHERE whole NOT IN (SELECT DISTINCT hash FROM images)
-                    OR part NOT IN (SELECT DISTINCT hash FROM images)",
-            )
-            .execute(&mut *tx)
-            .await?;
-            // 覆盖标记引用了已出库哈希的库整行作废：正结果行刚被回收，
-            // 留着标记会把「删掉再加回」的对误当已比对。库数量级小，
-            // 在 Rust 侧逐行查 covered 是否全在库内即可。
-            let live: HashSet<String> = indexed.intersection(&disk).cloned().collect();
-            let state_rows = sqlx::query("SELECT library, covered FROM crop_scan_state")
-                .fetch_all(&mut *tx)
-                .await?;
-            for row in state_rows {
-                let library = row.try_get::<String, _>("library")?;
-                let covered = row.try_get::<String, _>("covered")?;
-                let stale = covered
-                    .as_bytes()
-                    .chunks(64)
-                    .any(|chunk| std::str::from_utf8(chunk).is_ok_and(|hash| !live.contains(hash)));
-                if stale {
-                    delete_crop_state(&mut *tx, &library).await?;
-                }
+            for hash in &reclaimed {
+                delete_crop_pairs_for_hash(&mut *tx, hash).await?;
+                shrink_hash_from_covered(&mut tx, hash).await?;
             }
             tx.commit().await?;
 

@@ -663,14 +663,60 @@ async fn crop_scan_persists_pairs_and_repeats_from_cache() {
     assert_eq!(again, groups);
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
 
-    // 删掉局部图：正结果对与覆盖标记随之作废，该库回到增量重算。
+    // 逻辑删掉局部图：缓存原样保留（行数不变），重查仍全命中——
+    // 被删哈希由结果重建的 EXISTS 过滤，组随成员消失。
     store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
-    assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
-    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 0);
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
     let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
-    assert!(matches!(plan, CropPlan::Incremental { .. }));
-    assert!(store.crop_scan_run(group, plan).await.unwrap().is_empty());
+    let after_delete = match plan {
+        CropPlan::Complete(groups) => groups,
+        other => panic!("删图后应仍全命中: {other:?}"),
+    };
+    assert!(after_delete.is_empty());
 
+    // 保护期内把同一张图加回：覆盖与正结果都在，直接命中，裁剪对回来。
+    add_images(&store, group, "猫", vec![part.clone()])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let restored = match plan {
+        CropPlan::Complete(groups) => groups,
+        other => panic!("保护期内加回应零成本: {other:?}"),
+    };
+    assert_eq!(restored, groups);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn reclaimed_blob_shrinks_coverage_so_readd_recomputes() {
+    let (store, dir) = temp_store();
+    let group = 63;
+    let whole = photo_like_jpeg(3, None);
+    let part = photo_like_jpeg(3, Some(40));
+    add_images(&store, group, "猫", vec![whole.clone(), part.clone()])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let groups = store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(groups.len(), 1);
+
+    // 从没备份过的 blob 没有保护期：删除后对账立即物理回收，
+    // 正结果对随之删除、哈希从覆盖标记摘除。
+    store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
+    store.reconcile_all_at(20_000).await;
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+
+    // 同内容图在回收之后加回：不再被覆盖，按增量重算它的对，重新检出。
+    add_images(&store, group, "猫", vec![part]).await.unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let again = match plan {
+        CropPlan::Incremental { .. } => store.crop_scan_run(group, plan).await.unwrap(),
+        other => panic!("回收后加回应走增量: {other:?}"),
+    };
+    assert_eq!(again, groups);
     let _ = std::fs::remove_dir_all(dir);
 }
 
