@@ -1,5 +1,5 @@
 use image::{DynamicImage, GrayImage, ImageReader, Limits, imageops::FilterType};
-use std::{io::Cursor, sync::LazyLock};
+use std::{collections::HashSet, io::Cursor, sync::LazyLock};
 
 /// 256-bit 感知哈希。dHash 看邻域差分，pHash 看低频 DCT。
 /// 比特按行主序切成 4 个 u64 词，`bit / 64` 定词、`bit % 64` 定位。
@@ -408,6 +408,9 @@ const CROP_CORNER_MARGIN: f64 = 32.0;
 const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
 /// 裁剪对展示上限，语义同 MAX_MAYBE_GROUPS：防止海量对撑爆查重会话内存。
 const MAX_CROP_PAIRS: usize = 500;
+/// 裁剪配对缓存的算法版本。判据常量或匹配流程一变，缓存的正结果对就
+/// 不再可信；bump 此值让 schema_meta 的失效标记换值，整账弃掉重算。
+pub(crate) const CROP_CACHE_VERSION: &str = "v1";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
 
@@ -506,8 +509,13 @@ fn center_hashes(image: &DynamicImage) -> [[u64; FINGERPRINT_WORDS]; CENTER_KEEP
 }
 
 /// 全库裁剪两两检测。已是「重复」距离的图对跳过（归查重管）；输出组固定
-/// 两张：hashes[0] 是整体、hashes[1] 是局部。
-pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<SimilarGroup> {
+/// 两张：hashes[0] 是整体、hashes[1] 是局部。`covered` 是已比对过的图集合，
+/// 两端都在其中的对直接跳过——配对缓存的增量补算靠它只跑有新端点的对。
+pub fn detect_crops(
+    images: &[SiftableImage],
+    duplicate_limit: u32,
+    covered: &HashSet<&str>,
+) -> Vec<SimilarGroup> {
     let n = images.len();
     if n < 2 {
         return Vec::new();
@@ -528,6 +536,11 @@ pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<Simil
                 let mut i = t;
                 while i < n {
                     for j in (i + 1)..n {
+                        if covered.contains(images[i].hash.as_str())
+                            && covered.contains(images[j].hash.as_str())
+                        {
+                            continue;
+                        }
                         let (dup_dist, _) =
                             pair_distances(images[i].fingerprint, images[j].fingerprint);
                         // 「重复」距离的对归查重管，不算裁剪。
@@ -550,7 +563,13 @@ pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<Simil
             let _ = handle.join();
         }
     });
-    let mut pairs: Vec<SimilarGroup> = shards.into_iter().flatten().collect();
+    let pairs: Vec<SimilarGroup> = shards.into_iter().flatten().collect();
+    assemble_crop_groups(pairs)
+}
+
+/// 裁剪组的排序截断：percent 降序、同分按组内哈希字典序，截到展示上限。
+/// 全量检测与配对缓存重建两条路径共用，保证产出一致。
+pub(crate) fn assemble_crop_groups(mut pairs: Vec<SimilarGroup>) -> Vec<SimilarGroup> {
     pairs.sort_by(|a, b| {
         b.percent
             .cmp(&a.percent)
@@ -560,7 +579,7 @@ pub fn detect_crops(images: &[SiftableImage], duplicate_limit: u32) -> Vec<Simil
     pairs
 }
 
-fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
+pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
     SimilarGroup {
         kind: GroupKind::Crop,
         hashes: vec![whole.to_owned(), part.to_owned()],
@@ -1022,7 +1041,7 @@ mod tests {
         let whole = siftable("w", &jpeg_bytes(&base, 85));
         for keep in [50u32, 40] {
             let part = siftable("p", &jpeg_bytes(&center_crop(&base, keep), 85));
-            let groups = detect_crops(&[whole.clone(), part], 32);
+            let groups = detect_crops(&[whole.clone(), part], 32, &HashSet::new());
             assert_eq!(groups.len(), 1, "keep={keep}");
             assert_eq!(groups[0].kind, GroupKind::Crop);
             assert_eq!(groups[0].hashes, vec!["w".to_owned(), "p".to_owned()]);
@@ -1038,7 +1057,23 @@ mod tests {
     fn unrelated_images_produce_no_crop_groups() {
         let a = siftable("a", &jpeg_bytes(&photo_like(1), 85));
         let b = siftable("b", &jpeg_bytes(&photo_like(200), 85));
-        assert!(detect_crops(&[a, b], 32).is_empty());
+        assert!(detect_crops(&[a, b], 32, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn covered_pairs_are_skipped_partial_coverage_still_computes() {
+        let base = photo_like(3);
+        let whole = siftable("w", &jpeg_bytes(&base, 85));
+        let part = siftable("p", &jpeg_bytes(&center_crop(&base, 40), 85));
+        // 一端在覆盖集：对仍有新端点，照常计算并检出。
+        let partial: HashSet<&str> = HashSet::from(["w"]);
+        assert_eq!(
+            detect_crops(&[whole.clone(), part.clone()], 32, &partial).len(),
+            1
+        );
+        // 两端都覆盖：本轮跳过，不再产出。
+        let full: HashSet<&str> = HashSet::from(["w", "p"]);
+        assert!(detect_crops(&[whole, part], 32, &full).is_empty());
     }
 
     #[test]
@@ -1126,7 +1161,7 @@ mod tests {
                 },
             });
         }
-        let groups = detect_crops(&images, 32);
+        let groups = detect_crops(&images, 32, &HashSet::new());
         assert_eq!(groups.len(), MAX_CROP_PAIRS);
         assert!(groups.iter().all(|g| g.kind == GroupKind::Crop));
     }
