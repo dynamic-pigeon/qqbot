@@ -311,30 +311,58 @@ where
     Ok(())
 }
 
-/// 哈希彻底出库时清掉它参与的正结果对。
-pub(super) async fn delete_crop_pairs_for_hash(
-    pool: &SqlitePool,
+/// blob 物理回收时清掉该哈希参与的正结果对（在对账事务里调用）。
+pub(super) async fn delete_crop_pairs_for_hash<'e, E>(
+    executor: E,
     hash: &str,
-) -> Result<(), StoreError> {
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query("DELETE FROM crop_pairs WHERE whole = ? OR part = ?")
         .bind(hash)
         .bind(hash)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }
 
-/// 作废引用了某哈希的覆盖标记。哈希与 covered 槽位同为 64 字节、按槽对齐
-/// 拼接，instr 只可能整槽命中，不会误伤相邻哈希。不清会让「删掉再加回
-/// 同一张图」的对被当成已比对——正结果行已随哈希回收，那会漏检。
-pub(super) async fn invalidate_crop_covered(
-    pool: &SqlitePool,
+/// 把哈希从所有覆盖标记里摘除（重写 covered 去掉那个 64 字符槽位，摘空
+/// 删行），与正结果对的回收在同一事务。不摘的话，「blob 已回收 → 同内容
+/// 图再加回」会对着已删的正结果行被当成已比对而漏检。哈希与槽位同为
+/// 64 字节、按槽对齐拼接，instr 只可能整槽命中，不会误伤相邻哈希。
+pub(super) async fn shrink_hash_from_covered(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     hash: &str,
 ) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM crop_scan_state WHERE instr(covered, ?) > 0")
-        .bind(hash)
-        .execute(pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT library, covered FROM crop_scan_state WHERE instr(covered, ?) > 0")
+            .bind(hash)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in rows {
+        let library: String = row.try_get("library")?;
+        let covered: String = row.try_get("covered")?;
+        let shrunk: String = covered
+            .as_bytes()
+            .chunks(64)
+            .filter(|slot| *slot != hash.as_bytes())
+            .map(|slot| std::str::from_utf8(slot).map(str::to_owned))
+            .collect::<Result<String, _>>()
+            .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记异常: {library}")))?;
+        if shrunk.is_empty() {
+            sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
+                .bind(&library)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE crop_scan_state SET covered = ? WHERE library = ?")
+                .bind(&shrunk)
+                .bind(&library)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
     Ok(())
 }
 
