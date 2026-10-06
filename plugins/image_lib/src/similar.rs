@@ -372,7 +372,7 @@ pub fn cluster(
 // 目标机一致。
 
 use opencv::core::{DMatch, KeyPoint, Mat, NORM_L2, Point2f, Vector};
-use opencv::features2d::{BFMatcher, DescriptorMatcherTrait, Feature2DTrait, SIFT};
+use opencv::features2d::{BFMatcher, DescriptorMatcherTraitConst, Feature2DTrait, SIFT};
 use opencv::prelude::*;
 
 /// SIFT 归一化画布边长。统一 512×512 再提特征，让单应 RANSAC 的像素
@@ -508,6 +508,52 @@ fn center_hashes(image: &DynamicImage) -> [[u64; FINGERPRINT_WORDS]; CENTER_KEEP
     out
 }
 
+/// 配对热路径的每图静态侧：截断到 [`CROP_MATCH_FEATURES`] 的关键点与
+/// 反量化描述子。两两配对下每张图要和其余所有图各配一次，截断与
+/// u8→f32 反量化在这里一次摊掉，配对循环内只剩匹配本身。反量化缓冲
+/// 常驻内存（千张库约 192MB），换热路径零分配。
+struct MatchSide {
+    points: Vec<Point2f>,
+    floats: Vec<f32>,
+}
+
+impl MatchSide {
+    /// 截断后点数不足 4 的图连 RANSAC 的最小解都凑不出，不参与配对。
+    fn new(sift: &SiftFeatures) -> Option<Self> {
+        let limit = CROP_MATCH_FEATURES.min(sift.points.len());
+        if limit < 4 {
+            return None;
+        }
+        let points = sift.points[..limit]
+            .iter()
+            .map(|&(x, y)| Point2f::new(f32::from(x), f32::from(y)))
+            .collect();
+        let floats = dequantize(&sift.descriptors[..limit]);
+        Some(Self { points, floats })
+    }
+}
+
+/// 把 OpenCV 全局线程池压到单线程的守卫。配对分片线程已经打满核，
+/// 匹配器内部的 parallel_for 再起线程池只会嵌套超订阅互相踩；提取等
+/// 非配对路径仍要原来的并行度，离开作用域时恢复原值。
+struct SingleThreadGuard(Option<i32>);
+
+impl SingleThreadGuard {
+    fn new() -> Self {
+        let saved = opencv::core::get_num_threads().ok();
+        let _ = opencv::core::set_num_threads(1);
+        Self(saved)
+    }
+}
+
+impl Drop for SingleThreadGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = self.0 {
+            let _ = opencv::core::set_num_threads(saved);
+        }
+    }
+}
+
 /// 全库裁剪两两检测。已是「重复」距离的图对跳过（归查重管）；输出组固定
 /// 两张：hashes[0] 是整体、hashes[1] 是局部。`covered` 是已比对过的图集合，
 /// 两端都在其中的对直接跳过——配对缓存的增量补算靠它只跑有新端点的对。
@@ -522,8 +568,14 @@ pub fn detect_crops(
     }
     // 不做任何预筛：同质风格的表情包库里，哈希/词袋/降维粗匹配全都
     // 分不开「内容重叠」和「风格相似」（实测五种方案全部失效），
-    // 预筛只会漏检。全量两两特征匹配单对约 1ms，千张库并行数分钟可完成。
+    // 预筛只会漏检。配对开销的大头是两侧各 384 个描述子的 knn 暴力
+    // 比对，千张库并行数分钟可完成。
     // 交错取行分片，各线程负载均衡；match_crop_pair 是纯函数，可并行。
+    let sides: Vec<Option<MatchSide>> = images
+        .iter()
+        .map(|image| MatchSide::new(&image.sift))
+        .collect();
+    let _single_thread = SingleThreadGuard::new();
     let workers = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(4)
@@ -532,24 +584,35 @@ pub fn detect_crops(
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for (t, shard) in shards.iter_mut().enumerate() {
+            let sides = &sides;
             handles.push(scope.spawn(move || {
+                // BFMatcher 无跨调用状态，分片内复用一个；创建失败视同
+                // 该分片全部匹配失败，与单对匹配失败同语义。
+                let Ok(matcher) = BFMatcher::new(NORM_L2, false) else {
+                    return;
+                };
                 let mut i = t;
                 while i < n {
+                    let Some(side_i) = &sides[i] else {
+                        i += workers;
+                        continue;
+                    };
                     for j in (i + 1)..n {
                         if covered.contains(images[i].hash.as_str())
                             && covered.contains(images[j].hash.as_str())
                         {
                             continue;
                         }
+                        let Some(side_j) = &sides[j] else {
+                            continue;
+                        };
                         let (dup_dist, _) =
                             pair_distances(images[i].fingerprint, images[j].fingerprint);
                         // 「重复」距离的对归查重管，不算裁剪。
                         if dup_dist > duplicate_limit {
-                            if let Some(percent) = match_crop_pair(&images[j].sift, &images[i].sift)
-                            {
+                            if let Some(percent) = match_crop_pair(side_j, side_i, &matcher) {
                                 shard.push(crop_group(&images[i].hash, &images[j].hash, percent));
-                            } else if let Some(percent) =
-                                match_crop_pair(&images[i].sift, &images[j].sift)
+                            } else if let Some(percent) = match_crop_pair(side_i, side_j, &matcher)
                             {
                                 shard.push(crop_group(&images[j].hash, &images[i].hash, percent));
                             }
@@ -590,37 +653,27 @@ pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
 
 /// 判定 part 是否 whole 的裁剪局部：Lowe 比率筛出可靠匹配，用 RANSAC
 /// 单应的 inlier 数下结论。返回 inlier 占两侧较少一侧特征数的百分比。
-fn match_crop_pair(full_part: &SiftFeatures, full_whole: &SiftFeatures) -> Option<u8> {
-    let limit = CROP_MATCH_FEATURES.min(full_part.points.len());
-    let part = SiftFeatures {
-        points: full_part.points[..limit].to_vec(),
-        descriptors: full_part.descriptors[..limit].to_vec(),
-        centers: full_part.centers,
-    };
-    let limit = CROP_MATCH_FEATURES.min(full_whole.points.len());
-    let whole = SiftFeatures {
-        points: full_whole.points[..limit].to_vec(),
-        descriptors: full_whole.descriptors[..limit].to_vec(),
-        centers: full_whole.centers,
-    };
-    let n_part = part.points.len();
-    let n_whole = whole.points.len();
-    if n_part < 4 || n_whole < 4 {
-        return None;
-    }
-    // Mat 的数据指针借用底下的 Vec，两者必须活到匹配结束，不能封成函数返回。
-    let part_floats = dequantize(&part.descriptors);
-    let whole_floats = dequantize(&whole.descriptors);
+/// 两侧的截断与反量化由 [`MatchSide`] 摊到每图一次；Mat 头是 O(1) 的
+/// 外部数据包装（不拷描述子），BoxedRef 借用 floats 缓冲、活到匹配
+/// 结束。matcher 由调用方持有，knn_train_match 直传训练侧、不落内部
+/// 训练集，无状态可复用。
+fn match_crop_pair(part: &MatchSide, whole: &MatchSide, matcher: &BFMatcher) -> Option<u8> {
     let part_desc =
-        Mat::new_rows_cols_with_data(n_part as i32, SIFT_DIMS as i32, &part_floats).ok()?;
+        Mat::new_rows_cols_with_data(part.points.len() as i32, SIFT_DIMS as i32, &part.floats)
+            .ok()?;
     let whole_desc =
-        Mat::new_rows_cols_with_data(n_whole as i32, SIFT_DIMS as i32, &whole_floats).ok()?;
-    let mut matcher = BFMatcher::new(NORM_L2, false).ok()?;
-    matcher.add(&whole_desc).ok()?;
-    matcher.train().ok()?;
+        Mat::new_rows_cols_with_data(whole.points.len() as i32, SIFT_DIMS as i32, &whole.floats)
+            .ok()?;
     let mut matches = Vector::<Vector<DMatch>>::new();
     matcher
-        .knn_match(&part_desc, &mut matches, 2, &Mat::default(), false)
+        .knn_train_match(
+            &part_desc,
+            &whole_desc,
+            &mut matches,
+            2,
+            &Mat::default(),
+            false,
+        )
         .ok()?;
     let mut src = Vector::<Point2f>::new();
     let mut dst = Vector::<Point2f>::new();
@@ -632,10 +685,10 @@ fn match_crop_pair(full_part: &SiftFeatures, full_whole: &SiftFeatures) -> Optio
         let best = pair.get(0).ok()?;
         let second = pair.get(1).ok()?;
         if best.distance < SIFT_LOWE_RATIO * second.distance {
-            let (px, py) = part.points[i];
-            let (wx, wy) = whole.points[best.train_idx as usize];
-            src.push(Point2f::new(f32::from(px), f32::from(py)));
-            dst.push(Point2f::new(f32::from(wx), f32::from(wy)));
+            let part_point = part.points[i];
+            let whole_point = whole.points[best.train_idx as usize];
+            src.push(part_point);
+            dst.push(whole_point);
         }
     }
     if src.len() < 4 {
