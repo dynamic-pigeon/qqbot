@@ -517,6 +517,361 @@ fn weight_halves_per_extra_draw() {
     assert_eq!(weight(min + 13, min), 1);
 }
 
+/// 块状噪声图：与 similar.rs 的测试 fixture 同思路，块角能提出 SIFT 特征。
+fn blocky_png(seed: u32) -> Vec<u8> {
+    use image::{DynamicImage, Rgb, RgbImage};
+    let control = |gx: u32, gy: u32, slot: u32| -> f64 {
+        let h = seed
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(gx.wrapping_mul(0x85EB_CA6B))
+            .wrapping_add(gy.wrapping_mul(0xC2B2_AE35))
+            .wrapping_add(slot.wrapping_mul(0x27D4_EB2F));
+        ((h ^ (h >> 16)) % 1000) as f64 / 1000.0
+    };
+    let image = RgbImage::from_fn(512, 512, |x, y| {
+        let (gx, gy) = (x / 16, y / 16);
+        let fx = (x % 16) as f64 / 16.0;
+        let fy = (y % 16) as f64 / 16.0;
+        let base = control(gx, gy, 0) * 200.0;
+        let slope = control(gx, gy, 1) * 40.0 - 20.0;
+        let detail = ((x.wrapping_mul(31) ^ y.wrapping_mul(17)) % 16) as f64 / 16.0;
+        let v = (base + slope * (fx - fy) + detail * 12.0 + 12.0).clamp(0.0, 255.0) as u8;
+        Rgb([v, v / 2 + 40, 220u8.saturating_sub(v / 3)])
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .unwrap();
+    buf.into_inner()
+}
+
+/// 与 similar.rs 的 photo_like 同思路：块角是强角点、各角邻域梯度组合互不
+/// 相同，中心裁剪能被 SIFT 检出；纯块状噪声的角点描述子彼此同构，检不出。
+fn photo_like_jpeg(seed: u32, keep_percent: Option<u32>) -> Vec<u8> {
+    use image::{ImageEncoder, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
+    let control = |gx: u32, gy: u32, slot: u32| -> f64 {
+        let h = seed
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(gx.wrapping_mul(0x85EB_CA6B))
+            .wrapping_add(gy.wrapping_mul(0xC2B2_AE35))
+            .wrapping_add(slot.wrapping_mul(0x27D4_EB2F));
+        ((h ^ (h >> 16)) % 1000) as f64 / 1000.0
+    };
+    let full = RgbImage::from_fn(512, 512, |x, y| {
+        let (gx, gy) = (x / 16, y / 16);
+        let fx = (x % 16) as f64 / 16.0;
+        let fy = (y % 16) as f64 / 16.0;
+        let base = control(gx, gy, 0) * 200.0;
+        let slope = control(gx, gy, 1) * 40.0 - 20.0;
+        let detail = ((x.wrapping_mul(31) ^ y.wrapping_mul(17)) % 16) as f64 / 16.0;
+        let v = (base + slope * (fx - fy) + detail * 12.0 + 12.0).clamp(0.0, 255.0) as u8;
+        Rgb([v, v / 2 + 40, 220u8.saturating_sub(v / 3)])
+    });
+    let image = match keep_percent {
+        None => full,
+        Some(keep) => {
+            let side = 512 * keep / 100;
+            let offset = (512 - side) / 2;
+            image::imageops::crop_imm(&full, offset, offset, side, side).to_image()
+        }
+    };
+    let mut buf = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, 85)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    buf
+}
+
+async fn table_count(dir: &std::path::Path, group: i64, table: &str) -> i64 {
+    // sqlx 0.9 的 query_scalar 只收 'static str，表名映射成字面量。
+    let sql: &'static str = match table {
+        "crop_pairs" => "SELECT COUNT(*) FROM crop_pairs",
+        "crop_scan_state" => "SELECT COUNT(*) FROM crop_scan_state",
+        _ => unreachable!("仅用于配对缓存两张表"),
+    };
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join(group.to_string()).join("index.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let count = sqlx::query_scalar::<_, i64>(sql)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    count
+}
+
+#[tokio::test]
+async fn crop_scan_persists_pairs_and_repeats_from_cache() {
+    let (store, dir) = temp_store();
+    let group = 61;
+    let whole = photo_like_jpeg(3, None);
+    let part = photo_like_jpeg(3, Some(40));
+    add_images(&store, group, "猫", vec![whole.clone(), part.clone()])
+        .await
+        .unwrap();
+
+    // 首扫：增量计划（还没有任何覆盖），算出 1 对并落库。
+    let (canonical, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    assert_eq!(canonical, "猫");
+    assert!(matches!(
+        plan,
+        CropPlan::Incremental {
+            had_coverage: false,
+            ..
+        }
+    ));
+    let groups = store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0].hashes,
+        vec![sha256_hex(&whole), sha256_hex(&part)]
+    );
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+
+    // 重扫：覆盖完整，直接从缓存拼出同一份结果。
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let cached = match plan {
+        CropPlan::Complete(groups) => groups,
+        other => panic!("应全命中: {other:?}"),
+    };
+    assert_eq!(cached, groups);
+
+    // 新增一张无关图：只补算带新端点的对，无新增正结果。
+    add_images(&store, group, "猫", vec![photo_like_jpeg(9, None)])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    assert!(matches!(
+        plan,
+        CropPlan::Incremental {
+            had_coverage: true,
+            ..
+        }
+    ));
+    let again = store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(again, groups);
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
+
+    // 逻辑删掉局部图：缓存原样保留（行数不变），重查仍全命中——
+    // 被删哈希由结果重建的 EXISTS 过滤，组随成员消失。
+    store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let after_delete = match plan {
+        CropPlan::Complete(groups) => groups,
+        other => panic!("删图后应仍全命中: {other:?}"),
+    };
+    assert!(after_delete.is_empty());
+
+    // 保护期内把同一张图加回：覆盖与正结果都在，直接命中，裁剪对回来。
+    add_images(&store, group, "猫", vec![part.clone()])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let restored = match plan {
+        CropPlan::Complete(groups) => groups,
+        other => panic!("保护期内加回应零成本: {other:?}"),
+    };
+    assert_eq!(restored, groups);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn reclaimed_blob_shrinks_coverage_so_readd_recomputes() {
+    let (store, dir) = temp_store();
+    let group = 63;
+    let whole = photo_like_jpeg(3, None);
+    let part = photo_like_jpeg(3, Some(40));
+    add_images(&store, group, "猫", vec![whole.clone(), part.clone()])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let groups = store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(groups.len(), 1);
+
+    // 从没备份过的 blob 没有保护期：删除后对账立即物理回收，
+    // 正结果对随之删除、哈希从覆盖标记摘除。
+    store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
+    store.reconcile_all_at(20_000).await;
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+
+    // 同内容图在回收之后加回：不再被覆盖，按增量重算它的对，重新检出。
+    add_images(&store, group, "猫", vec![part]).await.unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let again = match plan {
+        CropPlan::Incremental { .. } => store.crop_scan_run(group, plan).await.unwrap(),
+        other => panic!("回收后加回应走增量: {other:?}"),
+    };
+    assert_eq!(again, groups);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn crop_cache_is_wiped_when_invalidation_marker_changes() {
+    let (store, dir) = temp_store();
+    let group = 62;
+    let whole = photo_like_jpeg(3, None);
+    let part = photo_like_jpeg(3, Some(40));
+    add_images(&store, group, "猫", vec![whole, part])
+        .await
+        .unwrap();
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
+
+    // 篡改失效标记，模拟「换阈值或换算法版本后留下的旧账」。
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join(group.to_string()).join("index.db"));
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE schema_meta SET value = 'v9:8' WHERE key = 'crop_cache'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    // 新开的 Store 会在 ensure_pool → init_schema 里按标记弃账。
+    let reopened = Store::open_with_quota(dir.clone(), u64::MAX).unwrap();
+    reopened.stats(group).await.unwrap();
+    assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
+    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn sifts_cover_library_and_persist() {
+    let (store, dir) = temp_store();
+    let group = 17;
+    add_images(&store, group, "猫", vec![blocky_png(3), blocky_png(7)])
+        .await
+        .unwrap();
+    add_images(&store, group, "猫", vec![png_like(9)])
+        .await
+        .unwrap();
+
+    let (canonical, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    assert_eq!(canonical, "猫");
+    let images = match plan {
+        CropPlan::Incremental { images, .. } => images,
+        other => panic!("无覆盖时应走增量: {other:?}"),
+    };
+    // 无纹理的假 PNG 提不出指纹，与查重口径一致地跳过。
+    assert_eq!(images.len(), 2);
+    assert!(images.iter().all(|image| !image.sift.points.is_empty()));
+
+    // 落库断言：特征必须持久化，否则每次查裁剪都会全库重算。
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(dir.join(group.to_string()).join("index.db"))
+        .read_only(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sift")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 2, "SIFT 特征未落库");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn narrow_sift_table_is_rebuilt_on_open() {
+    let (store, dir) = temp_store();
+    let group = 87;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE sift (
+            hash TEXT NOT NULL PRIMARY KEY CHECK (length(hash) = 64),
+            features BLOB NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // 任意一次库操作都会走 ensure_pool → init_schema，触发换代重建。
+    store.stats(group).await.err();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .read_only(true);
+    let check = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let sql = sqlx::query_scalar::<_, String>("SELECT sql FROM sqlite_master WHERE name = 'sift'")
+        .fetch_one(&check)
+        .await
+        .unwrap();
+    assert!(sql.contains("% 132 = 0"), "narrow table not rebuilt: {sql}");
+    let version =
+        sqlx::query_scalar::<_, String>("SELECT value FROM schema_meta WHERE key = 'sift'")
+            .fetch_one(&check)
+            .await
+            .unwrap();
+    assert_eq!(version, "v1");
+    check.close().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn newer_sift_schema_is_rejected() {
+    let (store, dir) = temp_store();
+    let group = 88;
+    let db = dir.join(group.to_string()).join("index.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE schema_meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_meta VALUES ('sift', 'v9')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let result = store.stats(group).await;
+    assert!(result.is_err(), "新版本库不应被旧代码打开");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn narrow_fingerprint_table_is_rebuilt_on_open() {
     let (store, dir) = temp_store();
