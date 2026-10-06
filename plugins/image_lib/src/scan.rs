@@ -20,8 +20,9 @@ pub fn parse_group_index(raw: &str) -> Option<usize> {
 const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
 /// QQ 一条大约 20 张封顶；9 张给查重对照留余量，也避免 base64 消息体过大。
 const MAX_IMAGES_PER_MESSAGE: usize = 9;
-/// 原始字节。base64 后大约 11 MiB，留在常见 WebSocket 16 MiB 单帧之下。
-const MAX_BYTES_PER_MESSAGE: usize = 8 * 1024 * 1024;
+/// 单条消息的原始字节上限，对齐 QQ 单张原图 15 MiB。base64 后约 20 MiB，
+/// 超出常见 WebSocket 16 MiB 单帧，走这档要求链路两端能收分帧大消息。
+const MAX_BYTES_PER_MESSAGE: usize = 15 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ScanKey {
@@ -407,12 +408,12 @@ mod tests {
 
     #[test]
     fn chunk_prefers_group_boundary_over_full_packing() {
-        // 首条已装 6 MiB，第二组两包共 3 MiB，逐包塞能塞进首包但会劈开组；
+        // 首条已装 12 MiB，第二组两包共 4 MiB，逐包塞能塞进首包但会劈开组；
         // 整组应一起挪到第二条。
-        let first = packet("重复 1/2 · 约 90%", 6 * 1024 * 1024);
+        let first = packet("重复 1/2 · 约 90%", 12 * 1024 * 1024);
         let second = vec![
-            packet("重复 2/2 · 约 90%", 1536 * 1024),
-            packet("（续）", 1536 * 1024),
+            packet("重复 2/2 · 约 90%", 2 * 1024 * 1024),
+            packet("（续）", 2 * 1024 * 1024),
         ];
         let chunks = chunk_forward_packets(vec![vec![first], second]);
         assert_eq!(chunks.len(), 2);
