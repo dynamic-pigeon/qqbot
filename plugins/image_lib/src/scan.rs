@@ -226,21 +226,30 @@ pub fn packets_for_group(
     out
 }
 
-/// 一条聊天记录塞不下时拆开连发。整包超过字节上限时单独成条。
-pub fn chunk_forward_packets(packets: Vec<ForwardPacket>) -> Vec<Vec<ForwardPacket>> {
+/// 一条聊天记录塞不下时拆开连发。对照两张图得在同一条记录里翻着看，
+/// 所以拆点优先落在组边界，宁可前一条留空也不把组劈开；整组本身超过
+/// 字节上限时才在组内按包拆。
+pub fn chunk_forward_packets(groups: Vec<Vec<ForwardPacket>>) -> Vec<Vec<ForwardPacket>> {
     let mut chunks = Vec::new();
     let mut current: Vec<ForwardPacket> = Vec::new();
     let mut bytes = 0usize;
-    for packet in packets {
-        let size = packet.byte_len();
-        let would_overflow =
-            !current.is_empty() && bytes.saturating_add(size) > MAX_BYTES_PER_MESSAGE;
-        if would_overflow {
+    for packets in groups {
+        let group_bytes = packets.iter().map(ForwardPacket::byte_len).sum();
+        if !current.is_empty() && bytes.saturating_add(group_bytes) > MAX_BYTES_PER_MESSAGE {
             chunks.push(std::mem::take(&mut current));
             bytes = 0;
         }
-        bytes = bytes.saturating_add(size);
-        current.push(packet);
+        for packet in packets {
+            let size = packet.byte_len();
+            let would_overflow =
+                !current.is_empty() && bytes.saturating_add(size) > MAX_BYTES_PER_MESSAGE;
+            if would_overflow {
+                chunks.push(std::mem::take(&mut current));
+                bytes = 0;
+            }
+            bytes = bytes.saturating_add(size);
+            current.push(packet);
+        }
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -376,16 +385,41 @@ mod tests {
     }
 
     #[test]
-    fn chunk_forward_splits_on_bytes() {
+    fn chunk_splits_oversize_group_across_forwards() {
         let group = packets_for_group(
             "重复 1/2 · 约 90%".into(),
             "重复 1/2 · 约 90%".into(),
             packed(2, MAX_BYTES_PER_MESSAGE - 1),
         );
-        let chunks = chunk_forward_packets(group);
+        let chunks = chunk_forward_packets(vec![group]);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 1);
         assert_eq!(chunks[1].len(), 1);
+    }
+
+    fn packet(caption: &str, size: usize) -> ForwardPacket {
+        ForwardPacket {
+            name: "重复 1/2 · 约 90%".into(),
+            caption: caption.to_owned(),
+            images: packed(1, size),
+        }
+    }
+
+    #[test]
+    fn chunk_prefers_group_boundary_over_full_packing() {
+        // 首条已装 6 MiB，第二组两包共 3 MiB，逐包塞能塞进首包但会劈开组；
+        // 整组应一起挪到第二条。
+        let first = packet("重复 1/2 · 约 90%", 6 * 1024 * 1024);
+        let second = vec![
+            packet("重复 2/2 · 约 90%", 1536 * 1024),
+            packet("（续）", 1536 * 1024),
+        ];
+        let chunks = chunk_forward_packets(vec![vec![first], second]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 1);
+        assert_eq!(chunks[1].len(), 2);
+        assert_eq!(chunks[1][0].caption, "重复 2/2 · 约 90%");
+        assert_eq!(chunks[1][1].caption, "（续）");
     }
 
     #[test]
