@@ -135,10 +135,16 @@ pub fn group_title(
             let note = if truncated { "，仅列部分" } else { "" };
             format!("也许像 {index}/{total} · 约 {percent}%{note}。不确定，别按重复删")
         }
+        GroupKind::Crop => {
+            let note = if truncated { "，仅列部分" } else { "" };
+            format!(
+                "局部 {index}/{total} · 约 {percent}%{note}。先整体后局部，信息量不同，别按重复删"
+            )
+        }
     }
 }
 
-/// 合并转发节点昵称。Maybe 组的警告放在正文里，避免昵称被截断。
+/// 合并转发节点昵称。Maybe/Crop 组的说明放在正文里，避免昵称被截断。
 pub fn group_node_name(
     kind: GroupKind,
     index: usize,
@@ -150,6 +156,7 @@ pub fn group_node_name(
     match kind {
         GroupKind::Duplicate => format!("重复 {index}/{total} · 约 {percent}%{note}"),
         GroupKind::Maybe => format!("也许像 {index}/{total} · 约 {percent}%{note}"),
+        GroupKind::Crop => format!("局部 {index}/{total} · 约 {percent}%{note}"),
     }
 }
 

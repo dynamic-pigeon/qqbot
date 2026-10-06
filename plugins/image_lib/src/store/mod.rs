@@ -15,7 +15,10 @@ use rand::seq::IndexedRandom;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
-use crate::similar::{Fingerprint, HashedImage, fingerprint_bytes};
+use crate::similar::{
+    HashedImage, SiftableImage, SimilarGroup, assemble_crop_groups, crop_group, detect_crops,
+    fingerprint_and_sift, fingerprint_bytes,
+};
 
 mod backup;
 mod blob_fs;
@@ -27,9 +30,11 @@ mod tests;
 
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use repo::{
-    additional_unique_bytes, backed_up_hashes, delete_fingerprint, hash_still_used,
-    insert_fingerprints, insert_images, library_exists, library_fingerprints, library_hashes,
-    merge_library, prune_dangling_aliases, purge_expired_backup_refs, resolve_library,
+    additional_unique_bytes, backed_up_hashes, crop_covered, delete_crop_pairs_for_hash,
+    delete_fingerprint, delete_sift, hash_still_used, insert_crop_pairs, insert_fingerprints,
+    insert_images, insert_sifts, library_crop_pairs, library_exists, library_fingerprints,
+    library_hashes, library_sifts, merge_library, prune_dangling_aliases,
+    purge_expired_backup_refs, resolve_library, save_crop_covered, shrink_hash_from_covered,
     unique_image_bytes, upsert_alias,
 };
 use schema::init_schema;
@@ -111,6 +116,26 @@ pub struct LibraryOverview {
     pub canonical: String,
     pub count: usize,
     pub bytes: u64,
+}
+
+/// 「查裁剪」的执行计划。配对缓存全命中时无需任何计算；否则只补算
+/// 两端任一不在覆盖集里的对。
+#[derive(Debug)]
+pub enum CropPlan {
+    /// 覆盖完整，结果已从缓存的正结果对拼出。
+    Complete(Vec<SimilarGroup>),
+    Incremental {
+        library: String,
+        /// 本轮扫完写进覆盖标记的成员全集（含提不出特征的图，它们的对
+        /// 永远算不出来，记入覆盖避免每次重试）。
+        members: Vec<String>,
+        /// 已比对过的图集合，计算时跳过两端都在其中的对。
+        covered: HashSet<String>,
+        /// 特征齐全、参与比对的成员图。
+        images: Vec<SiftableImage>,
+        /// 之前是否完成过整轮：区分首扫与补算的提示文案。
+        had_coverage: bool,
+    },
 }
 
 pub struct Store {
@@ -293,6 +318,11 @@ impl Store {
             prune_dangling_aliases(&pool).await?;
             if !hash_still_used(&pool, hash).await? {
                 delete_fingerprint(&pool, hash).await?;
+                delete_sift(&pool, hash).await?;
+                // 配对缓存不随逻辑删除动：正结果对与覆盖标记保留，删图后
+                // 重查直接命中（被删哈希由结果重建的 EXISTS 过滤），同内容
+                // 图在 blob 保护期内加回也零成本。作废绑定在磁盘物理回收
+                // 上，见 reconcile_group。
             }
             Ok(libraries)
         })
@@ -361,10 +391,25 @@ impl Store {
         .bind(canonical)
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "DELETE FROM sift WHERE hash IN (
+                 SELECT mine.hash FROM images AS mine
+                 WHERE mine.library = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM images AS other
+                       WHERE other.hash = mine.hash AND other.library != mine.library
+                   )
+             )",
+        )
+        .bind(canonical)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM images WHERE library = ?")
             .bind(canonical)
             .execute(&mut *tx)
             .await?;
+        // 覆盖标记与正结果对都保留：库清空后标记惰性无害（成员为空），
+        // 用同批图重建时依然全命中；blob 被对账回收时才收缩。
         sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
             .bind(canonical)
             .bind(canonical)
@@ -647,7 +692,7 @@ impl Store {
             })
             .await?;
 
-        let computed = fingerprint_missing(missing).await?;
+        let computed = derive_missing(missing, fingerprint_bytes).await?;
 
         if !computed.is_empty() {
             let to_write = &computed;
@@ -669,6 +714,176 @@ impl Store {
             })
             .collect();
         Ok((library, images))
+    }
+
+    /// 按规范库名补齐指纹与 SIFT 特征：两张表共用一次解码
+    /// （[`fingerprint_and_sift`]），任一缺失的图都会重算——存量库升级后
+    /// 首次查裁剪等于全库重算一遍，与首查重同量级。锁外解码期间同群的
+    /// 抽图/加图不会被卡住（同上）。[`crop_scan_prepare`] 在锁内判完缓存
+    /// 覆盖才走到这里，规范名直传，避免两段锁之间别名被并发改指。
+    async fn siftables_for_canonical(
+        &self,
+        group_id: i64,
+        library: &str,
+    ) -> Result<Vec<SiftableImage>, StoreError> {
+        let blobs = self.blobs_dir(group_id);
+        let (hashes, mut fingerprints, mut sifts, missing) = self
+            .with_group(group_id, |pool| async move {
+                let hashes: Vec<String> =
+                    library_hashes(&pool, library).await?.into_iter().collect();
+                let fingerprints = library_fingerprints(&pool, library).await?;
+                let sifts = library_sifts(&pool, library).await?;
+                let missing: Vec<(String, PathBuf)> = hashes
+                    .iter()
+                    .filter(|hash| !fingerprints.contains_key(*hash) || !sifts.contains_key(*hash))
+                    .filter_map(|hash| {
+                        blob_file(&blobs, hash)
+                            .ok()
+                            .map(|path| (hash.clone(), path))
+                    })
+                    .collect();
+                Ok((hashes, fingerprints, sifts, missing))
+            })
+            .await?;
+
+        let computed = derive_missing(missing, fingerprint_and_sift).await?;
+
+        if !computed.is_empty() {
+            let to_fingerprints: Vec<_> = computed
+                .iter()
+                .map(|(hash, (fingerprint, _))| (hash.clone(), *fingerprint))
+                .collect();
+            let to_sifts: Vec<_> = computed
+                .iter()
+                .map(|(hash, (_, sift))| (hash.clone(), sift.clone()))
+                .collect();
+            self.with_group(group_id, |pool| {
+                let to_fingerprints = &to_fingerprints;
+                let to_sifts = &to_sifts;
+                async move {
+                    insert_fingerprints(&pool, to_fingerprints).await?;
+                    insert_sifts(&pool, to_sifts).await
+                }
+            })
+            .await?;
+            for (hash, (fingerprint, sift)) in computed {
+                fingerprints.insert(hash.clone(), fingerprint);
+                sifts.insert(hash, sift);
+            }
+        }
+
+        let images = hashes
+            .into_iter()
+            .filter_map(|hash| {
+                let fingerprint = fingerprints.remove(&hash)?;
+                let sift = sifts.remove(&hash)?;
+                Some(SiftableImage {
+                    hash,
+                    fingerprint,
+                    sift,
+                })
+            })
+            .collect();
+        Ok(images)
+    }
+
+    /// 「查裁剪」的缓存判定：覆盖集（最近一次完整扫描的成员全集）包含全部
+    /// 成员时，直接从正结果缓存拼出结果；否则给出增量计划，只补算有新
+    /// 端点的对。blob 按内容寻址不可变，算过的对永远有效：逻辑删图与清库
+    /// 零成本（被删哈希由结果重建的 EXISTS 过滤），覆盖集只在 blob 被
+    /// 对账物理回收时收缩、换阈值/算法版本时整体作废。
+    pub async fn crop_scan_prepare(
+        &self,
+        group_id: i64,
+        name: &str,
+    ) -> Result<(String, CropPlan), StoreError> {
+        let (library, members, covered, cached) = self
+            .with_group(group_id, |pool| async move {
+                let library = resolve_library(&pool, name).await?;
+                if !library_exists(&pool, &library).await? {
+                    return Err(StoreError::LibraryMissing);
+                }
+                let mut members: Vec<String> =
+                    library_hashes(&pool, &library).await?.into_iter().collect();
+                members.sort();
+                let covered: HashSet<String> =
+                    crop_covered(&pool, &library).await?.into_iter().collect();
+                if members.len() < 2 || members.iter().all(|hash| covered.contains(hash)) {
+                    let pairs = library_crop_pairs(&pool, &library).await?;
+                    let groups = assemble_crop_groups(
+                        pairs
+                            .into_iter()
+                            .map(|(whole, part, percent)| crop_group(&whole, &part, percent))
+                            .collect(),
+                    );
+                    return Ok((library, members, covered, Some(groups)));
+                }
+                Ok((library, members, covered, None))
+            })
+            .await?;
+        if let Some(groups) = cached {
+            return Ok((library, CropPlan::Complete(groups)));
+        }
+        let had_coverage = !covered.is_empty();
+        let images = self.siftables_for_canonical(group_id, &library).await?;
+        Ok((
+            library.clone(),
+            CropPlan::Incremental {
+                library,
+                members,
+                covered,
+                images,
+                had_coverage,
+            },
+        ))
+    }
+
+    /// 执行 [`CropPlan`]：全命中直接返回；补算只跑两端任一不在覆盖集里的
+    /// 对，新正结果落库、本轮成员写进覆盖标记，最后统一从缓存重建（含
+    /// 此前部分扫描攒下的正结果），排序截断与全量路径同一条代码。
+    pub async fn crop_scan_run(
+        &self,
+        group_id: i64,
+        plan: CropPlan,
+    ) -> Result<Vec<SimilarGroup>, StoreError> {
+        let (library, members, covered, images) = match plan {
+            CropPlan::Complete(groups) => return Ok(groups),
+            CropPlan::Incremental {
+                library,
+                members,
+                covered,
+                images,
+                ..
+            } => (library, members, covered, images),
+        };
+        let duplicate = crate::config::static_config().duplicate_distance();
+        // 两两特征匹配是纯 CPU 的 O(n²)，让出 async worker（同查重）。
+        let found = kovi::tokio::task::spawn_blocking(move || {
+            let covered: HashSet<&str> = covered.iter().map(String::as_str).collect();
+            detect_crops(&images, duplicate, &covered)
+        })
+        .await
+        .map_err(|e| StoreError::Other(anyhow::anyhow!("查裁剪计算线程失败: {e}")))?;
+        let fresh: Vec<(String, String, u8)> = found
+            .iter()
+            .map(|group| match group.hashes.as_slice() {
+                [whole, part] => (whole.clone(), part.clone(), group.percent),
+                // detect_crops 产出的裁剪组固定两张：整体在前、局部在后。
+                _ => unreachable!("裁剪组固定两张"),
+            })
+            .collect();
+        self.with_group(group_id, |pool| async move {
+            insert_crop_pairs(&pool, &fresh).await?;
+            save_crop_covered(&pool, &library, &members).await?;
+            let stored = library_crop_pairs(&pool, &library).await?;
+            Ok(assemble_crop_groups(
+                stored
+                    .into_iter()
+                    .map(|(whole, part, percent)| crop_group(&whole, &part, percent))
+                    .collect(),
+            ))
+        })
+        .await
     }
 
     /// 每日维护入口:同一天数先备份再对账。「今天」只取一次传给两者,
@@ -728,6 +943,10 @@ impl Store {
                 .collect();
 
             let mut removed_files = 0u64;
+            // blob 物理消失的哈希（这里删掉孤儿文件，或下面索引指向但盘上
+            // 已没有）：配对缓存的正结果对与覆盖槽位同批作废，此后同内容
+            // 图再加回按增量只重算它的对。逻辑删图不动缓存（见 delete_hash）。
+            let mut reclaimed: HashSet<String> = HashSet::new();
             for hash in disk.difference(&indexed) {
                 if protected.contains(hash) {
                     continue;
@@ -736,12 +955,14 @@ impl Store {
                     && kovi::tokio::fs::remove_file(&path).await.is_ok()
                 {
                     removed_files += 1;
+                    reclaimed.insert(hash.clone());
                 }
             }
 
             let mut tx = pool.begin().await?;
             let mut removed_rows = 0u64;
             for hash in indexed.difference(&disk) {
+                reclaimed.insert(hash.clone());
                 let result = sqlx::query("DELETE FROM images WHERE hash = ?")
                     .bind(hash)
                     .execute(&mut *tx)
@@ -760,6 +981,13 @@ impl Store {
             )
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM sift WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
+                .execute(&mut *tx)
+                .await?;
+            for hash in &reclaimed {
+                delete_crop_pairs_for_hash(&mut *tx, hash).await?;
+                shrink_hash_from_covered(&mut tx, hash).await?;
+            }
             tx.commit().await?;
 
             if removed_files > 0 || removed_rows > 0 {
@@ -803,17 +1031,25 @@ fn is_large_blob(path: &PathBuf) -> bool {
 /// 单个解码 worker：固定数量的 async 任务，从队列动态领活，同一时刻
 /// 只挂一个 blocking 解码，所以占用的解码线程数恒等于 worker 数。
 /// 队列关闭（发送端全部 drop）且排空后 `recv` 返回 Err，worker 自然退出。
-fn spawn_hash_worker(
+fn spawn_derive_worker<T, F>(
     rx: async_channel::Receiver<(String, Vec<u8>)>,
-) -> kovi::tokio::task::JoinHandle<anyhow::Result<Vec<(String, Fingerprint)>>> {
+    compute: F,
+) -> kovi::tokio::task::JoinHandle<anyhow::Result<Vec<(String, T)>>>
+where
+    T: Send + 'static,
+    F: Fn(&[u8]) -> Option<T> + Send + Sync + Clone + 'static,
+{
     kovi::tokio::spawn(async move {
         let mut computed = Vec::new();
         while let Ok((hash, bytes)) = rx.recv().await {
-            let fingerprint = kovi::tokio::task::spawn_blocking(move || fingerprint_bytes(&bytes))
-                .await
-                .map_err(|e| anyhow::anyhow!("计算感知哈希失败: {e}"))?;
-            if let Some(fingerprint) = fingerprint {
-                computed.push((hash, fingerprint));
+            let derived = kovi::tokio::task::spawn_blocking({
+                let compute = compute.clone();
+                move || compute(&bytes)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("计算派生特征失败: {e}"))?;
+            if let Some(derived) = derived {
+                computed.push((hash, derived));
             }
         }
         Ok(computed)
@@ -826,9 +1062,14 @@ fn spawn_hash_worker(
 /// 队列同为容量 1：在途水位 = 每队列一张排队 + worker 在手的各一张。
 /// 大图的读盘与发送单独成一个任务——大图读得慢、大图队列又被慢解码
 /// 顶住背压，混在一个发送循环里会周期性断掉小图的供给。
-async fn fingerprint_missing(
+async fn derive_missing<T, F>(
     missing: Vec<(String, PathBuf)>,
-) -> Result<Vec<(String, Fingerprint)>, StoreError> {
+    compute: F,
+) -> Result<Vec<(String, T)>, StoreError>
+where
+    T: Send + 'static,
+    F: Fn(&[u8]) -> Option<T> + Send + Sync + Clone + 'static,
+{
     if missing.is_empty() {
         return Ok(Vec::new());
     }
@@ -851,9 +1092,9 @@ async fn fingerprint_missing(
     let (large_tx, large_rx) = async_channel::bounded::<(String, Vec<u8>)>(1);
     let mut handles = Vec::with_capacity(workers + 1);
     for _ in 0..workers {
-        handles.push(spawn_hash_worker(small_rx.clone()));
+        handles.push(spawn_derive_worker(small_rx.clone(), compute.clone()));
     }
-    handles.push(spawn_hash_worker(large_rx));
+    handles.push(spawn_derive_worker(large_rx, compute));
 
     let large_sender = kovi::tokio::spawn(async move {
         for (hash, path) in large {
@@ -881,7 +1122,7 @@ async fn fingerprint_missing(
     for handle in handles {
         let computed = handle
             .await
-            .map_err(|e| StoreError::Other(anyhow::anyhow!("计算感知哈希失败: {e}")))??;
+            .map_err(|e| StoreError::Other(anyhow::anyhow!("计算派生特征失败: {e}")))??;
         all.extend(computed);
     }
     Ok(all)

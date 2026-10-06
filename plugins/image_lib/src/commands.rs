@@ -21,13 +21,15 @@ use crate::send::{
     forward_node, image_message, report_send_fail, send_group_forward_wait, send_group_wait,
 };
 use crate::similar::{cluster, distance_from_percent};
-use crate::store::{StagedImage, Store, StoreError};
+use crate::store::{CropPlan, StagedImage, Store, StoreError};
 
 /// 查重展示单组读入内存的原始字节预算。大组逐张全读可放大到数百 MiB 常驻。
 const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     let scans = Arc::new(ScanSessions::new());
+    // 裁剪会话与查重会话同库同人也互不覆盖：两个命令各自翻页。
+    let crop_scans = Arc::new(ScanSessions::new());
     let wipes = Arc::new(WipeConfirmations::new());
     Command::new("图库")
         .description("管理本群图库")
@@ -49,7 +51,8 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
         .subcommand(unalias_command(Arc::clone(&store)))
         .subcommand(send_hash_command(Arc::clone(&store)))
         .subcommand(delete_hash_command(Arc::clone(&store)))
-        .subcommand(scan_command(store, scans))
+        .subcommand(scan_command(Arc::clone(&store), scans))
+        .subcommand(crop_scan_command(store, crop_scans))
 }
 
 fn add_command(store: Arc<Store>) -> Command {
@@ -180,6 +183,127 @@ fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
             let scans = Arc::clone(&scans);
             async move { handle_scan(ctx, &store, &scans).await }
         })
+}
+
+fn crop_scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
+    Command::new("查裁剪")
+        .description("扫指定图库的裁剪局部对，先整体后局部，每次最多 5 组")
+        .usage("查裁剪 <库名> [组号|下一组]")
+        .permission(Permission::BotAdmin)
+        .expose_as_root()
+        .prefix_match()
+        .handler(move |ctx| {
+            let store = Arc::clone(&store);
+            let scans = Arc::clone(&scans);
+            async move { handle_crop_scan(ctx, &store, &scans).await }
+        })
+}
+
+enum CropOp<'a> {
+    Start { name: &'a str },
+    Next { name: &'a str },
+    Jump { name: &'a str, index: usize },
+}
+
+/// 裁剪没有相似度档位，复用查重的参数解析但拒绝百分比参数。
+fn parse_crop_op(args: &[String]) -> Result<CropOp<'_>, CommandError> {
+    match parse_scan_op(args) {
+        Ok(ScanOp::Start {
+            name,
+            percent: None,
+        }) => Ok(CropOp::Start { name }),
+        Ok(ScanOp::Next { name }) => Ok(CropOp::Next { name }),
+        Ok(ScanOp::Jump { name, index }) => Ok(CropOp::Jump { name, index }),
+        Ok(ScanOp::Start {
+            percent: Some(_), ..
+        }) => Err(CommandError::user(
+            "查裁剪不支持相似度%；第二参数是组号或下一组",
+        )),
+        Err(error @ CommandError::MissingArgument { .. }) => Err(error),
+        Err(_) => Err(CommandError::user("第二参数是组号或下一组")),
+    }
+}
+
+async fn handle_crop_scan(
+    ctx: CommandContext,
+    store: &Store,
+    scans: &ScanSessions,
+) -> CommandResult {
+    let op = parse_crop_op(ctx.args())?;
+    let group_id = ctx.group_id()?;
+    let user_id = ctx.event().user_id;
+    match op {
+        CropOp::Start { name } => {
+            let (canonical, plan) = store
+                .crop_scan_prepare(group_id, name)
+                .await
+                .map_err(|error| missing_library(name, error))?;
+            // 缓存全命中时不回提示，结果直接出；只有真要算的库才说「别急」。
+            if let CropPlan::Incremental { had_coverage, .. } = &plan {
+                ctx.reply(if *had_coverage {
+                    format!("正在补算「{canonical}」新增图片的裁剪比对，稍等")
+                } else {
+                    format!("正在全量扫「{canonical}」的裁剪局部，每张图都要和全库两两比对，大库要几分钟，别急")
+                });
+            }
+            let groups = store
+                .crop_scan_run(group_id, plan)
+                .await
+                .map_err(CommandError::internal)?;
+            if groups.is_empty() {
+                ctx.reply(format!("「{canonical}」里没有裁剪关系的图"));
+                return Ok(());
+            }
+            let key = ScanKey {
+                group_id,
+                user_id,
+                library: canonical.clone(),
+            };
+            scans.start(key.clone(), groups);
+            show_scan_group(
+                &ctx,
+                store,
+                scans,
+                group_id,
+                &canonical,
+                &key,
+                None,
+                true,
+                "查裁剪",
+            )
+            .await
+        }
+        CropOp::Next { name } => {
+            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
+            show_scan_group(
+                &ctx,
+                store,
+                scans,
+                group_id,
+                &canonical,
+                &key,
+                None,
+                false,
+                "查裁剪",
+            )
+            .await
+        }
+        CropOp::Jump { name, index } => {
+            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
+            show_scan_group(
+                &ctx,
+                store,
+                scans,
+                group_id,
+                &canonical,
+                &key,
+                Some(index),
+                false,
+                "查裁剪",
+            )
+            .await
+        }
+    }
 }
 
 fn parse_hash_prefix(raw: &str) -> Result<String, CommandError> {
@@ -568,11 +692,17 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
                 library: canonical.clone(),
             };
             scans.start(key.clone(), groups);
-            show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, true).await
+            show_scan_group(
+                &ctx, store, scans, group_id, &canonical, &key, None, true, "查重",
+            )
+            .await
         }
         ScanOp::Next { name } => {
             let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
-            show_scan_group(&ctx, store, scans, group_id, &canonical, &key, None, false).await
+            show_scan_group(
+                &ctx, store, scans, group_id, &canonical, &key, None, false, "查重",
+            )
+            .await
         }
         ScanOp::Jump { name, index } => {
             let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
@@ -585,6 +715,7 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
                 &key,
                 Some(index),
                 false,
+                "查重",
             )
             .await
         }
@@ -628,6 +759,7 @@ async fn show_scan_group(
     key: &ScanKey,
     mut jump: Option<usize>,
     starting: bool,
+    command_hint: &str,
 ) -> CommandResult {
     let mut page = Vec::new();
     let mut total = 0usize;
@@ -643,7 +775,9 @@ async fn show_scan_group(
         match advance {
             None => {
                 if page.is_empty() {
-                    return Err(CommandError::user(format!("请先发送「查重 {library}」")));
+                    return Err(CommandError::user(format!(
+                        "请先发送「{command_hint} {library}」"
+                    )));
                 }
                 break;
             }
@@ -925,6 +1059,30 @@ mod tests {
         ));
         assert!(matches!(
             parse_hash_prefix("xyz"),
+            Err(CommandError::User(_))
+        ));
+    }
+
+    #[test]
+    fn crop_op_reuses_scan_op_but_rejects_percent() {
+        assert!(matches!(
+            parse_crop_op(&args(&["猫"])),
+            Ok(CropOp::Start { name: "猫" })
+        ));
+        assert!(matches!(
+            parse_crop_op(&args(&["猫", "下一组"])),
+            Ok(CropOp::Next { .. })
+        ));
+        assert!(matches!(
+            parse_crop_op(&args(&["猫", "3"])),
+            Ok(CropOp::Jump { index: 3, .. })
+        ));
+        assert!(matches!(
+            parse_crop_op(&args(&["猫", "90%"])),
+            Err(CommandError::User(_))
+        ));
+        assert!(matches!(
+            parse_crop_op(&args(&["猫", "foo"])),
             Err(CommandError::User(_))
         ));
     }

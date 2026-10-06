@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use sqlx::{Row, SqlitePool};
 
 use super::{StagedImage, StoreError};
-use crate::similar::{FINGERPRINT_WORDS, Fingerprint};
+use crate::similar::{
+    FINGERPRINT_WORDS, Fingerprint, SiftFeatures, sift_from_bytes, sift_to_bytes,
+};
 
 /// 指纹词组序列化成大端 BLOB：4×u64 = 32 字节，与建表 CHECK 对齐。
 fn pack_words(words: &[u64; FINGERPRINT_WORDS]) -> Vec<u8> {
@@ -152,6 +154,218 @@ fn corrupt_fingerprint(hash: &str) -> StoreError {
     StoreError::Other(anyhow::anyhow!("指纹 BLOB 长度异常: {hash}"))
 }
 
+pub(super) async fn insert_sifts(
+    pool: &SqlitePool,
+    features: &[(String, SiftFeatures)],
+) -> Result<(), StoreError> {
+    for (hash, features) in features {
+        // 与指纹同款：只忽略主键冲突（并发补特征的幂等）。
+        sqlx::query(
+            "INSERT INTO sift (hash, features) VALUES (?, ?)
+             ON CONFLICT(hash) DO NOTHING",
+        )
+        .bind(hash)
+        .bind(sift_to_bytes(features))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn delete_sift(pool: &SqlitePool, hash: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM sift WHERE hash = ?")
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(super) async fn library_sifts(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<HashMap<String, SiftFeatures>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT s.hash AS hash, s.features AS features
+         FROM sift s
+         INNER JOIN images i ON i.hash = s.hash
+         WHERE i.library = ?",
+    )
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    let mut found = HashMap::new();
+    for row in rows {
+        let hash = row.try_get::<String, _>("hash")?;
+        let bytes = row.try_get::<Vec<u8>, _>("features")?;
+        let features = sift_from_bytes(&bytes)
+            .ok_or_else(|| StoreError::Other(anyhow::anyhow!("SIFT BLOB 异常: {hash}")))?;
+        found.insert(hash, features);
+    }
+    Ok(found)
+}
+
+/// 读一个库的覆盖标记：covered 是 64 位 hex 哈希直接拼接，定长切块还原。
+pub(super) async fn crop_covered(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<String>, StoreError> {
+    let covered =
+        sqlx::query_scalar::<_, String>("SELECT covered FROM crop_scan_state WHERE library = ?")
+            .bind(library)
+            .fetch_optional(pool)
+            .await?;
+    let Some(covered) = covered else {
+        return Ok(Vec::new());
+    };
+    covered
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| {
+            std::str::from_utf8(chunk)
+                .map(str::to_owned)
+                .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记 BLOB 异常: {library}")))
+        })
+        .collect()
+}
+
+/// 整轮扫描完成后写入覆盖标记：本轮成员全集即「已两两比对过」的范围。
+pub(super) async fn save_crop_covered(
+    pool: &SqlitePool,
+    library: &str,
+    covered: &[String],
+) -> Result<(), StoreError> {
+    let mut blob = String::with_capacity(covered.len() * 64);
+    for hash in covered {
+        blob.push_str(hash);
+    }
+    sqlx::query(
+        "INSERT INTO crop_scan_state (library, covered) VALUES (?, ?)
+         ON CONFLICT(library) DO UPDATE SET covered = excluded.covered",
+    )
+    .bind(library)
+    .bind(blob)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 新查出的正结果对落库。只忽略主键冲突（并发扫描的幂等），与指纹同款。
+pub(super) async fn insert_crop_pairs(
+    pool: &SqlitePool,
+    pairs: &[(String, String, u8)],
+) -> Result<(), StoreError> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (whole, part, percent) in pairs {
+        sqlx::query(
+            "INSERT INTO crop_pairs (whole, part, percent) VALUES (?, ?, ?)
+             ON CONFLICT(whole, part) DO NOTHING",
+        )
+        .bind(whole)
+        .bind(part)
+        .bind(u64::from(*percent) as i64)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 该库成员之间的全部正结果对。EXISTS 子查询借 images 主键索引过滤，
+/// 已删出的哈希自然不在结果里；对的结果只依赖两张图的内容，跨库共享。
+pub(super) async fn library_crop_pairs(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<(String, String, u8)>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT c.whole AS whole, c.part AS part, c.percent AS percent
+         FROM crop_pairs c
+         WHERE EXISTS (SELECT 1 FROM images i WHERE i.library = ? AND i.hash = c.whole)
+           AND EXISTS (SELECT 1 FROM images i WHERE i.library = ? AND i.hash = c.part)",
+    )
+    .bind(library)
+    .bind(library)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("whole")?,
+                row.try_get::<String, _>("part")?,
+                row.try_get::<i64, _>("percent")? as u8,
+            ))
+        })
+        .collect()
+}
+
+pub(super) async fn delete_crop_state<'e, E>(executor: E, library: &str) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
+        .bind(library)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// blob 物理回收时清掉该哈希参与的正结果对（在对账事务里调用）。
+pub(super) async fn delete_crop_pairs_for_hash<'e, E>(
+    executor: E,
+    hash: &str,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM crop_pairs WHERE whole = ? OR part = ?")
+        .bind(hash)
+        .bind(hash)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// 把哈希从所有覆盖标记里摘除（重写 covered 去掉那个 64 字符槽位，摘空
+/// 删行），与正结果对的回收在同一事务。不摘的话，「blob 已回收 → 同内容
+/// 图再加回」会对着已删的正结果行被当成已比对而漏检。哈希与槽位同为
+/// 64 字节、按槽对齐拼接，instr 只可能整槽命中，不会误伤相邻哈希。
+pub(super) async fn shrink_hash_from_covered(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hash: &str,
+) -> Result<(), StoreError> {
+    let rows =
+        sqlx::query("SELECT library, covered FROM crop_scan_state WHERE instr(covered, ?) > 0")
+            .bind(hash)
+            .fetch_all(&mut **tx)
+            .await?;
+    for row in rows {
+        let library: String = row.try_get("library")?;
+        let covered: String = row.try_get("covered")?;
+        let shrunk: String = covered
+            .as_bytes()
+            .chunks(64)
+            .filter(|slot| *slot != hash.as_bytes())
+            .map(|slot| std::str::from_utf8(slot).map(str::to_owned))
+            .collect::<Result<String, _>>()
+            .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记异常: {library}")))?;
+        if shrunk.is_empty() {
+            sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
+                .bind(&library)
+                .execute(&mut **tx)
+                .await?;
+        } else {
+            sqlx::query("UPDATE crop_scan_state SET covered = ? WHERE library = ?")
+                .bind(&shrunk)
+                .bind(&library)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn insert_images(
     pool: &SqlitePool,
     library: &str,
@@ -243,6 +457,9 @@ pub(super) async fn merge_library(
         .bind(source)
         .execute(&mut **tx)
         .await?;
+    // 源库的覆盖标记随成员一起并走：目标库的标记不含并进来的图，
+    // 下次查裁剪会按增量补算它们的对。
+    delete_crop_state(&mut **tx, source).await?;
     sqlx::query("UPDATE aliases SET target = ? WHERE target = ?")
         .bind(dest)
         .bind(source)
