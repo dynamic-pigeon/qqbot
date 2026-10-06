@@ -410,7 +410,7 @@ const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
 const MAX_CROP_PAIRS: usize = 500;
 /// 裁剪配对缓存的算法版本。判据常量或匹配流程一变，缓存的正结果对就
 /// 不再可信；bump 此值让 schema_meta 的失效标记换值，整账弃掉重算。
-pub(crate) const CROP_CACHE_VERSION: &str = "v1";
+pub(crate) const CROP_CACHE_VERSION: &str = "v2";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
 
@@ -610,11 +610,17 @@ pub fn detect_crops(
                             pair_distances(images[i].fingerprint, images[j].fingerprint);
                         // 「重复」距离的对归查重管，不算裁剪。
                         if dup_dist > duplicate_limit {
-                            if let Some(percent) = match_crop_pair(side_j, side_i, &matcher) {
-                                shard.push(crop_group(&images[i].hash, &images[j].hash, percent));
-                            } else if let Some(percent) = match_crop_pair(side_i, side_j, &matcher)
+                            // knn（query=i → train=j）只跑一次，RANSAC
+                            // 单应的几何审查双向定谁是谁的局部。
+                            if let Some((i_is_part, percent)) =
+                                match_crop_pair(side_i, side_j, &matcher)
                             {
-                                shard.push(crop_group(&images[j].hash, &images[i].hash, percent));
+                                let (whole, part) = if i_is_part {
+                                    (&images[j].hash, &images[i].hash)
+                                } else {
+                                    (&images[i].hash, &images[j].hash)
+                                };
+                                shard.push(crop_group(whole, part, percent));
                             }
                         }
                     }
@@ -651,24 +657,34 @@ pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
     }
 }
 
-/// 判定 part 是否 whole 的裁剪局部：Lowe 比率筛出可靠匹配，用 RANSAC
-/// 单应的 inlier 数下结论。返回 inlier 占两侧较少一侧特征数的百分比。
-/// 两侧的截断与反量化由 [`MatchSide`] 摊到每图一次；Mat 头是 O(1) 的
-/// 外部数据包装（不拷描述子），BoxedRef 借用 floats 缓冲、活到匹配
-/// 结束。matcher 由调用方持有，knn_train_match 直传训练侧、不落内部
-/// 训练集，无状态可复用。
-fn match_crop_pair(part: &MatchSide, whole: &MatchSide, matcher: &BFMatcher) -> Option<u8> {
-    let part_desc =
-        Mat::new_rows_cols_with_data(part.points.len() as i32, SIFT_DIMS as i32, &part.floats)
+/// 判定 query 与 train 谁是谁的裁剪局部，只跑一次 knn（query 描述子
+/// 在 train 里找 2-NN）：对应点满足 H 等价于满足 H⁻¹，good/inlier/
+/// 内聚率对两个几何审查方向是同一组数字，质量三保险在此只判一次。
+/// RANSAC 拟合 H：query→train 后审查双向：H 把 query 画布压进
+/// train，则 query 是局部；H⁻¹ 把 train 画布压进 query，则 train 是
+/// 局部。返回（query 侧是否局部， inlier 占 good 的百分比）。
+/// 召回边界：查询侧恰好是整体时，能过 Lowe 的对应只有重叠区里的高
+/// 响应点，裁剪越狠越少——凑不满 [`CROP_MIN_GOOD`] 该方向即漏检，
+/// 这是单次 knn 相对双向各查一次省一半计算付出的代价。
+/// Mat 头是 O(1) 的外部数据包装（不拷描述子），BoxedRef 借用 floats
+/// 缓冲、活到匹配结束。matcher 由调用方持有，knn_train_match 直传
+/// 训练侧、不落内部训练集，无状态可复用。
+fn match_crop_pair(
+    query: &MatchSide,
+    train: &MatchSide,
+    matcher: &BFMatcher,
+) -> Option<(bool, u8)> {
+    let query_desc =
+        Mat::new_rows_cols_with_data(query.points.len() as i32, SIFT_DIMS as i32, &query.floats)
             .ok()?;
-    let whole_desc =
-        Mat::new_rows_cols_with_data(whole.points.len() as i32, SIFT_DIMS as i32, &whole.floats)
+    let train_desc =
+        Mat::new_rows_cols_with_data(train.points.len() as i32, SIFT_DIMS as i32, &train.floats)
             .ok()?;
     let mut matches = Vector::<Vector<DMatch>>::new();
     matcher
         .knn_train_match(
-            &part_desc,
-            &whole_desc,
+            &query_desc,
+            &train_desc,
             &mut matches,
             2,
             &Mat::default(),
@@ -685,10 +701,10 @@ fn match_crop_pair(part: &MatchSide, whole: &MatchSide, matcher: &BFMatcher) -> 
         let best = pair.get(0).ok()?;
         let second = pair.get(1).ok()?;
         if best.distance < SIFT_LOWE_RATIO * second.distance {
-            let part_point = part.points[i];
-            let whole_point = whole.points[best.train_idx as usize];
-            src.push(part_point);
-            dst.push(whole_point);
+            let query_point = query.points[i];
+            let train_point = train.points[best.train_idx as usize];
+            src.push(query_point);
+            dst.push(train_point);
         }
     }
     if src.len() < 4 {
@@ -713,25 +729,50 @@ fn match_crop_pair(part: &MatchSide, whole: &MatchSide, matcher: &BFMatcher) -> 
     if good < CROP_MIN_GOOD
         || inliers < CROP_MIN_INLIERS
         || inliers * 100 < good * CROP_MIN_COHESION_PERCENT
-        || !homography_plausible(&homography)
     {
         return None;
     }
-    u8::try_from(inliers * 100 / good).ok()
-}
-
-/// 单应矩阵的几何审查：把 part 画布四角经 H 投影，要求都落进 whole 画布
-/// （带宽容），四边形面积占 whole 的比例在裁剪合理区间，且没有翻转。
-fn homography_plausible(homography: &Mat) -> bool {
+    let percent = u8::try_from(inliers * 100 / good).ok()?;
     let mut matrix = [[0f64; 3]; 3];
     for (r, row) in matrix.iter_mut().enumerate() {
         for (c, slot) in row.iter_mut().enumerate() {
-            match homography.at_2d::<f64>(r as i32, c as i32) {
-                Ok(value) => *slot = *value,
-                Err(_) => return false,
-            }
+            *slot = *homography.at_2d::<f64>(r as i32, c as i32).ok()?;
         }
     }
+    if homography_plausible(&matrix) {
+        return Some((true, percent));
+    }
+    let inverted = invert3(&matrix)?;
+    if homography_plausible(&inverted) {
+        return Some((false, percent));
+    }
+    None
+}
+
+/// 3×3 矩阵求逆（伴随矩阵法）。det 接近零的退化单应没有可信的逆，
+/// 视同几何审查失败。
+fn invert3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *m;
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if !det.is_finite() || det.abs() < 1e-9 {
+        return None;
+    }
+    let mut inverse = [
+        [e * i - f * h, c * h - b * i, b * f - c * e],
+        [f * g - d * i, a * i - c * g, c * d - a * f],
+        [d * h - e * g, b * g - a * h, a * e - b * d],
+    ];
+    for row in &mut inverse {
+        for slot in row {
+            *slot /= det;
+        }
+    }
+    Some(inverse)
+}
+
+/// 单应矩阵的几何审查：把源画布四角经 H 投影，要求都落进目标画布
+/// （带宽容），四边形面积占目标画布的比例在裁剪合理区间，且没有翻转。
+fn homography_plausible(matrix: &[[f64; 3]; 3]) -> bool {
     let side = f64::from(SIFT_CANVAS);
     let corners = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)];
     let mut mapped = [(0f64, 0f64); 4];
