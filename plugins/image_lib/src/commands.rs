@@ -856,11 +856,11 @@ async fn reply_scan_page(
     let self_id = ctx.event().self_id;
     let from = groups.first().map(|group| group.index).unwrap_or(1);
     let to = groups.last().map(|group| group.index).unwrap_or(from);
-    let mut packets = Vec::new();
+    let mut grouped = Vec::new();
     for group in groups {
-        packets.extend(packets_for_group(group.title, group.name, group.images));
+        grouped.push(packets_for_group(group.title, group.name, group.images));
     }
-    let chunks = chunk_forward_packets(packets);
+    let chunks = chunk_forward_packets(grouped);
     for (i, chunk) in chunks.iter().enumerate() {
         let nodes: Vec<_> = chunk
             .iter()
