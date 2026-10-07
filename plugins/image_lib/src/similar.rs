@@ -383,10 +383,21 @@ const SIFT_MAX_FEATURES: i32 = 512;
 /// 匹配时双方只取响应最强的前 N 个特征：真裁剪的好匹配集中在高响应点，
 /// 截断把两两比较的计算量压掉四分之三，还顺带砍掉低响应点的弱相似误报。
 const CROP_MATCH_FEATURES: usize = 384;
-/// Lowe 比率测试：最优距离 / 次优距离低于它才算可靠匹配。
+/// Lowe 比率测试：最优距离 / 次优距离低于它才算可靠匹配（f32 域回退
+/// 路径用）。
 const SIFT_LOWE_RATIO: f32 = 0.8;
+/// 同一比率在 u8 整数平方距离域的形式：25·d1² < 16·d2² ⟺ d1/d2 < 4/5，
+/// 免掉每次比较的浮点转换（u64 承载 25·d1² 的量级）。
+const LOWE_NUM: u64 = 25;
+const LOWE_DEN: u64 = 16;
 /// findHomography RANSAC 的重投影阈值（归一化画布上的像素）。
 const HOMOGRAPHY_THRESHOLD: f64 = 4.0;
+/// RANSAC 迭代上限。默认 2000 是为无真模型的负对准备的：置信度永远
+/// 收敛不了，每次都烧满预算（负对成本的大头）。恰好压着判据下限的正对
+/// （inlier 占比 40%）期望两百次上下就能命中干净样本，500 上限对它
+/// 仍绰绰有余。
+const CROP_RANSAC_MAX_ITERS: i32 = 500;
+const CROP_RANSAC_CONFIDENCE: f64 = 0.995;
 /// 判据三保险。小样本陷阱（线上实测）：同系列表情包能凑出 4~10 个弱相似
 /// 匹配，RANSAC 用 4 点就能精确解出模型，小 good 必然全 inlier——内聚率
 /// 在小样本下毫无辨别力，真实库曾整库刷出 100% 误报。所以好匹配数本身
@@ -410,7 +421,9 @@ const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
 const MAX_CROP_PAIRS: usize = 500;
 /// 裁剪配对缓存的算法版本。判据常量或匹配流程一变，缓存的正结果对就
 /// 不再可信；bump 此值让 schema_meta 的失效标记换值，整账弃掉重算。
-pub(crate) const CROP_CACHE_VERSION: &str = "v2";
+/// v3：knn 换 u8 量化域 VNNI 内核 + RANSAC 迭代上限 500（检出与 v2
+/// 在真实库上逐对一致，仅 RANSAC 随机边界对可能翻面）。
+pub(crate) const CROP_CACHE_VERSION: &str = "v3";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
 
@@ -508,18 +521,41 @@ fn center_hashes(image: &DynamicImage) -> [[u64; FINGERPRINT_WORDS]; CENTER_KEEP
     out
 }
 
-/// 配对热路径的每图静态侧：截断到 [`CROP_MATCH_FEATURES`] 的关键点与
-/// 反量化描述子。两两配对下每张图要和其余所有图各配一次，截断与
-/// u8→f32 反量化在这里一次摊掉，配对循环内只剩匹配本身。反量化缓冲
-/// 常驻内存（千张库约 192MB），换热路径零分配。
-struct MatchSide {
+/// 配对热路径的每图静态侧:截断到 [`CROP_MATCH_FEATURES`] 的关键点与
+/// 描述子。两两配对下每张图要和其余所有图各配一次,截断与每行常数在
+/// 这里一次摊掉,配对循环内只剩匹配本身。缓冲常驻内存(VNNI 形态千张
+/// 库约 100MB,f32 回退约 190MB),换热路径零分配。形态由
+/// [`quantized_kernel_available`] 在扫描入口统一决定,全库同形态。
+enum MatchSide {
+    /// u8 量化域,自写 knn。query 侧存原值、train 侧存 XOR 0x80 副本:
+    /// VNNI 点积 dpbusd 是 u8×i8,一侧原值一侧翻转恰好凑出
+    /// Σa·(b−128) = a·b − 128·Σa,修正项只依赖 query 行常数 Σa。
+    Quantized(QuantizedSide),
+    /// f32 域回退,喂 OpenCV BFMatcher;无 VNNI 的 CPU 走这条路,
+    /// 与旧版行为一致。
+    Floats(FloatsSide),
+}
+
+struct QuantizedSide {
+    points: Vec<Point2f>,
+    /// 描述子原值,配对时作 query 侧。
+    plain: Vec<[u8; SIFT_DIMS]>,
+    /// XOR 0x80 副本,i8 解释 = 原值 − 128,配对时作 train 侧。
+    flipped: Vec<[u8; SIFT_DIMS]>,
+    /// 每行 Σv,距离重构的修正项。
+    sum: Vec<i32>,
+    /// 每行 ‖v‖²。
+    norm_sq: Vec<i32>,
+}
+
+struct FloatsSide {
     points: Vec<Point2f>,
     floats: Vec<f32>,
 }
 
 impl MatchSide {
     /// 截断后点数不足 4 的图连 RANSAC 的最小解都凑不出，不参与配对。
-    fn new(sift: &SiftFeatures) -> Option<Self> {
+    fn new(sift: &SiftFeatures, quantized: bool) -> Option<Self> {
         let limit = CROP_MATCH_FEATURES.min(sift.points.len());
         if limit < 4 {
             return None;
@@ -528,8 +564,191 @@ impl MatchSide {
             .iter()
             .map(|&(x, y)| Point2f::new(f32::from(x), f32::from(y)))
             .collect();
-        let floats = dequantize(&sift.descriptors[..limit]);
-        Some(Self { points, floats })
+        if quantized {
+            let mut plain = Vec::with_capacity(limit);
+            let mut flipped = Vec::with_capacity(limit);
+            let mut sum = Vec::with_capacity(limit);
+            let mut norm_sq = Vec::with_capacity(limit);
+            for row in &sift.descriptors[..limit] {
+                let mut flipped_row = *row;
+                for v in flipped_row.iter_mut() {
+                    *v ^= 0x80;
+                }
+                plain.push(*row);
+                flipped.push(flipped_row);
+                sum.push(row.iter().map(|&v| i32::from(v)).sum());
+                norm_sq.push(row.iter().map(|&v| i32::from(v) * i32::from(v)).sum());
+            }
+            Some(Self::Quantized(QuantizedSide {
+                points,
+                plain,
+                flipped,
+                sum,
+                norm_sq,
+            }))
+        } else {
+            let floats = dequantize(&sift.descriptors[..limit]);
+            Some(Self::Floats(FloatsSide { points, floats }))
+        }
+    }
+}
+
+/// VNNI 点积内核:一条指令吃 32/64 维 u8×i8。部署机( Cascade Lake)
+/// 只有 512 位 AVX512-VNNI,桌面平台是 256 位 AVX-VNNI,各实现一份;
+/// trait 单态化保证内核内联进配对循环。u8 域数据量是 f32 的四分之一,
+/// 描述子两两比对的带宽压力随之降四倍——部署机实测整体 2.7×。
+trait DotKernel {
+    unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32;
+}
+
+struct K512;
+struct K256;
+
+impl DotKernel for K512 {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f,avx512vnni")]
+    unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32 {
+        use std::arch::x86_64::*;
+        // edition 2024 的 unsafe fn 体内不再隐式 unsafe,intrinsic 逐块包好。
+        let mut acc = _mm512_setzero_si512();
+        for c in 0..SIFT_DIMS / 64 {
+            let va = unsafe { _mm512_loadu_si512(a.as_ptr().add(c * 64) as *const __m512i) };
+            let vb =
+                unsafe { _mm512_loadu_si512(b_flipped.as_ptr().add(c * 64) as *const __m512i) };
+            acc = _mm512_dpbusd_epi32(acc, va, vb);
+        }
+        // 不用 _mm512_reduce_add_epi32:横向折叠序列在部分虚拟化环境
+        // 踩非法指令,store 回内存再标量求和只依赖 F+VNNI 基础指令。
+        let mut tmp = [0i32; 16];
+        unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc) };
+        tmp.iter().sum()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn dot(_: &[u8; SIFT_DIMS], _: &[u8; SIFT_DIMS]) -> i32 {
+        unreachable!("非 x86_64 不会构建 Quantized 形态")
+    }
+}
+
+impl DotKernel for K256 {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,avxvnni")]
+    unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32 {
+        use std::arch::x86_64::*;
+        let mut acc = _mm256_setzero_si256();
+        for c in 0..SIFT_DIMS / 32 {
+            let va = unsafe { _mm256_loadu_si256(a.as_ptr().add(c * 32) as *const __m256i) };
+            let vb =
+                unsafe { _mm256_loadu_si256(b_flipped.as_ptr().add(c * 32) as *const __m256i) };
+            acc = _mm256_dpbusd_avx_epi32(acc, va, vb);
+        }
+        let mut tmp = [0i32; 8];
+        unsafe { _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc) };
+        tmp.iter().sum()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe fn dot(_: &[u8; SIFT_DIMS], _: &[u8; SIFT_DIMS]) -> i32 {
+        unreachable!("非 x86_64 不会构建 Quantized 形态")
+    }
+}
+
+/// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。云主机 CPU
+/// flags 有虚报前科,换部署目标时先实测(2026-10-08 当前部署机验证可跑)。
+fn quantized_kernel_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static OK: LazyLock<bool> = LazyLock::new(|| {
+            std::arch::is_x86_feature_detected!("avx512vnni")
+                || std::arch::is_x86_feature_detected!("avxvnni")
+        });
+        *OK
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// d² = ‖a‖² + ‖b‖² − 2a·b,其中 a·b = dpb + 128·Σa(dpbusd 输出的是
+/// Σa·(b−128))。全程 i32/i64 整数域:与 f32 域单调等价,仅距离几乎
+/// 并列的边界匹配可能翻面(RANSAC 随机性之下的噪声级差异)。
+#[inline]
+fn dist_from_dot(dpb: i32, sum_a: i32, norm_a: i32, norm_b: i32) -> u32 {
+    let ab = i64::from(dpb) + 128 * i64::from(sum_a);
+    (i64::from(norm_a) + i64::from(norm_b) - 2 * ab) as u32
+}
+
+/// u8 域 knn:每个 query 描述子在 train 侧找精确 top-2,过 Lowe 比率的
+/// 点对收进 pts。并列距离取先扫到的行,与 BFMatcher 的严格小于更新
+/// 同一选择。整数域比率判据见 [`LOWE_NUM`]。
+fn knn_quantized<K: DotKernel>(
+    query: &QuantizedSide,
+    train: &QuantizedSide,
+    pts: &mut Vec<(Point2f, Point2f)>,
+) {
+    for (qi, qrow) in query.plain.iter().enumerate() {
+        let (mut best, mut second) = (u32::MAX, u32::MAX);
+        let mut best_t = 0usize;
+        for (ti, trow) in train.flipped.iter().enumerate() {
+            let d = dist_from_dot(
+                unsafe { K::dot(qrow, trow) },
+                query.sum[qi],
+                query.norm_sq[qi],
+                train.norm_sq[ti],
+            );
+            if d < best {
+                second = best;
+                best = d;
+                best_t = ti;
+            } else if d < second {
+                second = d;
+            }
+        }
+        if second != u32::MAX && LOWE_NUM * u64::from(best) < LOWE_DEN * u64::from(second) {
+            pts.push((query.points[qi], train.points[best_t]));
+        }
+    }
+}
+
+/// f32 回退域 knn:BFMatcher 照旧,比率判据维持浮点形式。
+fn knn_opencv(
+    query: &FloatsSide,
+    train: &FloatsSide,
+    matcher: &BFMatcher,
+    pts: &mut Vec<(Point2f, Point2f)>,
+) {
+    let query_desc =
+        Mat::new_rows_cols_with_data(query.points.len() as i32, SIFT_DIMS as i32, &query.floats)
+            .expect("f32 缓冲尺寸自洽");
+    let train_desc =
+        Mat::new_rows_cols_with_data(train.points.len() as i32, SIFT_DIMS as i32, &train.floats)
+            .expect("f32 缓冲尺寸自洽");
+    let mut matches = Vector::<Vector<DMatch>>::new();
+    if matcher
+        .knn_train_match(
+            &query_desc,
+            &train_desc,
+            &mut matches,
+            2,
+            &Mat::default(),
+            false,
+        )
+        .is_err()
+    {
+        return;
+    }
+    for i in 0..matches.len() {
+        let Ok(pair) = matches.get(i) else {
+            continue;
+        };
+        if pair.len() < 2 {
+            continue;
+        }
+        let (Ok(best), Ok(second)) = (pair.get(0), pair.get(1)) else {
+            continue;
+        };
+        if best.distance < SIFT_LOWE_RATIO * second.distance {
+            pts.push((query.points[i], train.points[best.train_idx as usize]));
+        }
     }
 }
 
@@ -562,6 +781,22 @@ pub fn detect_crops(
     duplicate_limit: u32,
     covered: &HashSet<&str>,
 ) -> Vec<SimilarGroup> {
+    detect_crops_inner(
+        images,
+        duplicate_limit,
+        covered,
+        quantized_kernel_available(),
+    )
+}
+
+/// 形态参数供测试强制回退路径:运行时检测只有 VNNI 一条真路,生产
+/// 入口 [`detect_crops`] 恒用检测结果。
+fn detect_crops_inner(
+    images: &[SiftableImage],
+    duplicate_limit: u32,
+    covered: &HashSet<&str>,
+    quantized: bool,
+) -> Vec<SimilarGroup> {
     let n = images.len();
     if n < 2 {
         return Vec::new();
@@ -573,7 +808,7 @@ pub fn detect_crops(
     // 交错取行分片，各线程负载均衡；match_crop_pair 是纯函数，可并行。
     let sides: Vec<Option<MatchSide>> = images
         .iter()
-        .map(|image| MatchSide::new(&image.sift))
+        .map(|image| MatchSide::new(&image.sift, quantized))
         .collect();
     let _single_thread = SingleThreadGuard::new();
     let workers = std::thread::available_parallelism()
@@ -587,9 +822,15 @@ pub fn detect_crops(
             let sides = &sides;
             handles.push(scope.spawn(move || {
                 // BFMatcher 无跨调用状态，分片内复用一个；创建失败视同
-                // 该分片全部匹配失败，与单对匹配失败同语义。
-                let Ok(matcher) = BFMatcher::new(NORM_L2, false) else {
-                    return;
+                // 该分片全部匹配失败，与单对匹配失败同语义。VNNI 形态
+                // 用不上它，创建也免了。
+                let matcher = if quantized {
+                    None
+                } else {
+                    let Ok(matcher) = BFMatcher::new(NORM_L2, false) else {
+                        return;
+                    };
+                    Some(matcher)
                 };
                 let mut i = t;
                 while i < n {
@@ -613,7 +854,7 @@ pub fn detect_crops(
                             // knn（query=i → train=j）只跑一次，RANSAC
                             // 单应的几何审查双向定谁是谁的局部。
                             if let Some((i_is_part, percent)) =
-                                match_crop_pair(side_i, side_j, &matcher)
+                                match_crop_pair(side_i, side_j, matcher.as_ref())
                             {
                                 let (whole, part) = if i_is_part {
                                     (&images[j].hash, &images[i].hash)
@@ -666,57 +907,59 @@ pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
 /// 召回边界：查询侧恰好是整体时，能过 Lowe 的对应只有重叠区里的高
 /// 响应点，裁剪越狠越少——凑不满 [`CROP_MIN_GOOD`] 该方向即漏检，
 /// 这是单次 knn 相对双向各查一次省一半计算付出的代价。
-/// Mat 头是 O(1) 的外部数据包装（不拷描述子），BoxedRef 借用 floats
-/// 缓冲、活到匹配结束。matcher 由调用方持有，knn_train_match 直传
-/// 训练侧、不落内部训练集，无状态可复用。
+/// knn 内核按 MatchSide 形态分派:量化域走 VNNI 自写(整数平方距离,
+/// 判据与 f32 域单调等价),回退域照旧 BFMatcher;`matcher` 仅回退
+/// 形态需要。两条路产出的点对集进同一段 RANSAC。
 fn match_crop_pair(
     query: &MatchSide,
     train: &MatchSide,
-    matcher: &BFMatcher,
+    matcher: Option<&BFMatcher>,
 ) -> Option<(bool, u8)> {
-    let query_desc =
-        Mat::new_rows_cols_with_data(query.points.len() as i32, SIFT_DIMS as i32, &query.floats)
-            .ok()?;
-    let train_desc =
-        Mat::new_rows_cols_with_data(train.points.len() as i32, SIFT_DIMS as i32, &train.floats)
-            .ok()?;
-    let mut matches = Vector::<Vector<DMatch>>::new();
-    matcher
-        .knn_train_match(
-            &query_desc,
-            &train_desc,
-            &mut matches,
-            2,
-            &Mat::default(),
-            false,
-        )
-        .ok()?;
-    let mut src = Vector::<Point2f>::new();
-    let mut dst = Vector::<Point2f>::new();
-    for i in 0..matches.len() {
-        let pair = matches.get(i).ok()?;
-        if pair.len() < 2 {
-            continue;
+    let mut pts: Vec<(Point2f, Point2f)> = Vec::new();
+    match (query, train) {
+        // 全库同形态是 detect_crops 的不变式,混合形态只可能来自调用
+        // 方拼错,按匹配失败处理。
+        (MatchSide::Quantized(query), MatchSide::Quantized(train)) => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                static K512: LazyLock<bool> =
+                    LazyLock::new(|| std::arch::is_x86_feature_detected!("avx512vnni"));
+                if *K512 {
+                    knn_quantized::<K512>(query, train, &mut pts);
+                } else {
+                    knn_quantized::<K256>(query, train, &mut pts);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("非 x86_64 不会构建 Quantized 形态");
         }
-        let best = pair.get(0).ok()?;
-        let second = pair.get(1).ok()?;
-        if best.distance < SIFT_LOWE_RATIO * second.distance {
-            let query_point = query.points[i];
-            let train_point = train.points[best.train_idx as usize];
-            src.push(query_point);
-            dst.push(train_point);
+        (MatchSide::Floats(query), MatchSide::Floats(train)) => {
+            let matcher = matcher?;
+            knn_opencv(query, train, matcher, &mut pts);
         }
+        _ => return None,
     }
-    if src.len() < 4 {
+    // 好匹配数达不到下限的对在这里就出局：模型质量反正过不了三保险，
+    // 省下负对上最贵的 RANSAC 迭代预算。
+    let good = pts.len() as u64;
+    if good < CROP_MIN_GOOD {
         return None;
     }
+    let mut src = Vector::<Point2f>::new();
+    let mut dst = Vector::<Point2f>::new();
+    for (query_point, train_point) in pts {
+        src.push(query_point);
+        dst.push(train_point);
+    }
     let mut mask = Mat::default();
-    let homography = opencv::calib3d::find_homography(
+    let homography = opencv::calib3d::find_homography_ext(
         &src,
         &dst,
-        &mut mask,
         opencv::calib3d::RANSAC,
         HOMOGRAPHY_THRESHOLD,
+        &mut mask,
+        CROP_RANSAC_MAX_ITERS,
+        CROP_RANSAC_CONFIDENCE,
     )
     .ok()?;
     let mut inliers = 0u64;
@@ -725,11 +968,7 @@ fn match_crop_pair(
             inliers += 1;
         }
     }
-    let good = src.len() as u64;
-    if good < CROP_MIN_GOOD
-        || inliers < CROP_MIN_INLIERS
-        || inliers * 100 < good * CROP_MIN_COHESION_PERCENT
-    {
+    if inliers < CROP_MIN_INLIERS || inliers * 100 < good * CROP_MIN_COHESION_PERCENT {
         return None;
     }
     let percent = u8::try_from(inliers * 100 / good).ok()?;
@@ -1168,6 +1407,87 @@ mod tests {
         // 两端都覆盖：本轮跳过，不再产出。
         let full: HashSet<&str> = HashSet::from(["w", "p"]);
         assert!(detect_crops(&[whole, part], 32, &full).is_empty());
+    }
+
+    /// 运行时检测只会选中 VNNI 形态，回退路径(BFMatcher)在这里强制
+    /// 走一遍：无 VNNI 的机器（CI runner 等）生产上就是这条路。
+    #[test]
+    fn crop_detects_on_float_fallback() {
+        let base = photo_like(3);
+        let whole = siftable("w", &jpeg_bytes(&base, 85));
+        let part = siftable("p", &jpeg_bytes(&center_crop(&base, 50), 85));
+        let groups = detect_crops_inner(&[whole, part], 32, &HashSet::new(), false);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, GroupKind::Crop);
+        assert_eq!(groups[0].hashes, vec!["w".to_owned(), "p".to_owned()]);
+        assert!(
+            groups[0].percent >= CROP_MIN_COHESION_PERCENT as u8,
+            "percent={}",
+            groups[0].percent
+        );
+    }
+
+    /// 同一对特征走两种 knn 内核，检出结论必须一致：u8 整数距离与
+    /// f32 距离单调等价，差异只应出现在 RANSAC 随机性本身。用手工
+    /// 特征对（描述子一一对应，内聚率 100%）避开随机边界。
+    #[test]
+    fn quantized_kernel_agrees_with_float_fallback() {
+        let whole_sift = manual_whole();
+        let part_sift = manual_part();
+        let verdicts = [true, false].map(|quantized| {
+            let whole = MatchSide::new(&whole_sift, quantized).unwrap();
+            let part = MatchSide::new(&part_sift, quantized).unwrap();
+            let matcher = if quantized {
+                None
+            } else {
+                Some(BFMatcher::new(NORM_L2, false).unwrap())
+            };
+            match_crop_pair(&whole, &part, matcher.as_ref())
+        });
+        // query 是 whole：两个内核都要么检出且判为非局部，要么同不出。
+        assert_eq!(verdicts[0].is_some(), verdicts[1].is_some());
+        assert_eq!(
+            verdicts[0].map(|(is_part, _)| is_part),
+            verdicts[1].map(|(is_part, _)| is_part)
+        );
+    }
+
+    /// 距离重构的数学本身：dpbusd 输出 Σa·(b−128)，经修正项还原后必须
+    /// 等于暴力 Σ(a−b)²。SIMD 内核的正确性由双形态一致性测试兜底，
+    /// 这里钉住标量换算公式。
+    #[test]
+    fn dist_from_dot_matches_bruteforce() {
+        let row = |seed: u8| -> [u8; SIFT_DIMS] {
+            let mut v = seed.wrapping_mul(37);
+            let mut row = [0u8; SIFT_DIMS];
+            for slot in row.iter_mut() {
+                v = v.wrapping_mul(31).wrapping_add(11);
+                *slot = v;
+            }
+            row
+        };
+        for seed in [1u8, 7, 42, 200] {
+            let a = row(seed);
+            let b = row(seed.wrapping_add(3));
+            let sum_a: i32 = a.iter().map(|&v| i32::from(v)).sum();
+            let norm_a: i32 = a.iter().map(|&v| i32::from(v) * i32::from(v)).sum();
+            let norm_b: i32 = b.iter().map(|&v| i32::from(v) * i32::from(v)).sum();
+            let dpb: i32 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| i32::from(x) * i32::from(y as i8))
+                .sum();
+            let brute: u32 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| (i32::from(x) - i32::from(y)).unsigned_abs().pow(2))
+                .sum::<u32>();
+            assert_eq!(
+                dist_from_dot(dpb, sum_a, norm_a, norm_b),
+                brute,
+                "seed={seed}"
+            );
+        }
     }
 
     #[test]
