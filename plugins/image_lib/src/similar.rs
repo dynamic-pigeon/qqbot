@@ -677,6 +677,31 @@ fn dist_from_dot(dpb: i32, sum_a: i32, norm_a: i32, norm_b: i32) -> u32 {
     (i64::from(norm_a) + i64::from(norm_b) - 2 * ab) as u32
 }
 
+/// 带 target_feature 的核入口。`DotKernel::dot` 带 `#[target_feature]`,
+/// Rust 只允许它内联进同样声明该 feature 的函数——直接在普通安全函数
+/// 里调泛型 knn 时,每比较一个 train 行都是真正的函数调用,内核小函数
+/// 的 call 开销在低频核上占可观比例。外壳把 feature 声明补齐,层级
+/// 内联得以发生;安全性由调用点的运行时检测兜底。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vnni")]
+unsafe fn knn_quantized_avx512(
+    query: &QuantizedSide,
+    train: &QuantizedSide,
+    pts: &mut Vec<(Point2f, Point2f)>,
+) {
+    knn_quantized::<K512>(query, train, pts)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn knn_quantized_avxvnni(
+    query: &QuantizedSide,
+    train: &QuantizedSide,
+    pts: &mut Vec<(Point2f, Point2f)>,
+) {
+    knn_quantized::<K256>(query, train, pts)
+}
+
 /// u8 域 knn:每个 query 描述子在 train 侧找精确 top-2,过 Lowe 比率的
 /// 点对收进 pts。并列距离取先扫到的行,与 BFMatcher 的严格小于更新
 /// 同一选择。整数域比率判据见 [`LOWE_NUM`]。
@@ -924,10 +949,11 @@ fn match_crop_pair(
             {
                 static K512: LazyLock<bool> =
                     LazyLock::new(|| std::arch::is_x86_feature_detected!("avx512vnni"));
+                // 检测兜底后进 unsafe 外壳,feature 上下文里内核才能内联。
                 if *K512 {
-                    knn_quantized::<K512>(query, train, &mut pts);
+                    unsafe { knn_quantized_avx512(query, train, &mut pts) };
                 } else {
-                    knn_quantized::<K256>(query, train, &mut pts);
+                    unsafe { knn_quantized_avxvnni(query, train, &mut pts) };
                 }
             }
             #[cfg(not(target_arch = "x86_64"))]
