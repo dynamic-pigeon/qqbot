@@ -31,6 +31,12 @@ const READY: Duration = Duration::from_secs(10);
 const REPLY: Duration = Duration::from_secs(8);
 const SLOW: Duration = Duration::from_secs(45);
 
+/// 帮助列表必须出现的命令，同时也是注册完成的判定门槛：msg_rank 要起
+/// SQLite，比其他插件慢，只等部分插件会在慢机上对着没注册完的帮助断言。
+const HELP_NEEDLES: [&str; 8] = [
+    "/help", "/wordle", "/live", "/dynamic", "图库", "!md", "/查卡", "/周报",
+];
+
 #[tokio::test(flavor = "current_thread")]
 async fn plugin_commands_reply_on_mock_onebot() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -44,9 +50,7 @@ async fn plugin_commands_reply_on_mock_onebot() {
     server.wait_ready().await;
     let help = wait_until_help_ready(&server).await;
     assert!(help.contains("📚 可用命令"), "{help}");
-    for needle in [
-        "/help", "/wordle", "/live", "/dynamic", "图库", "!md", "/查卡", "/周报",
-    ] {
+    for needle in HELP_NEEDLES {
         assert!(help.contains(needle), "帮助缺少 {needle}: {help}");
     }
 
@@ -224,7 +228,7 @@ async fn wait_until_help_ready(server: &MockOneBot) -> String {
             Err(_) => continue,
         };
         last = reply.text;
-        if last.contains("/wordle") && last.contains("图库") && last.contains("!md") {
+        if HELP_NEEDLES.iter().all(|needle| last.contains(needle)) {
             return last;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
