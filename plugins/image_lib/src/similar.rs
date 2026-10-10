@@ -424,7 +424,9 @@ const MAX_CROP_PAIRS: usize = 500;
 /// v4：覆盖集从每库一行的拼接字符串改为每成员一行的行表；knn 换 u8
 /// 量化域 VNNI 内核，RANSAC 迭代上限 500。VNNI 检出与旧判据在真实库
 /// 上逐对一致，仅 RANSAC 随机边界对可能翻面。
-pub(crate) const CROP_CACHE_VERSION: &str = "v4";
+/// v5：配对从单方向改为正反各查一次再合并——query 侧恰好是整体的狠
+/// 裁剪对会漏检，且结果随成员枚举顺序漂移，正结果集变化。
+pub(crate) const CROP_CACHE_VERSION: &str = "v5";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
 
@@ -877,10 +879,8 @@ fn detect_crops_inner(
                             pair_distances(images[i].fingerprint, images[j].fingerprint);
                         // 「重复」距离的对归查重管，不算裁剪。
                         if dup_dist > duplicate_limit {
-                            // knn（query=i → train=j）只跑一次，RANSAC
-                            // 单应的几何审查双向定谁是谁的局部。
                             if let Some((i_is_part, percent)) =
-                                match_crop_pair(side_i, side_j, matcher.as_ref())
+                                match_crop_pair_both(side_i, side_j, matcher.as_ref())
                             {
                                 let (whole, part) = if i_is_part {
                                     (&images[j].hash, &images[i].hash)
@@ -924,15 +924,42 @@ pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
     }
 }
 
-/// 判定 query 与 train 谁是谁的裁剪局部，只跑一次 knn（query 描述子
-/// 在 train 里找 2-NN）：对应点满足 H 等价于满足 H⁻¹，good/inlier/
+/// 正反两个方向各跑一次 [`match_crop_pair`] 再合并：任一方向成立即检出，
+/// 两个都成立取内聚率高的方向。Lowe 方向决定以谁的点提候选对应——
+/// query 侧恰好是整体时重叠区外的点全是陪跑，狠裁剪会凑不满
+/// [`CROP_MIN_GOOD`]，反向补上这一漏。两个方向都算再合并，结果只依赖
+/// 这对图本身，与成员列表的枚举顺序无关。
+fn match_crop_pair_both(
+    a: &MatchSide,
+    b: &MatchSide,
+    matcher: Option<&BFMatcher>,
+) -> Option<(bool, u8)> {
+    let forward = match_crop_pair(a, b, matcher);
+    let backward = match_crop_pair(b, a, matcher);
+    match (forward, backward) {
+        (Some((a_is_part, pa)), Some((b_is_part, pb))) => {
+            // 谁是谁的局部由同一几何给出，两方向的判定必然一致；可能
+            // 不同的只有 percent，取内聚率高的方向。
+            if pa >= pb {
+                Some((a_is_part, pa))
+            } else {
+                Some((!b_is_part, pb))
+            }
+        }
+        (Some((a_is_part, pa)), None) => Some((a_is_part, pa)),
+        (None, Some((b_is_part, pb))) => Some((!b_is_part, pb)),
+        (None, None) => None,
+    }
+}
+
+/// 单方向的配对判定：跑一次 query→train 的 knn（query 描述子在 train
+/// 里找 2-NN）：对应点满足 H 等价于满足 H⁻¹，good/inlier/
 /// 内聚率对两个几何审查方向是同一组数字，质量三保险在此只判一次。
 /// RANSAC 拟合 H：query→train 后审查双向：H 把 query 画布压进
 /// train，则 query 是局部；H⁻¹ 把 train 画布压进 query，则 train 是
 /// 局部。返回（query 侧是否局部， inlier 占 good 的百分比）。
-/// 召回边界：查询侧恰好是整体时，能过 Lowe 的对应只有重叠区里的高
-/// 响应点，裁剪越狠越少——凑不满 [`CROP_MIN_GOOD`] 该方向即漏检，
-/// 这是单次 knn 相对双向各查一次省一半计算付出的代价。
+/// 方向相关的召回边界见 [`match_crop_pair_both`]，由它正反各调一次
+/// 兜住。
 /// knn 内核按 MatchSide 形态分派:量化域走 VNNI 自写(整数平方距离,
 /// 判据与 f32 域单调等价),回退域照旧 BFMatcher;`matcher` 仅回退
 /// 形态需要。两条路产出的点对集进同一段 RANSAC。
@@ -1434,6 +1461,105 @@ mod tests {
         // 两端都覆盖：本轮跳过，不再产出。
         let full: HashSet<&str> = HashSet::from(["w", "p"]);
         assert!(detect_crops(&[whole, part], 32, &full).is_empty());
+    }
+
+    /// 正反两方向的判定由同一几何给出必然一致；percent 可能不同（keep=50
+    /// 的 f32 域实测正向 75%、反向 74%），合并取高者，且与调用顺序无关。
+    /// 形态跟随运行时检测，生产上是哪条 knn 内核就测哪条。
+    #[test]
+    fn crop_pair_merge_is_order_independent() {
+        let quantized = quantized_kernel_available();
+        let base = photo_like(3);
+        let whole = siftable("w", &jpeg_bytes(&base, 85));
+        let part = siftable("p", &jpeg_bytes(&center_crop(&base, 50), 85));
+        let side_w = MatchSide::new(&whole.sift, quantized).expect("whole side");
+        let side_p = MatchSide::new(&part.sift, quantized).expect("part side");
+        let matcher = if quantized {
+            None
+        } else {
+            Some(BFMatcher::new(NORM_L2, false).expect("matcher"))
+        };
+        let (w_is_part, w_pct) =
+            match_crop_pair(&side_w, &side_p, matcher.as_ref()).expect("forward");
+        let (p_is_part, p_pct) =
+            match_crop_pair(&side_p, &side_w, matcher.as_ref()).expect("backward");
+        assert_eq!(w_is_part, !p_is_part, "两方向的角色判定必须一致");
+        let merged = match_crop_pair_both(&side_w, &side_p, matcher.as_ref()).expect("merged");
+        assert_eq!(
+            merged,
+            (w_is_part, w_pct.max(p_pct)),
+            "合并取内聚率高的方向"
+        );
+        let swapped =
+            match_crop_pair_both(&side_p, &side_w, matcher.as_ref()).expect("merged swapped");
+        // swapped 的 bool 指 side_p（它的第一个参数）是否为局部，换回
+        // w 的坐标系后再比较。
+        assert_eq!(
+            (!swapped.0, swapped.1),
+            merged,
+            "合并结果与调用顺序无关"
+        );
+    }
+
+    /// 全库检测的结果不随成员枚举顺序变化——单方向版里 query 角色由
+    /// 顺序决定，percent 会漂移。
+    #[test]
+    fn crop_detection_is_independent_of_enumeration_order() {
+        let base = photo_like(3);
+        let whole = siftable("w", &jpeg_bytes(&base, 85));
+        let part = siftable("p", &jpeg_bytes(&center_crop(&base, 40), 85));
+        let whole_first = detect_crops(&[whole.clone(), part.clone()], 32, &HashSet::new());
+        let part_first = detect_crops(&[part, whole], 32, &HashSet::new());
+        assert_eq!(whole_first, part_first);
+    }
+
+    /// 配对内核基准：随机描述子的「无关对」，Lowe 几乎全灭、RANSAC
+    /// 早退，量到的就是 knn 距离计算本身。手动跑：
+    /// cargo test --release -p image_lib -- --ignored bench --nocapture
+    #[test]
+    #[ignore = "基准测试，手动跑"]
+    fn bench_crop_pair_kernel() {
+        let _guard = SingleThreadGuard::new();
+        let quantized = quantized_kernel_available();
+        let side = |seed: usize| {
+            let mut descriptors = vec![[0u8; SIFT_DIMS]; CROP_MATCH_FEATURES];
+            let mut x = 0x9E37_79B9u32 ^ seed as u32;
+            for row in descriptors.iter_mut() {
+                for v in row.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    *v = (x >> 24) as u8;
+                }
+            }
+            let sift = SiftFeatures {
+                points: vec![(0, 0); CROP_MATCH_FEATURES],
+                descriptors,
+                centers: [[0; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
+            };
+            MatchSide::new(&sift, quantized).expect("side")
+        };
+        let matcher = if quantized {
+            None
+        } else {
+            Some(BFMatcher::new(NORM_L2, false).expect("matcher"))
+        };
+        let sides: Vec<MatchSide> = (0..24).map(side).collect();
+        let rounds = 4000usize;
+        let start = std::time::Instant::now();
+        for k in 0..rounds {
+            let a = &sides[k % sides.len()];
+            let b = &sides[(k * 7 + 3) % sides.len()];
+            std::hint::black_box(match_crop_pair_both(a, b, matcher.as_ref()));
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "形态={} match_crop_pair_both: {} 对合计 {:?}, 单对 {:?}",
+            if quantized { "VNNI" } else { "BFMatcher" },
+            rounds,
+            elapsed,
+            elapsed / rounds as u32
+        );
     }
 
     /// 运行时检测只会选中 VNNI 形态，回退路径(BFMatcher)在这里强制
