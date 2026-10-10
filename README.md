@@ -12,7 +12,7 @@ cargo run --release
 
 没有 `kovi.conf.toml` 时会交互生成。Linux 部署请加 `--features jemalloc` 或 `mimalloc`（二者互斥），否则词云/截图后 RSS 不易回落。
 
-`image_lib` 的裁剪检测动态链接 OpenCV 4.6：绑定按 pkg-config 的 `opencv4` 找头文件与库（`.cargo/config.toml` 不入库，用 `PKG_CONFIG_SYSROOT_DIR` / `PKG_CONFIG_PATH` 指向自己的安装即可），产物动态依赖 `libopencv_*.so.406`，目标机要有同版本运行库。动态链接 OpenCV 后 musl 目标不再可用，交叉部署用 cargo-zigbuild 在目标 glibc 版本上钉版编译。
+`image_lib` 的裁剪检测动态链接系统 OpenCV，目标机要有相同 minor 版本的运行库。动态链接 OpenCV 后 musl 目标不可用，交叉部署用 cargo-zigbuild 在目标 glibc 版本上钉版编译。
 
 | 文件 | 用途 |
 |---|---|
@@ -47,7 +47,7 @@ cargo test --workspace --all-targets --locked
 cargo audit
 ```
 
-workspace 会通过依赖编进 `utils` 的 `chromium` / `screenshot` / `markdown` 和 Wordle 的 `qq`。单独测 `utils` 时要加 `--features markdown`，否则 Markdown/截图测试不会编进来。`image_lib` 需要「运行」一节所述的 OpenCV 4.6 与系统 libclang（`libclang-dev`）。
+workspace 会通过依赖编进 `utils` 的 `chromium` / `screenshot` / `markdown` 和 Wordle 的 `qq`。单独测 `utils` 时要加 `--features markdown`，否则 Markdown/截图测试不会编进来。`image_lib` 需要「运行」一节所述的系统 OpenCV 与系统 libclang（`libclang-dev`）。
 
 依赖公网 API 或本机 Chrome 的测试标了 `ignored`：
 
