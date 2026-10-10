@@ -30,11 +30,11 @@ mod tests;
 
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use repo::{
-    additional_unique_bytes, backed_up_hashes, crop_covered, delete_crop_pairs_for_hash,
-    delete_fingerprint, delete_sift, hash_still_used, insert_crop_pairs, insert_fingerprints,
-    insert_images, insert_sifts, library_crop_pairs, library_exists, library_fingerprints,
-    library_hashes, library_sifts, merge_library, prune_dangling_aliases,
-    purge_expired_backup_refs, resolve_library, save_crop_covered, shrink_hash_from_covered,
+    additional_unique_bytes, backed_up_hashes, crop_covered, delete_covered_for_hash,
+    delete_crop_pairs_for_hash, delete_fingerprint, delete_sift, hash_still_used,
+    insert_crop_pairs, insert_fingerprints, insert_images, insert_sifts, library_crop_pairs,
+    library_exists, library_fingerprints, library_hashes, library_sifts, merge_library,
+    prune_dangling_aliases, purge_expired_backup_refs, resolve_library, save_crop_covered,
     unique_image_bytes, upsert_alias,
 };
 use schema::init_schema;
@@ -806,8 +806,7 @@ impl Store {
                 let mut members: Vec<String> =
                     library_hashes(&pool, &library).await?.into_iter().collect();
                 members.sort();
-                let covered: HashSet<String> =
-                    crop_covered(&pool, &library).await?.into_iter().collect();
+                let covered = crop_covered(&pool, &library).await?;
                 if members.len() < 2 || members.iter().all(|hash| covered.contains(hash)) {
                     let pairs = library_crop_pairs(&pool, &library).await?;
                     let groups = assemble_crop_groups(
@@ -944,7 +943,7 @@ impl Store {
 
             let mut removed_files = 0u64;
             // blob 物理消失的哈希（这里删掉孤儿文件，或下面索引指向但盘上
-            // 已没有）：配对缓存的正结果对与覆盖槽位同批作废，此后同内容
+            // 已没有）：配对缓存的正结果对与覆盖行同批作废，此后同内容
             // 图再加回按增量只重算它的对。逻辑删图不动缓存（见 delete_hash）。
             let mut reclaimed: HashSet<String> = HashSet::new();
             for hash in disk.difference(&indexed) {
@@ -986,7 +985,7 @@ impl Store {
                 .await?;
             for hash in &reclaimed {
                 delete_crop_pairs_for_hash(&mut *tx, hash).await?;
-                shrink_hash_from_covered(&mut tx, hash).await?;
+                delete_covered_for_hash(&mut *tx, hash).await?;
             }
             tx.commit().await?;
 
