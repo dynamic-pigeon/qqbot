@@ -67,12 +67,21 @@ pub(super) async fn init_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     .execute(pool)
     .await?;
     sqlx::query(
-        // 每库一行的覆盖标记：covered 是 64 位 hex 哈希直接拼接，
-        // 记录最近一次完整扫描时的成员全集，两端都在其中的对视为已比对。
-        "CREATE TABLE IF NOT EXISTS crop_scan_state (
-            library TEXT NOT NULL PRIMARY KEY,
-            covered TEXT NOT NULL CHECK (length(covered) % 64 = 0)
+        // 覆盖集：最近一次完整扫描时的成员全集，每成员一行，
+        // 两端都在其中的对视为已比对。
+        "CREATE TABLE IF NOT EXISTS crop_scan_covered (
+            library TEXT NOT NULL,
+            hash TEXT NOT NULL CHECK (length(hash) = 64),
+            PRIMARY KEY (library, hash)
         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        // v2 及以前覆盖集存成每库一行的拼接字符串（crop_scan_state），
+        // v3 换行表；旧表连同数据一并弃掉，失效标记同步换代，首次
+        // 查裁剪按全量重算。
+        "DROP TABLE IF EXISTS crop_scan_state",
     )
     .execute(pool)
     .await?;
@@ -179,7 +188,7 @@ async fn migrate_crop_cache(pool: &SqlitePool) -> Result<(), StoreError> {
         return Ok(());
     }
     sqlx::query("DELETE FROM crop_pairs").execute(pool).await?;
-    sqlx::query("DELETE FROM crop_scan_state")
+    sqlx::query("DELETE FROM crop_scan_covered")
         .execute(pool)
         .await?;
     sqlx::query(

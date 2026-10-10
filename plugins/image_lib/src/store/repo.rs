@@ -204,48 +204,43 @@ pub(super) async fn library_sifts(
     Ok(found)
 }
 
-/// 读一个库的覆盖标记：covered 是 64 位 hex 哈希直接拼接，定长切块还原。
+/// 读一个库的覆盖集：最近一次完整扫描时的成员全集。
 pub(super) async fn crop_covered(
     pool: &SqlitePool,
     library: &str,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<HashSet<String>, StoreError> {
     let covered =
-        sqlx::query_scalar::<_, String>("SELECT covered FROM crop_scan_state WHERE library = ?")
+        sqlx::query_scalar::<_, String>("SELECT hash FROM crop_scan_covered WHERE library = ?")
             .bind(library)
-            .fetch_optional(pool)
+            .fetch_all(pool)
             .await?;
-    let Some(covered) = covered else {
-        return Ok(Vec::new());
-    };
-    covered
-        .as_bytes()
-        .chunks(64)
-        .map(|chunk| {
-            std::str::from_utf8(chunk)
-                .map(str::to_owned)
-                .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记 BLOB 异常: {library}")))
-        })
-        .collect()
+    Ok(covered.into_iter().collect())
 }
 
-/// 整轮扫描完成后写入覆盖标记：本轮成员全集即「已两两比对过」的范围。
+/// 整轮扫描完成后写入覆盖集：本轮成员全集即「已两两比对过」的范围。
+/// 全量替换：先清该库旧成员，再写入本轮名单。
 pub(super) async fn save_crop_covered(
     pool: &SqlitePool,
     library: &str,
     covered: &[String],
 ) -> Result<(), StoreError> {
-    let mut blob = String::with_capacity(covered.len() * 64);
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM crop_scan_covered WHERE library = ?")
+        .bind(library)
+        .execute(&mut *tx)
+        .await?;
     for hash in covered {
-        blob.push_str(hash);
+        // 只忽略主键冲突（并发扫描的幂等），与指纹同款。
+        sqlx::query(
+            "INSERT INTO crop_scan_covered (library, hash) VALUES (?, ?)
+             ON CONFLICT(library, hash) DO NOTHING",
+        )
+        .bind(library)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
     }
-    sqlx::query(
-        "INSERT INTO crop_scan_state (library, covered) VALUES (?, ?)
-         ON CONFLICT(library) DO UPDATE SET covered = excluded.covered",
-    )
-    .bind(library)
-    .bind(blob)
-    .execute(pool)
-    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -304,7 +299,7 @@ pub(super) async fn delete_crop_state<'e, E>(executor: E, library: &str) -> Resu
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
+    sqlx::query("DELETE FROM crop_scan_covered WHERE library = ?")
         .bind(library)
         .execute(executor)
         .await?;
@@ -327,42 +322,19 @@ where
     Ok(())
 }
 
-/// 把哈希从所有覆盖标记里摘除（重写 covered 去掉那个 64 字符槽位，摘空
-/// 删行），与正结果对的回收在同一事务。不摘的话，「blob 已回收 → 同内容
-/// 图再加回」会对着已删的正结果行被当成已比对而漏检。哈希与槽位同为
-/// 64 字节、按槽对齐拼接，instr 只可能整槽命中，不会误伤相邻哈希。
-pub(super) async fn shrink_hash_from_covered(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+/// 把哈希从所有库的覆盖集里摘除，与正结果对的回收在同一事务。不摘的话，
+/// 「blob 已回收 → 同内容图再加回」会对着已删的正结果行被当成已比对而漏检。
+pub(super) async fn delete_covered_for_hash<'e, E>(
+    executor: E,
     hash: &str,
-) -> Result<(), StoreError> {
-    let rows =
-        sqlx::query("SELECT library, covered FROM crop_scan_state WHERE instr(covered, ?) > 0")
-            .bind(hash)
-            .fetch_all(&mut **tx)
-            .await?;
-    for row in rows {
-        let library: String = row.try_get("library")?;
-        let covered: String = row.try_get("covered")?;
-        let shrunk: String = covered
-            .as_bytes()
-            .chunks(64)
-            .filter(|slot| *slot != hash.as_bytes())
-            .map(|slot| std::str::from_utf8(slot).map(str::to_owned))
-            .collect::<Result<String, _>>()
-            .map_err(|_| StoreError::Other(anyhow::anyhow!("覆盖标记异常: {library}")))?;
-        if shrunk.is_empty() {
-            sqlx::query("DELETE FROM crop_scan_state WHERE library = ?")
-                .bind(&library)
-                .execute(&mut **tx)
-                .await?;
-        } else {
-            sqlx::query("UPDATE crop_scan_state SET covered = ? WHERE library = ?")
-                .bind(&shrunk)
-                .bind(&library)
-                .execute(&mut **tx)
-                .await?;
-        }
-    }
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query("DELETE FROM crop_scan_covered WHERE hash = ?")
+        .bind(hash)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
