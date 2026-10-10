@@ -117,10 +117,6 @@ pub struct StagedFile {
 ///
 /// 临时文件带 `.tmp` 扩展名：崩溃残留由每日对账清理；入库时在同目录内
 /// rename 成正式 blob，避免跨文件系统拷贝。
-/// 把一张图流式下载/复制到 `blobs` 目录旁的临时文件，全程不进内存。
-///
-/// 临时文件带 `.tmp` 扩展名：崩溃残留由每日对账清理；入库时在同目录内
-/// rename 成正式 blob，避免跨文件系统拷贝。
 pub async fn stage_image(segment: &Segment, blobs: &Path) -> Result<StagedFile, FetchError> {
     kovi::tokio::fs::create_dir_all(blobs)
         .await
