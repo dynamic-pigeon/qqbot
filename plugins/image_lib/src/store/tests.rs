@@ -591,7 +591,7 @@ async fn table_count(dir: &std::path::Path, group: i64, table: &str) -> i64 {
     // sqlx 0.9 的 query_scalar 只收 'static str，表名映射成字面量。
     let sql: &'static str = match table {
         "crop_pairs" => "SELECT COUNT(*) FROM crop_pairs",
-        "crop_scan_state" => "SELECT COUNT(*) FROM crop_scan_state",
+        "crop_scan_covered" => "SELECT COUNT(*) FROM crop_scan_covered",
         _ => unreachable!("仅用于配对缓存两张表"),
     };
     let options = sqlx::sqlite::SqliteConnectOptions::new()
@@ -637,7 +637,8 @@ async fn crop_scan_persists_pairs_and_repeats_from_cache() {
         vec![sha256_hex(&whole), sha256_hex(&part)]
     );
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
-    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+    // 覆盖集按成员一行：两张图都在库里。
+    assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 2);
 
     // 重扫：覆盖完整，直接从缓存拼出同一份结果。
     let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
@@ -667,7 +668,9 @@ async fn crop_scan_persists_pairs_and_repeats_from_cache() {
     // 被删哈希由结果重建的 EXISTS 过滤，组随成员消失。
     store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
-    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+    // 逻辑删图不动覆盖集：此时库里有三名成员（整体、局部、无关图），
+    // 行原样保留。
+    assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 3);
     let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
     let after_delete = match plan {
         CropPlan::Complete(groups) => groups,
@@ -707,7 +710,8 @@ async fn reclaimed_blob_shrinks_coverage_so_readd_recomputes() {
     store.delete_hash(group, &sha256_hex(&part)).await.unwrap();
     store.reconcile_all_at(20_000).await;
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
-    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 1);
+    // 被回收哈希的成员行摘除，剩下的整体图仍在覆盖集里。
+    assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 1);
 
     // 同内容图在回收之后加回：不再被覆盖，按增量重算它的对，重新检出。
     add_images(&store, group, "猫", vec![part]).await.unwrap();
@@ -751,7 +755,7 @@ async fn crop_cache_is_wiped_when_invalidation_marker_changes() {
     let reopened = Store::open_with_quota(dir.clone(), u64::MAX).unwrap();
     reopened.stats(group).await.unwrap();
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
-    assert_eq!(table_count(&dir, group, "crop_scan_state").await, 0);
+    assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 0);
     let _ = std::fs::remove_dir_all(dir);
 }
 
