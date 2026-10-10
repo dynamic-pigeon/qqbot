@@ -7,6 +7,8 @@ use kovi::{Message, RuntimeBot};
 use kovi_onebot::{MessageRegistrar as _, OneBotMessage, OnebotTrait};
 use utils::retry::retry_async_with_backoff;
 
+use crate::similar::decode_limited;
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const SEND_RETRIES: usize = 2;
 const HASH_PREFIX_CHARS: usize = 12;
@@ -32,8 +34,6 @@ pub(crate) fn image_message(text: Option<&str>, images: &[&[u8]]) -> Message {
     }
     message
 }
-
-use crate::similar::decode_limited;
 
 /// 按高度从中间横切成上下两半。整图发不出时，两半分开发。
 fn split_image(bytes: &[u8]) -> Option<[Vec<u8>; 2]> {
