@@ -55,19 +55,18 @@ const CROP_AREA_MIN: f64 = 0.15;
 const CROP_AREA_MAX: f64 = 0.9;
 /// 四角允许越出画布的宽容（像素），吸收 JPEG 与量化噪声。
 const CROP_CORNER_MARGIN: f64 = 32.0;
-/// 中心档数。历史上有过用它做哈希预筛的版本——实测对「偏移 + 非等比 +
-/// 保留 <1/3」的裁剪整对漏检（同质风格库里也没有任何更便宜的信号可用），
-/// 预筛已删，检测走全库两两特征匹配；常量保留是因为序列化布局依赖它。
+/// 中心档数。哈希预筛对「偏移 + 非等比 + 保留 <1/3」的裁剪整对漏检，
+/// 同质风格库里也没有更便宜的信号可用，检测走全库两两特征匹配；
+/// 常量保留是因为序列化布局依赖它。
 const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
 /// 裁剪对展示上限，语义同 MAX_MAYBE_GROUPS：防止海量对撑爆查重会话内存。
 const MAX_CROP_PAIRS: usize = 500;
 /// 裁剪配对缓存的算法版本。判据常量或匹配流程一变，缓存的正结果对就
 /// 不再可信；bump 此值让 schema_meta 的失效标记换值，整账弃掉重算。
-/// v4：覆盖集从每库一行的拼接字符串改为每成员一行的行表；knn 换 u8
-/// 量化域 VNNI 内核，RANSAC 迭代上限 500。VNNI 检出与旧判据在真实库
-/// 上逐对一致，仅 RANSAC 随机边界对可能翻面。
-/// v5：配对从单方向改为正反各查一次再合并——query 侧恰好是整体的狠
-/// 裁剪对会漏检，且结果随成员枚举顺序漂移，正结果集变化。
+/// v4：覆盖集是每成员一行的行表；knn 用 u8 量化域 VNNI 内核，RANSAC
+/// 迭代上限 500。
+/// v5：配对正反各查一次再合并——只查单方向时 query 侧恰好是整体的狠
+/// 裁剪对会漏检，且结果随成员枚举顺序漂移。
 pub(crate) const CROP_CACHE_VERSION: &str = "v5";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
@@ -188,8 +187,7 @@ enum MatchSide {
     /// VNNI 点积 dpbusd 是 u8×i8,一侧原值一侧翻转恰好凑出
     /// Σa·(b−128) = a·b − 128·Σa,修正项只依赖 query 行常数 Σa。
     Quantized(QuantizedSide),
-    /// f32 域回退,喂 OpenCV BFMatcher;无 VNNI 的 CPU 走这条路,
-    /// 与旧版行为一致。
+    /// f32 域回退,喂 OpenCV BFMatcher;无 VNNI 的 CPU 走这条路。
     Floats(FloatsSide),
 }
 
@@ -250,10 +248,9 @@ impl MatchSide {
     }
 }
 
-/// VNNI 点积内核:一条指令吃 32/64 维 u8×i8。部署机( Cascade Lake)
-/// 只有 512 位 AVX512-VNNI,桌面平台是 256 位 AVX-VNNI,各实现一份;
-/// trait 单态化保证内核内联进配对循环。u8 域数据量是 f32 的四分之一,
-/// 描述子两两比对的带宽压力随之降四倍——部署机实测整体 2.7×。
+/// VNNI 点积内核:一条指令吃 32/64 维 u8×i8。512 位 AVX512-VNNI 与
+/// 256 位 AVX-VNNI 各实现一份;trait 单态化保证内核内联进配对循环。
+/// u8 域数据量是 f32 的四分之一,描述子两两比对的带宽压力随之降四倍。
 trait DotKernel {
     unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32;
 }
@@ -308,8 +305,8 @@ impl DotKernel for K256 {
     }
 }
 
-/// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。云主机 CPU
-/// flags 有虚报前科,换部署目标时先实测(2026-10-08 当前部署机验证可跑)。
+/// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。CPU flags 在
+/// 虚拟化环境有虚报前科,换部署目标时先实测。
 fn quantized_kernel_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -635,8 +632,8 @@ fn match_crop_pair(
                 // 检测兜底后进 unsafe 外壳,feature 上下文里内核才能内联。
                 // 生产形态由 quantized_kernel_available 把关,两必居一;测试
                 // 可能强设 Quantized,两个都不在时点对留空按无匹配处理,
-                // 不能让 else 兜底跑 avxvnni——无 VNNI 的 CPU(CI runner)
-                // 上那就是 SIGILL。
+                // 不能让 else 兜底跑 avxvnni——无 VNNI 的 CPU 上那就是
+                // SIGILL。
                 if *K512 {
                     unsafe { knn_quantized_avx512(query, train, &mut pts) };
                 } else if *K256 {
@@ -999,7 +996,7 @@ mod tests {
     }
 
     /// 运行时检测只会选中 VNNI 形态，回退路径(BFMatcher)在这里强制
-    /// 走一遍：无 VNNI 的机器（CI runner 等）生产上就是这条路。
+    /// 走一遍：无 VNNI 的机器生产上就是这条路。
     #[test]
     fn crop_detects_on_float_fallback() {
         let base = photo_like(3);
@@ -1021,8 +1018,8 @@ mod tests {
     /// 特征对（描述子一一对应，内聚率 100%）避开随机边界。
     #[test]
     fn quantized_kernel_agrees_with_float_fallback() {
-        // 量化内核要求 CPU 有任一形态的 VNNI;CI runner(AMD,无 VNNI)
-        // 跑不了,跳过——一致性由桌面/部署机本地跑本测试覆盖。
+        // 量化内核要求 CPU 有任一形态的 VNNI,没有则跳过——一致性由
+        // 有 VNNI 的环境跑本测试覆盖。
         if !quantized_kernel_available() {
             return;
         }
