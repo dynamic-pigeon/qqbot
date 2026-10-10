@@ -218,7 +218,7 @@ fn dct1_32(input: &[f64; 32], output: &mut [f64; 32]) {
 
 pub fn hamming(a: &[u64; FINGERPRINT_WORDS], b: &[u64; FINGERPRINT_WORDS]) -> u32 {
     // musl 基线目标不含 popcnt，count_ones 会被编译成软件实现（慢数倍）；
-    // 部署机 CPU 均支持该指令，运行时检测后走硬件路径。
+    // 运行时检测，支持的 CPU 走硬件路径。
     #[cfg(target_arch = "x86_64")]
     {
         static HAS_POPCNT: LazyLock<bool> =
