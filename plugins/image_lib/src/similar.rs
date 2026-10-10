@@ -410,7 +410,9 @@ const CENTER_KEEPS: [u32; 3] = [75, 50, 33];
 const MAX_CROP_PAIRS: usize = 500;
 /// 裁剪配对缓存的算法版本。判据常量或匹配流程一变，缓存的正结果对就
 /// 不再可信；bump 此值让 schema_meta 的失效标记换值，整账弃掉重算。
-pub(crate) const CROP_CACHE_VERSION: &str = "v2";
+/// v3 换代只动存储：覆盖集从每库一行的拼接字符串改为每成员一行，判据
+/// 未变——旧二进制不认识新表，版本交错后同样靠整账弃掉兜底。
+pub(crate) const CROP_CACHE_VERSION: &str = "v3";
 /// SIFT 描述子维度（算法固定值，序列化布局依赖它）。
 const SIFT_DIMS: usize = 128;
 
