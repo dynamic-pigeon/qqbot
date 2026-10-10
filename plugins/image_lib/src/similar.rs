@@ -453,6 +453,18 @@ pub fn fingerprint_and_sift(bytes: &[u8]) -> Option<(Fingerprint, SiftFeatures)>
     Some((fingerprint_image(&image)?, sift_features(&image)?))
 }
 
+/// OpenCV 4.7 起 `SIFT::create` 追加 `enable_precise_upscale` 尾参，按
+/// build.rs 下发的 `opencv_ge_4_7` cfg 分新旧签名。≥4.7 传 false（官方
+/// 默认；true 在 4.10 上实测会让部分裁剪对掉到内聚率阈值之下）。特征与
+/// 4.6 产物不逐位一致，跨版本混算靠 sift 表算法版本整体弃账兜底。
+fn create_sift() -> opencv::Result<opencv::core::Ptr<SIFT>> {
+    #[cfg(opencv_ge_4_7)]
+    let sift = SIFT::create(SIFT_MAX_FEATURES, 3, 0.03, 10.0, 1.0, false);
+    #[cfg(not(opencv_ge_4_7))]
+    let sift = SIFT::create(SIFT_MAX_FEATURES, 3, 0.03, 10.0, 1.0);
+    sift
+}
+
 /// 提取 SIFT 特征。解码限额由 [`decode_limited`] 把关，这里只把灰度像素
 /// 装进 CV_8U Mat，不走 imdecode。
 fn sift_features(image: &DynamicImage) -> Option<SiftFeatures> {
@@ -466,7 +478,7 @@ fn sift_features(image: &DynamicImage) -> Option<SiftFeatures> {
     );
     let mat =
         Mat::new_rows_cols_with_data(SIFT_CANVAS as i32, SIFT_CANVAS as i32, gray.as_raw()).ok()?;
-    let mut sift = SIFT::create(SIFT_MAX_FEATURES, 3, 0.03, 10.0, 1.0).ok()?;
+    let mut sift = create_sift().ok()?;
     let mut keypoints = Vector::<KeyPoint>::new();
     let mut descriptors = Mat::default();
     sift.detect_and_compute(
@@ -878,17 +890,16 @@ fn detect_crops_inner(
                         let (dup_dist, _) =
                             pair_distances(images[i].fingerprint, images[j].fingerprint);
                         // 「重复」距离的对归查重管，不算裁剪。
-                        if dup_dist > duplicate_limit {
-                            if let Some((i_is_part, percent)) =
+                        if dup_dist > duplicate_limit
+                            && let Some((i_is_part, percent)) =
                                 match_crop_pair_both(side_i, side_j, matcher.as_ref())
-                            {
-                                let (whole, part) = if i_is_part {
-                                    (&images[j].hash, &images[i].hash)
-                                } else {
-                                    (&images[i].hash, &images[j].hash)
-                                };
-                                shard.push(crop_group(whole, part, percent));
-                            }
+                        {
+                            let (whole, part) = if i_is_part {
+                                (&images[j].hash, &images[i].hash)
+                            } else {
+                                (&images[i].hash, &images[j].hash)
+                            };
+                            shard.push(crop_group(whole, part, percent));
                         }
                     }
                     i += workers;
@@ -1494,11 +1505,7 @@ mod tests {
             match_crop_pair_both(&side_p, &side_w, matcher.as_ref()).expect("merged swapped");
         // swapped 的 bool 指 side_p（它的第一个参数）是否为局部，换回
         // w 的坐标系后再比较。
-        assert_eq!(
-            (!swapped.0, swapped.1),
-            merged,
-            "合并结果与调用顺序无关"
-        );
+        assert_eq!((!swapped.0, swapped.1), merged, "合并结果与调用顺序无关");
     }
 
     /// 全库检测的结果不随成员枚举顺序变化——单方向版里 query 角色由
