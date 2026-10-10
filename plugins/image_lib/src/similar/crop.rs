@@ -630,10 +630,16 @@ fn match_crop_pair(
             {
                 static K512: LazyLock<bool> =
                     LazyLock::new(|| std::arch::is_x86_feature_detected!("avx512vnni"));
+                static K256: LazyLock<bool> =
+                    LazyLock::new(|| std::arch::is_x86_feature_detected!("avxvnni"));
                 // 检测兜底后进 unsafe 外壳,feature 上下文里内核才能内联。
+                // 生产形态由 quantized_kernel_available 把关,两必居一;测试
+                // 可能强设 Quantized,两个都不在时点对留空按无匹配处理,
+                // 不能让 else 兜底跑 avxvnni——无 VNNI 的 CPU(CI runner)
+                // 上那就是 SIGILL。
                 if *K512 {
                     unsafe { knn_quantized_avx512(query, train, &mut pts) };
-                } else {
+                } else if *K256 {
                     unsafe { knn_quantized_avxvnni(query, train, &mut pts) };
                 }
             }
@@ -1015,6 +1021,11 @@ mod tests {
     /// 特征对（描述子一一对应，内聚率 100%）避开随机边界。
     #[test]
     fn quantized_kernel_agrees_with_float_fallback() {
+        // 量化内核要求 CPU 有任一形态的 VNNI;CI runner(AMD,无 VNNI)
+        // 跑不了,跳过——一致性由桌面/部署机本地跑本测试覆盖。
+        if !quantized_kernel_available() {
+            return;
+        }
         let whole_sift = manual_whole();
         let part_sift = manual_part();
         let verdicts = [true, false].map(|quantized| {
