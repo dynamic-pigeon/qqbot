@@ -1,4 +1,4 @@
-// SIFT::create 自 OpenCV 4.7 起追加 enable_precise_upscale 尾参，similar.rs
+// SIFT::create 自 OpenCV 4.7 起追加 enable_precise_upscale 尾参，similar/crop.rs
 // 按这里下发的 cfg 分新旧两个签名。pkg-config 探测失败时不发 cfg，按 4.6
 // 旧签名编译（CI 与部署 chroot 的口径）。
 fn main() {

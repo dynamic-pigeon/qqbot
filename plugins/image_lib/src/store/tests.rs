@@ -1,4 +1,5 @@
 use super::backup::{RETAINED_DAYS, date_string};
+use super::derive::is_large_blob;
 use super::*;
 use kovi::tokio;
 use utils::sha256_hex;
@@ -517,7 +518,7 @@ fn weight_halves_per_extra_draw() {
     assert_eq!(weight(min + 13, min), 1);
 }
 
-/// 块状噪声图：与 similar.rs 的测试 fixture 同思路，块角能提出 SIFT 特征。
+/// 块状噪声图：与 similar/crop.rs 的测试 fixture 同思路，块角能提出 SIFT 特征。
 fn blocky_png(seed: u32) -> Vec<u8> {
     use image::{DynamicImage, Rgb, RgbImage};
     let control = |gx: u32, gy: u32, slot: u32| -> f64 {
@@ -545,7 +546,7 @@ fn blocky_png(seed: u32) -> Vec<u8> {
     buf.into_inner()
 }
 
-/// 与 similar.rs 的 photo_like 同思路：块角是强角点、各角邻域梯度组合互不
+/// 与 similar/crop.rs 的 photo_like 同思路：块角是强角点、各角邻域梯度组合互不
 /// 相同，中心裁剪能被 SIFT 检出；纯块状噪声的角点描述子彼此同构，检不出。
 fn photo_like_jpeg(seed: u32, keep_percent: Option<u32>) -> Vec<u8> {
     use image::{ImageEncoder, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
