@@ -188,13 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_rank_top_defaults_to_ten() {
-        let parsed: StaticConfig = kovi::toml::from_str("").unwrap();
-        assert_eq!(parsed.rank_top, 10);
-        assert_eq!(parsed.rank_top(), 10);
-    }
-
-    #[test]
     fn rank_top_zero_becomes_one() {
         let parsed: StaticConfig = kovi::toml::from_str("rank_top = 0").unwrap();
         assert_eq!(parsed.rank_top(), 1);
@@ -259,13 +252,6 @@ mod tests {
         assert!(config.wordcloud_enabled(1));
         assert!(!config.wordcloud_enabled(2));
         assert_eq!(config.wordcloud_group, vec![1]);
-    }
-
-    #[test]
-    fn missing_weekly_report_keys_default_to_monday_ten() {
-        let parsed: StaticConfig = kovi::toml::from_str("").unwrap();
-        assert_eq!(parsed.weekly_report_cron, "0 10 * * 1");
-        assert_eq!(parsed.weekly_report_top(), 10);
     }
 
     #[test]

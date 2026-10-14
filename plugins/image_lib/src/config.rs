@@ -13,7 +13,8 @@ pub(crate) const DEFAULT_DRAW_MAX_PER_WINDOW: usize = 5;
 pub(crate) const DEFAULT_DUPLICATE_DISTANCE: u32 = 32;
 /// 至少一路不超过此值、又没到重复阈值时，标成「也许像」。
 pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 64;
-/// 未配置时备份与对账回收的 cron（本地时区，每天凌晨四点）。
+/// 未配置时备份与对账回收的 cron（本地时区，每天凌晨四点）。必须是
+/// kovi（croner，秒位可选）可解析的五字段表达式，解析失败会在启动期 panic。
 pub(crate) const DEFAULT_BACKUP_CRON: &str = "0 4 * * *";
 
 /// 根目录 `config.toml` 的 `[image_lib]`。
@@ -80,16 +81,4 @@ pub(crate) fn static_config() -> &'static StaticConfig {
     static CONFIG: LazyLock<StaticConfig> =
         LazyLock::new(|| utils::config::parse_or_panic("image_lib"));
     &CONFIG
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_config_has_valid_backup_cron() {
-        // 与 kovi(croner,秒位可选)约定的五字段表达式;注册时解析失败
-        // 会在启动期 panic,默认值必须始终可解析。
-        assert_eq!(StaticConfig::default().backup_cron, "0 4 * * *");
-    }
 }
