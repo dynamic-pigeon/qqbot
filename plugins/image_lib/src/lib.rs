@@ -19,6 +19,13 @@ use store::Store;
 
 #[kovi::plugin]
 async fn main() {
+    // OpenCV 全局线程池恒为单线程：配对分片线程已按核数打满，匹配器
+    // 内部的 parallel_for 再起线程池只会嵌套超订阅；解码管道按图并行。
+    // 全局线程数不能在有并发 OpenCV 活动时更改（会与 parallel_for 竞争
+    // 死锁），只在插件启动、任何图像活动之前设这一次。
+    if let Err(e) = opencv::core::set_num_threads(1) {
+        tracing::warn!("OpenCV 线程池设为单线程失败: {e}");
+    }
     let image_config = config::static_config();
     let bot = plugin::get_runtime_bot();
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));

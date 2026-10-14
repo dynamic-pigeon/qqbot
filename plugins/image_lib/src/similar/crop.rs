@@ -431,27 +431,6 @@ fn knn_opencv(
     }
 }
 
-/// 把 OpenCV 全局线程池压到单线程的守卫。配对分片线程已经打满核，
-/// 匹配器内部的 parallel_for 再起线程池只会嵌套超订阅互相踩；提取等
-/// 非配对路径仍要原来的并行度，离开作用域时恢复原值。
-struct SingleThreadGuard(Option<i32>);
-
-impl SingleThreadGuard {
-    fn new() -> Self {
-        let saved = opencv::core::get_num_threads().ok();
-        let _ = opencv::core::set_num_threads(1);
-        Self(saved)
-    }
-}
-
-impl Drop for SingleThreadGuard {
-    fn drop(&mut self) {
-        if let Some(saved) = self.0 {
-            let _ = opencv::core::set_num_threads(saved);
-        }
-    }
-}
-
 /// 全库裁剪两两检测。已是「重复」距离的图对跳过（归查重管）；输出组固定
 /// 两张：hashes[0] 是整体、hashes[1] 是局部。`covered` 是已比对过的图集合，
 /// 两端都在其中的对直接跳过——配对缓存的增量补算靠它只跑有新端点的对。
@@ -489,7 +468,6 @@ fn detect_crops_inner(
         .iter()
         .map(|image| MatchSide::new(&image.sift, quantized))
         .collect();
-    let _single_thread = SingleThreadGuard::new();
     let workers = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(4)
@@ -952,7 +930,8 @@ mod tests {
     #[test]
     #[ignore = "基准测试，手动跑"]
     fn bench_crop_pair_kernel() {
-        let _guard = SingleThreadGuard::new();
+        // 测试进程不走插件 main 的全局设置，基准自行压到单线程去抖。
+        let _ = opencv::core::set_num_threads(1);
         let quantized = quantized_kernel_available();
         let side = |seed: usize| {
             let mut descriptors = vec![[0u8; SIFT_DIMS]; CROP_MATCH_FEATURES];
