@@ -1,12 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
 
-use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, serde_json::json};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use serde::Deserialize;
@@ -58,23 +54,14 @@ pub fn init() {
     .unwrap();
 }
 
-/// 轮询防重入标记：上一轮还没跑完时直接跳过本轮。
-static POLL_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// 提前 return 时也能复位 [`POLL_RUNNING`]。
-struct PollGuard;
-
-impl Drop for PollGuard {
-    fn drop(&mut self) {
-        POLL_RUNNING.store(false, Ordering::Release);
-    }
-}
+/// 轮询防重入：上一轮还没跑完时直接跳过本轮。
+static POLL_LOCK: kovi::tokio::sync::Mutex<()> = kovi::tokio::sync::Mutex::const_new(());
 
 async fn scheduled_task(map: Arc<Mutex<HashMap<u64, bool>>>, bot: Arc<kovi::RuntimeBot>) {
-    if POLL_RUNNING.swap(true, Ordering::AcqRel) {
+    let Ok(_poll_guard) = POLL_LOCK.try_lock() else {
+        tracing::warn!("上一轮直播轮询尚未结束，跳过本轮");
         return;
-    }
-    let _guard = PollGuard;
+    };
 
     let cfg = config::CONFIG.get();
 
@@ -147,7 +134,19 @@ async fn notify(
     let img = if info.cover_from_user.is_empty() {
         Default::default()
     } else {
-        match retry_async(async || fetch_img(&info.cover_from_user).await, 3).await {
+        match retry_async(
+            async || {
+                crate::image::fetch_bili_image_bytes(
+                    &info.cover_from_user,
+                    10 * 1024 * 1024,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            },
+            3,
+        )
+        .await
+        {
             Ok(img) => img,
             Err(_) => {
                 tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
@@ -187,16 +186,6 @@ async fn notify(
             tracing::warn!("直播通知发送失败 group={group}: {e}");
         }
     }
-}
-
-async fn fetch_img(url: &str) -> anyhow::Result<Bytes> {
-    let bytes = crate::image::download_bili_image(
-        url,
-        10 * 1024 * 1024,
-        std::time::Duration::from_secs(10),
-    )
-    .await?;
-    Ok(Bytes::from(bytes))
 }
 
 pub async fn check_uid(uid: u64) -> bool {
