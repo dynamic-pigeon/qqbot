@@ -274,36 +274,49 @@ async fn handle_crop_scan(
             .await
         }
         CropOp::Next { name } => {
-            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
-            show_scan_group(
-                &ctx,
-                store,
-                scans,
-                group_id,
-                &canonical,
-                &key,
-                None,
-                false,
-                "查裁剪",
-            )
-            .await
+            resume_scan(&ctx, store, scans, group_id, user_id, name, None, "查裁剪").await
         }
         CropOp::Jump { name, index } => {
-            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
-            show_scan_group(
+            resume_scan(
                 &ctx,
                 store,
                 scans,
                 group_id,
-                &canonical,
-                &key,
+                user_id,
+                name,
                 Some(index),
-                false,
                 "查裁剪",
             )
             .await
         }
     }
+}
+
+/// 恢复进行中的扫描会话并展示对应页；`jump` 是组号，`None` 表示翻下一组。
+#[allow(clippy::too_many_arguments)]
+async fn resume_scan(
+    ctx: &CommandContext,
+    store: &Store,
+    scans: &ScanSessions,
+    group_id: i64,
+    user_id: i64,
+    name: &str,
+    jump: Option<usize>,
+    command_hint: &str,
+) -> CommandResult {
+    let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
+    show_scan_group(
+        ctx,
+        store,
+        scans,
+        group_id,
+        &canonical,
+        &key,
+        jump,
+        false,
+        command_hint,
+    )
+    .await
 }
 
 fn parse_hash_prefix(raw: &str) -> Result<String, CommandError> {
@@ -526,10 +539,7 @@ async fn handle_delete(
                     ));
                     Ok(())
                 }
-                Err(StoreError::LibraryMissing) => {
-                    Err(CommandError::user(format!("「{name}」不存在")))
-                }
-                Err(error) => Err(map_store_user_error(error)),
+                Err(error) => Err(missing_library(name, error)),
             }
         }
     }
@@ -596,8 +606,7 @@ async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) ->
             ));
             Ok(())
         }
-        Err(StoreError::ImageMissing) => Err(CommandError::user("没有这张图")),
-        Err(error) => Err(CommandError::internal(error)),
+        Err(error) => Err(map_store_user_error(error)),
     }
 }
 
@@ -698,23 +707,17 @@ async fn handle_scan(ctx: CommandContext, store: &Store, scans: &ScanSessions) -
             .await
         }
         ScanOp::Next { name } => {
-            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
-            show_scan_group(
-                &ctx, store, scans, group_id, &canonical, &key, None, false, "查重",
-            )
-            .await
+            resume_scan(&ctx, store, scans, group_id, user_id, name, None, "查重").await
         }
         ScanOp::Jump { name, index } => {
-            let (canonical, key) = open_scan_key(store, group_id, user_id, name).await?;
-            show_scan_group(
+            resume_scan(
                 &ctx,
                 store,
                 scans,
                 group_id,
-                &canonical,
-                &key,
+                user_id,
+                name,
                 Some(index),
-                false,
                 "查重",
             )
             .await
@@ -809,23 +812,7 @@ async fn show_scan_group(
                 total: group_total,
             }) => {
                 total = group_total;
-                // 组员全读会把大组放大成数百 MiB 常驻；超预算即止并提示「仅列部分」。
-                let mut budget = MAX_GROUP_READ_BYTES;
-                let mut read_cut = false;
-                let mut images = Vec::new();
-                for hash in &group.hashes {
-                    if budget == 0 {
-                        read_cut = true;
-                        break;
-                    }
-                    if let Ok(bytes) = store.read_blob(group_id, hash).await {
-                        budget = budget.saturating_sub(bytes.len());
-                        images.push(PackedImage {
-                            hash: hash.clone(),
-                            bytes,
-                        });
-                    }
-                }
+                let (images, read_cut) = read_group_images(store, group_id, &group.hashes).await;
                 if images.len() < 2 {
                     if from_jump && page.is_empty() {
                         ctx.reply(format!("第 {index} 组不足两张，可能已经删过了"));
@@ -844,6 +831,32 @@ async fn show_scan_group(
         }
     }
     reply_scan_page(ctx, library, page, total).await
+}
+
+/// 在 [`MAX_GROUP_READ_BYTES`] 预算内逐张读入组员图片；预算耗尽即止，
+/// 返回是否被预算截断（组员全读会把大组放大成数百 MiB 常驻）。
+async fn read_group_images(
+    store: &Store,
+    group_id: i64,
+    hashes: &[String],
+) -> (Vec<PackedImage>, bool) {
+    let mut budget = MAX_GROUP_READ_BYTES;
+    let mut read_cut = false;
+    let mut images = Vec::new();
+    for hash in hashes {
+        if budget == 0 {
+            read_cut = true;
+            break;
+        }
+        if let Ok(bytes) = store.read_blob(group_id, hash).await {
+            budget = budget.saturating_sub(bytes.len());
+            images.push(PackedImage {
+                hash: hash.clone(),
+                bytes,
+            });
+        }
+    }
+    (images, read_cut)
 }
 
 async fn reply_scan_page(
