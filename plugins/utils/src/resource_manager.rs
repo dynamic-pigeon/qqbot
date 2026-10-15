@@ -144,15 +144,7 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
 
         debug!("resource manager: building resource");
         let resource = Arc::new((self.inner.builder)().await?);
-        let mut state = lock_state(&self.inner.state);
-        state.cancel_cleanup();
-        state.resource = Some(Arc::clone(&resource));
-        state.generation = state.generation.wrapping_add(1);
-        Ok(ManagedResource {
-            resource: Some(resource),
-            manager: Arc::downgrade(&self.inner),
-            runtime,
-        })
+        Ok(self.publish_new_resource(resource, runtime))
     }
 
     /// 让缓存实例失效、等旧实例销毁完成后构建新实例返回。
@@ -214,15 +206,21 @@ impl<T: Send + Sync + 'static> ResourceManager<T> {
         }
 
         let new_resource = Arc::new((self.inner.builder)().await?);
+        Ok(self.publish_new_resource(new_resource, runtime))
+    }
+
+    /// 把刚构建的实例写进缓存并取消挂起的清理，返回持有它的 lease。
+    /// generation 递增让旧实例 cleanup 任务因编号不匹配而退出。
+    fn publish_new_resource(&self, resource: Arc<T>, runtime: Handle) -> ManagedResource<T> {
         let mut state = lock_state(&self.inner.state);
         state.cancel_cleanup();
-        state.resource = Some(Arc::clone(&new_resource));
+        state.resource = Some(Arc::clone(&resource));
         state.generation = state.generation.wrapping_add(1);
-        Ok(ManagedResource {
-            resource: Some(new_resource),
+        ManagedResource {
+            resource: Some(resource),
             manager: Arc::downgrade(&self.inner),
             runtime,
-        })
+        }
     }
 
     fn acquire_cached(&self, runtime: &Handle) -> Option<ManagedResource<T>> {

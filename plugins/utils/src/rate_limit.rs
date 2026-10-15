@@ -36,19 +36,6 @@ impl<K: Eq + Hash> RateLimiter<K> {
         }
     }
 
-    /// 只检查、不记账。用来在做重活之前先拒绝已经打满的 key。
-    pub fn check(&self, key: &K) -> Result<(), RateLimitHit> {
-        let mut map = self.lock();
-        let now = Instant::now();
-        prune(&mut map, now, self.window);
-        if let Some(times) = map.get(key)
-            && times.len() >= self.max_per_window
-        {
-            return Err(hit(times, now, self.window));
-        }
-        Ok(())
-    }
-
     /// 窗口内还有名额则记一次并放行；否则返回还要等多久。
     pub fn try_acquire(&self, key: K) -> Result<(), RateLimitHit> {
         let mut map = self.lock();
@@ -114,14 +101,5 @@ mod tests {
         let limiter = RateLimiter::<u8>::new(Duration::from_secs(1), 0);
         assert!(limiter.try_acquire(1).is_ok());
         assert!(limiter.try_acquire(1).is_err());
-    }
-
-    #[test]
-    fn check_does_not_consume_a_slot() {
-        let limiter = RateLimiter::new(Duration::from_secs(60), 1);
-        assert!(limiter.check(&1).is_ok());
-        assert!(limiter.check(&1).is_ok());
-        assert!(limiter.try_acquire(1).is_ok());
-        assert!(limiter.check(&1).is_err());
     }
 }
