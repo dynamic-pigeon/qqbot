@@ -13,8 +13,8 @@ use kovi::tokio::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rand::seq::IndexedRandom;
+use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
 
 use crate::similar::{
     HashedImage, SiftableImage, SimilarGroup, assemble_crop_groups, crop_group, detect_crops,
@@ -33,12 +33,15 @@ mod tests;
 use blob_fs::{blob_file, blob_hashes_on_disk, is_hash_prefix, promote_staged, remove_unindexed};
 use derive::derive_missing;
 use repo::{
-    additional_unique_bytes, backed_up_hashes, crop_covered, delete_covered_for_hash,
-    delete_crop_pairs_for_hash, delete_fingerprint, delete_sift, hash_still_used,
-    insert_crop_pairs, insert_fingerprints, insert_images, insert_sifts, library_crop_pairs,
-    library_exists, library_fingerprints, library_hashes, library_sifts, merge_library,
-    prune_dangling_aliases, purge_expired_backup_refs, resolve_library, save_crop_covered,
-    unique_image_bytes, upsert_alias,
+    additional_unique_bytes, alias_pairs, alias_target, backed_up_hashes, bump_draw_count,
+    crop_covered, delete_alias, delete_covered_for_hash, delete_crop_pairs_for_hash,
+    delete_derived_exclusive_to, delete_fingerprint, delete_image_rows, delete_sift,
+    hash_still_used, hashes_by_prefix, indexed_hashes, insert_crop_pairs, insert_fingerprints,
+    insert_images, insert_sifts, library_crop_pairs, library_draw_items, library_exists,
+    library_fingerprints, library_hashes, library_sifts, library_size, library_size_rows,
+    merge_library, prune_dangling_aliases, prune_derived_not_referenced, purge_expired_backup_refs,
+    resolve_library, save_crop_covered, unique_image_bytes, unique_image_count, upsert_alias,
+    wipe_library_rows,
 };
 use schema::init_schema;
 
@@ -307,12 +310,7 @@ impl Store {
     /// 成为孤儿，由每日对账在备份保护期之外统一回收，误删的保护期内可恢复。
     pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
         self.with_group(group_id, |pool| async move {
-            let mut libraries = sqlx::query_scalar::<_, String>(
-                "DELETE FROM images WHERE hash = ? RETURNING library",
-            )
-            .bind(hash)
-            .fetch_all(&pool)
-            .await?;
+            let mut libraries = delete_image_rows(&pool, hash).await?;
             if libraries.is_empty() {
                 return Err(StoreError::ImageMissing);
             }
@@ -340,17 +338,10 @@ impl Store {
     ) -> Result<LibraryOverview, StoreError> {
         self.with_group(group_id, |pool| async move {
             let canonical = resolve_library(&pool, name).await?;
-            let row = sqlx::query(
-                "SELECT COUNT(*) AS count, SUM(size) AS bytes FROM images WHERE library = ?",
-            )
-            .bind(&canonical)
-            .fetch_one(&pool)
-            .await?;
-            let count = row.try_get::<i64, _>("count")? as usize;
+            let (count, bytes) = library_size(&pool, &canonical).await?;
             if count == 0 {
                 return Err(StoreError::LibraryMissing);
             }
-            let bytes = row.try_get::<Option<i64>, _>("bytes")?.unwrap_or(0) as u64;
             Ok(LibraryOverview {
                 canonical,
                 count,
@@ -381,43 +372,10 @@ impl Store {
             return Err(StoreError::LibraryMissing);
         }
         let mut tx = pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM perceptual WHERE hash IN (
-                 SELECT mine.hash FROM images AS mine
-                 WHERE mine.library = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM images AS other
-                       WHERE other.hash = mine.hash AND other.library != mine.library
-                   )
-             )",
-        )
-        .bind(canonical)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "DELETE FROM sift WHERE hash IN (
-                 SELECT mine.hash FROM images AS mine
-                 WHERE mine.library = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM images AS other
-                       WHERE other.hash = mine.hash AND other.library != mine.library
-                   )
-             )",
-        )
-        .bind(canonical)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM images WHERE library = ?")
-            .bind(canonical)
-            .execute(&mut *tx)
-            .await?;
+        delete_derived_exclusive_to(&mut tx, canonical).await?;
         // 覆盖标记与正结果对都保留：库清空后标记惰性无害（成员为空），
         // 用同批图重建时依然全命中；blob 被对账回收时才收缩。
-        sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
-            .bind(canonical)
-            .bind(canonical)
-            .execute(&mut *tx)
-            .await?;
+        wipe_library_rows(&mut tx, canonical).await?;
         tx.commit().await?;
         Ok(canonical.to_owned())
     }
@@ -425,29 +383,11 @@ impl Store {
     pub async fn pick_random(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
             let library = resolve_library(&pool, name).await?;
-            let rows = sqlx::query("SELECT hash, draw_count FROM images WHERE library = ?")
-                .bind(&library)
-                .fetch_all(&pool)
-                .await?;
-            let items = rows
-                .into_iter()
-                .map(|row| {
-                    Ok((
-                        row.try_get::<String, _>("hash")?,
-                        row.try_get::<i64, _>("draw_count")?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, sqlx::Error>>()?;
+            let items = library_draw_items(&pool, &library).await?;
             let hash = pick_weighted(&items)
                 .map(str::to_owned)
                 .ok_or(StoreError::LibraryEmpty)?;
-            sqlx::query(
-                "UPDATE images SET draw_count = draw_count + 1 WHERE library = ? AND hash = ?",
-            )
-            .bind(&library)
-            .bind(&hash)
-            .execute(&pool)
-            .await?;
+            bump_draw_count(&pool, &library, &hash).await?;
             Ok(hash)
         })
         .await
@@ -470,11 +410,7 @@ impl Store {
             }
 
             let alias_is_library = library_exists(&pool, alias).await?;
-            let existing_target =
-                sqlx::query_scalar::<_, String>("SELECT target FROM aliases WHERE alias = ?")
-                    .bind(alias)
-                    .fetch_optional(&pool)
-                    .await?;
+            let existing_target = alias_target(&pool, alias).await?;
 
             if !merge {
                 if alias_is_library {
@@ -493,11 +429,7 @@ impl Store {
                         target: existing_target,
                     });
                 }
-                sqlx::query("INSERT INTO aliases (alias, target) VALUES (?, ?)")
-                    .bind(alias)
-                    .bind(&canonical)
-                    .execute(&pool)
-                    .await?;
+                upsert_alias(&pool, alias, &canonical).await?;
                 return Ok(AliasResult {
                     canonical,
                     merged_from: None,
@@ -541,11 +473,7 @@ impl Store {
 
     pub async fn remove_alias(&self, group_id: i64, alias: &str) -> Result<(), StoreError> {
         self.with_group(group_id, |pool| async move {
-            let result = sqlx::query("DELETE FROM aliases WHERE alias = ?")
-                .bind(alias)
-                .execute(&pool)
-                .await?;
-            if result.rows_affected() == 0 {
+            if delete_alias(&pool, alias).await? == 0 {
                 return Err(StoreError::AliasMissing(alias.to_owned()));
             }
             Ok(())
@@ -555,37 +483,21 @@ impl Store {
 
     pub async fn stats(&self, group_id: i64) -> Result<GroupStats, StoreError> {
         self.with_group(group_id, |pool| async move {
-            let rows = sqlx::query(
-                "SELECT library, COUNT(*) AS count, SUM(size) AS bytes
-                 FROM images GROUP BY library ORDER BY library",
-            )
-            .fetch_all(&pool)
-            .await?;
-            let alias_rows = sqlx::query("SELECT alias, target FROM aliases ORDER BY alias")
-                .fetch_all(&pool)
-                .await?;
+            let rows = library_size_rows(&pool).await?;
             let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for row in alias_rows {
-                let alias: String = row.try_get("alias")?;
-                let target: String = row.try_get("target")?;
+            for (alias, target) in alias_pairs(&pool).await? {
                 aliases.entry(target).or_default().push(alias);
             }
             let libraries = rows
                 .into_iter()
-                .map(|row| {
-                    let name: String = row.try_get("library")?;
-                    Ok(LibraryStat {
-                        aliases: aliases.remove(&name).unwrap_or_default(),
-                        name,
-                        count: row.try_get::<i64, _>("count")? as usize,
-                        bytes: row.try_get::<i64, _>("bytes")? as u64,
-                    })
+                .map(|(name, count, bytes)| LibraryStat {
+                    aliases: aliases.remove(&name).unwrap_or_default(),
+                    name,
+                    count: count as usize,
+                    bytes: bytes as u64,
                 })
-                .collect::<Result<Vec<_>, sqlx::Error>>()?;
-            let unique_count =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT hash) FROM images")
-                    .fetch_one(&pool)
-                    .await? as usize;
+                .collect();
+            let unique_count = unique_image_count(&pool).await?;
             let unique_bytes = unique_image_bytes(&pool).await?;
             Ok(GroupStats {
                 libraries,
@@ -608,12 +520,7 @@ impl Store {
         }
         self.with_group(group_id, |pool| async move {
             let pattern = format!("{prefix}%");
-            let hashes = sqlx::query_scalar::<_, String>(
-                "SELECT DISTINCT hash FROM images WHERE hash LIKE ? ESCAPE '\\'",
-            )
-            .bind(&pattern)
-            .fetch_all(&pool)
-            .await?;
+            let hashes = hashes_by_prefix(&pool, &pattern).await?;
             match hashes.as_slice() {
                 [hash] => Ok(hash.clone()),
                 [] => Err(StoreError::ImageMissing),
@@ -938,11 +845,7 @@ impl Store {
 
             let disk = blob_hashes_on_disk(&blobs).await?;
 
-            let indexed: HashSet<String> = sqlx::query_scalar("SELECT DISTINCT hash FROM images")
-                .fetch_all(&pool)
-                .await?
-                .into_iter()
-                .collect();
+            let indexed = indexed_hashes(&pool).await?;
 
             let mut removed_files = 0u64;
             // blob 物理消失的哈希（这里删掉孤儿文件，或下面索引指向但盘上
@@ -965,27 +868,12 @@ impl Store {
             let mut removed_rows = 0u64;
             for hash in indexed.difference(&disk) {
                 reclaimed.insert(hash.clone());
-                let result = sqlx::query("DELETE FROM images WHERE hash = ?")
-                    .bind(hash)
-                    .execute(&mut *tx)
-                    .await?;
-                removed_rows += result.rows_affected();
+                removed_rows += delete_image_rows(&mut *tx, hash).await?.len() as u64;
             }
             if removed_rows > 0 {
-                sqlx::query(
-                    "DELETE FROM aliases WHERE target NOT IN (SELECT DISTINCT library FROM images)",
-                )
-                .execute(&mut *tx)
-                .await?;
+                prune_dangling_aliases(&mut *tx).await?;
             }
-            sqlx::query(
-                "DELETE FROM perceptual WHERE hash NOT IN (SELECT DISTINCT hash FROM images)",
-            )
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("DELETE FROM sift WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
-                .execute(&mut *tx)
-                .await?;
+            prune_derived_not_referenced(&mut tx).await?;
             for hash in &reclaimed {
                 delete_crop_pairs_for_hash(&mut *tx, hash).await?;
                 delete_covered_for_hash(&mut *tx, hash).await?;
