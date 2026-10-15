@@ -2,10 +2,11 @@ mod browser;
 mod fetch;
 mod types;
 
+pub(crate) use fetch::DEFAULT_USER_AGENT;
 pub use fetch::fetch_user_dynamics;
 pub use types::{DynamicAuthor, DynamicItem, Pic, RichText};
 
-/// B 站动态 / 封面图片域名白名单，用于 `validate_image_url_async` 的 SSRF 防御。
+/// B 站动态 / 封面图片域名白名单，用于 `validate_image_url` 的 SSRF 防御。
 pub const ALLOWED_BILI_HOSTS: &[&str] = &["bilibili.com", "hdslb.com"];
 
 /// 启动期触发预解析 SPACE_FEED_URL，确保硬编码 URL 被损坏时立即 panic
@@ -209,42 +210,25 @@ pub async fn fetch_recent(uid: u64, count: usize) -> anyhow::Result<Vec<DynamicI
 pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
     let mut changed = false;
     config::CONFIG.modify(|cfg| {
-        if let Some(s) = cfg.dynamic_subscribe.iter_mut().find(|s| s.uid == uid) {
-            if !s.groups.contains(&group) {
-                s.groups.push(group);
-                changed = true;
-            }
-        } else {
-            cfg.dynamic_subscribe.push(crate::config::Subscribe {
-                uid,
-                groups: vec![group],
-            });
-            changed = true;
-        }
+        changed = config::upsert_subscribe_group(&mut cfg.dynamic_subscribe, uid, group);
     })?;
     Ok(changed)
 }
 
 pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
     config::CONFIG.modify(|cfg| {
-        if let Some(idx) = cfg.dynamic_subscribe.iter().position(|s| s.uid == uid) {
-            let s = &mut cfg.dynamic_subscribe[idx];
-            s.groups.retain(|g| *g != group);
-            if s.groups.is_empty() {
-                cfg.dynamic_subscribe.remove(idx);
-            }
-        }
+        config::remove_subscribe_group(&mut cfg.dynamic_subscribe, uid, group);
         cfg.dynamic_checkpoints
             .retain(|checkpoint| checkpoint.uid != uid || checkpoint.group != group);
     })
 }
 
-pub fn list_subscribes(group: i64) -> Vec<(u64, String)> {
+pub fn list_subscribes(group: i64) -> Vec<u64> {
     let cfg = config::CONFIG.get();
     cfg.dynamic_subscribe
         .iter()
         .filter(|s| s.groups.contains(&group))
-        .map(|s| (s.uid, String::new()))
+        .map(|s| s.uid)
         .collect()
 }
 
@@ -263,7 +247,13 @@ pub async fn push_dynamic(
 
     let mut images: Vec<Bytes> = Vec::new();
     for src in &sent {
-        match fetch_image(src).await {
+        match crate::image::fetch_bili_image_bytes(
+            src,
+            MAX_DYNAMIC_IMAGE_BYTES,
+            Duration::from_secs(15),
+        )
+        .await
+        {
             Ok(bytes) => images.push(bytes),
             Err(e) => tracing::warn!("拉取动态图片失败 {}: {e}", src),
         }
@@ -344,15 +334,8 @@ fn format_author_header(author: &DynamicAuthor) -> String {
     }
 }
 
-async fn fetch_image(url: &str) -> anyhow::Result<Bytes> {
-    const MAX_DYNAMIC_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-    let bytes =
-        crate::image::download_bili_image(url, MAX_DYNAMIC_IMAGE_BYTES, Duration::from_secs(15))
-            .await?;
-    Ok(Bytes::from(bytes))
-}
-
 const MAX_PICS_PER_PUSH: usize = 3;
+const MAX_DYNAMIC_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn collect_pics(item: &DynamicItem) -> Vec<String> {
     let raw: Vec<String> = match item {

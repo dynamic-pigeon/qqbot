@@ -151,6 +151,14 @@ pub(crate) fn render_command_error(error: &CommandError, usage: &str) -> String 
     }
 }
 
+/// 用户是否在 bot 管理员名单内。
+pub(crate) fn user_is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
+    bot.get_all_admin()
+        .unwrap_or_default()
+        .iter()
+        .any(|id| id.try_as_i64() == Some(user_id))
+}
+
 #[derive(Clone)]
 pub struct CommandContext {
     event: Arc<MsgEvent>,
@@ -229,11 +237,7 @@ impl CommandContext {
     }
 
     pub fn is_admin(&self) -> bool {
-        self.bot
-            .get_all_admin()
-            .unwrap_or_default()
-            .iter()
-            .any(|id| id.try_as_i64() == Some(self.event.user_id))
+        user_is_bot_admin(&self.bot, self.event.user_id)
     }
 
     pub fn require_admin(&self) -> Result<(), CommandError> {

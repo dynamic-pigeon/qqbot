@@ -24,11 +24,20 @@ fn unpack_words(bytes: &[u8]) -> Option<[u64; FINGERPRINT_WORDS]> {
 }
 
 pub(super) async fn resolve_library(pool: &SqlitePool, name: &str) -> Result<String, StoreError> {
+    let target = alias_target(pool, name).await?;
+    Ok(target.unwrap_or_else(|| name.to_owned()))
+}
+
+/// 别名当前指向的规范库名；没有该别名行时为 None。
+pub(super) async fn alias_target(
+    pool: &SqlitePool,
+    alias: &str,
+) -> Result<Option<String>, StoreError> {
     let target = sqlx::query_scalar::<_, String>("SELECT target FROM aliases WHERE alias = ?")
-        .bind(name)
+        .bind(alias)
         .fetch_optional(pool)
         .await?;
-    Ok(target.unwrap_or_else(|| name.to_owned()))
+    Ok(target)
 }
 
 pub(super) async fn library_exists(pool: &SqlitePool, name: &str) -> Result<bool, StoreError> {
@@ -225,10 +234,7 @@ pub(super) async fn save_crop_covered(
     covered: &[String],
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM crop_scan_covered WHERE library = ?")
-        .bind(library)
-        .execute(&mut *tx)
-        .await?;
+    delete_crop_state(&mut *tx, library).await?;
     for hash in covered {
         // 只忽略主键冲突（并发扫描的幂等），与指纹同款。
         sqlx::query(
@@ -366,6 +372,214 @@ pub(super) async fn insert_images(
     Ok(())
 }
 
+/// 删一个哈希的全部索引行，返回它原先所在的库列表（无序）。
+pub(super) async fn delete_image_rows<'e, E>(
+    executor: E,
+    hash: &str,
+) -> Result<Vec<String>, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let libraries =
+        sqlx::query_scalar::<_, String>("DELETE FROM images WHERE hash = ? RETURNING library")
+            .bind(hash)
+            .fetch_all(executor)
+            .await?;
+    Ok(libraries)
+}
+
+/// 库的张数与字节占用；bytes 口径与「图库」列表一致（SUM(size)，共享图在
+/// 多个库各计一次）。空库时 count 为 0、SUM 为 NULL 记 0。
+pub(super) async fn library_size(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<(usize, u64), StoreError> {
+    let row =
+        sqlx::query("SELECT COUNT(*) AS count, SUM(size) AS bytes FROM images WHERE library = ?")
+            .bind(library)
+            .fetch_one(pool)
+            .await?;
+    let count = row.try_get::<i64, _>("count")? as usize;
+    let bytes = row.try_get::<Option<i64>, _>("bytes")?.unwrap_or(0) as u64;
+    Ok((count, bytes))
+}
+
+/// 抽图的候选项：库内全部 (hash, draw_count)。
+pub(super) async fn library_draw_items(
+    pool: &SqlitePool,
+    library: &str,
+) -> Result<Vec<(String, i64)>, StoreError> {
+    let rows = sqlx::query("SELECT hash, draw_count FROM images WHERE library = ?")
+        .bind(library)
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("hash")?,
+                row.try_get::<i64, _>("draw_count")?,
+            ))
+        })
+        .collect()
+}
+
+/// 抽中一张图后把它的 draw_count 加一。
+pub(super) async fn bump_draw_count(
+    pool: &SqlitePool,
+    library: &str,
+    hash: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE images SET draw_count = draw_count + 1 WHERE library = ? AND hash = ?")
+        .bind(library)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 删除一个别名行，返回受影响行数（0 表示别名不存在）。
+pub(super) async fn delete_alias<'e, E>(executor: E, alias: &str) -> Result<u64, StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let result = sqlx::query("DELETE FROM aliases WHERE alias = ?")
+        .bind(alias)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// 「图库」列表的每库 (库名, 张数, 字节数)，按库名排序。
+pub(super) async fn library_size_rows(
+    pool: &SqlitePool,
+) -> Result<Vec<(String, i64, i64)>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT library, COUNT(*) AS count, SUM(size) AS bytes
+         FROM images GROUP BY library ORDER BY library",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("library")?,
+                row.try_get::<i64, _>("count")?,
+                row.try_get::<i64, _>("bytes")?,
+            ))
+        })
+        .collect()
+}
+
+/// 全部 (别名, 指向)，按别名排序。
+pub(super) async fn alias_pairs(pool: &SqlitePool) -> Result<Vec<(String, String)>, StoreError> {
+    let rows = sqlx::query("SELECT alias, target FROM aliases ORDER BY alias")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("alias")?,
+                row.try_get::<String, _>("target")?,
+            ))
+        })
+        .collect()
+}
+
+/// 全库去重后的图片张数。
+pub(super) async fn unique_image_count(pool: &SqlitePool) -> Result<usize, StoreError> {
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT hash) FROM images")
+        .fetch_one(pool)
+        .await? as usize;
+    Ok(count)
+}
+
+/// 前缀匹配的候选哈希（LIKE pattern，调用方负责转义与大小写）。
+pub(super) async fn hashes_by_prefix(
+    pool: &SqlitePool,
+    pattern: &str,
+) -> Result<Vec<String>, StoreError> {
+    let hashes = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT hash FROM images WHERE hash LIKE ? ESCAPE '\\'",
+    )
+    .bind(pattern)
+    .fetch_all(pool)
+    .await?;
+    Ok(hashes)
+}
+
+/// 索引里现存的全部分析哈希。
+pub(super) async fn indexed_hashes(pool: &SqlitePool) -> Result<HashSet<String>, StoreError> {
+    let hashes = sqlx::query_scalar("SELECT DISTINCT hash FROM images")
+        .fetch_all(pool)
+        .await?;
+    Ok(hashes.into_iter().collect())
+}
+
+/// 删除只被 `library` 引用的派生特征（perceptual / sift 同一判据）：
+/// 其他库还引用的哈希保留，特征按内容共享。
+pub(super) async fn delete_derived_exclusive_to(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    library: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "DELETE FROM perceptual WHERE hash IN (
+             SELECT mine.hash FROM images AS mine
+             WHERE mine.library = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM images AS other
+                   WHERE other.hash = mine.hash AND other.library != mine.library
+               )
+         )",
+    )
+    .bind(library)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM sift WHERE hash IN (
+             SELECT mine.hash FROM images AS mine
+             WHERE mine.library = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM images AS other
+                   WHERE other.hash = mine.hash AND other.library != mine.library
+               )
+         )",
+    )
+    .bind(library)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// 清掉不再被任何库引用的派生特征行（对账路径，与索引清理由同一事务保证）。
+pub(super) async fn prune_derived_not_referenced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM perceptual WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM sift WHERE hash NOT IN (SELECT DISTINCT hash FROM images)")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// 清空一个库的索引行与相关别名（含以它为名的别名行）。
+pub(super) async fn wipe_library_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    canonical: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM images WHERE library = ?")
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM aliases WHERE target = ? OR alias = ?")
+        .bind(canonical)
+        .bind(canonical)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn upsert_alias<'e, E>(
     executor: E,
     alias: &str,
@@ -441,9 +655,12 @@ pub(super) async fn merge_library(
     Ok(())
 }
 
-pub(super) async fn prune_dangling_aliases(pool: &SqlitePool) -> Result<(), StoreError> {
+pub(super) async fn prune_dangling_aliases<'e, E>(executor: E) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query("DELETE FROM aliases WHERE target NOT IN (SELECT DISTINCT library FROM images)")
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(())
 }

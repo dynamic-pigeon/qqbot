@@ -1,8 +1,19 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 
 use crate::dynamics::ALLOWED_BILI_HOSTS;
+
+/// 下载 B 站图片字节并聚合为 [`Bytes`]，供消息段构建直接引用。
+pub(crate) async fn fetch_bili_image_bytes(
+    url: &str,
+    max_bytes: usize,
+    request_timeout: Duration,
+) -> Result<Bytes> {
+    let bytes = download_bili_image(url, max_bytes, request_timeout).await?;
+    Ok(Bytes::from(bytes))
+}
 
 pub(crate) async fn download_bili_image(
     url: &str,

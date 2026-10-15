@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use askama::Template;
-use kovi::chrono::{Datelike as _, Days, NaiveDate, Weekday};
+use kovi::chrono::{Datelike as _, Days, NaiveDate};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, chrono};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use utils::command::{
@@ -22,8 +22,6 @@ const NIGHT_HOURS: [u32; 7] = [23, 0, 1, 2, 3, 4, 5];
 const EARLY_HOURS: [u32; 3] = [6, 7, 8];
 /// 加冕夜聊王/早起王所需的时段内最少消息数，避免一两条消息夺冠。
 const MIN_KING_MESSAGES: u32 = 3;
-/// 热词统计读取原文的上限，与词云一致。
-const MAX_HOTWORD_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const HOTWORD_LIMIT: usize = 12;
 /// 每日消息量柱状图从周一排到周日。
 const DAY_LABELS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
@@ -97,12 +95,7 @@ fn report_status(ctx: CommandContext) -> CommandResult {
 async fn view_report(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    if let Err(hit) = super::RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
-        return Err(CommandError::user(format!(
-            "刚跑完，{} 秒后再试一次",
-            hit.retry_after_secs()
-        )));
-    }
+    super::acquire_rank_cooldown(group_id)?;
 
     let window = last_week_window(chrono::Local::now().date_naive());
     let rows = crate::db::msg_count_with_active_days(group_id, window.start, window.end)
@@ -151,8 +144,7 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
             });
         }
         async move {}
-    })
-    .unwrap();
+    })?;
     Ok(())
 }
 
@@ -162,7 +154,7 @@ async fn send_weekly_report(bot: &RuntimeBot, group_id: i64, path: &Path) {
     {
         Ok(rows) => rows,
         Err(e) => {
-            notify_admin(bot, group_id, e).await;
+            crate::notify_admin(bot, format!("生成周报失败: {e}, group_id: {group_id}")).await;
             return;
         }
     };
@@ -178,21 +170,9 @@ async fn send_weekly_report(bot: &RuntimeBot, group_id: i64, path: &Path) {
                 .add_text("📊 上周群活跃周报")
                 .add_image(&utils::base64_image(&image)),
         ),
-        Err(e) => notify_admin(bot, group_id, e).await,
-    }
-}
-
-async fn notify_admin(bot: &RuntimeBot, group_id: i64, error: anyhow::Error) {
-    tracing::error!("生成周报失败: {error}, group_id: {group_id}");
-    if let Some(admin_id) = bot
-        .get_main_admin()
-        .ok()
-        .and_then(|admin| admin.try_as_i64())
-    {
-        bot.send_private_msg(
-            admin_id,
-            format!("生成周报失败: {error}, group_id: {group_id}"),
-        );
+        Err(e) => {
+            crate::notify_admin(bot, format!("生成周报失败: {e}, group_id: {group_id}")).await;
+        }
     }
 }
 
@@ -221,7 +201,7 @@ struct ReportWindow {
 
 /// 上个完整自然周（周一开始），today 由调用方传入，测试才能用固定日期驱动。
 fn last_week_window(today: NaiveDate) -> ReportWindow {
-    let monday = today.week(Weekday::Mon).first_day() - Days::new(7);
+    let monday = super::monday_weeks_ago(today, 1);
     ReportWindow {
         start: super::local_midnight(monday).timestamp(),
         end: super::local_midnight(monday + Days::new(7)).timestamp(),
@@ -292,7 +272,7 @@ async fn gen_weekly_report_html(
                 .await
                 .unwrap_or_else(|e| {
                     tracing::error!("获取用户 {user_id} 信息失败: {e}");
-                    fallback_user_info(user_id)
+                    user_info::fallback_user_info(user_id)
                 });
             (user_id, info)
         }))
@@ -351,15 +331,6 @@ async fn gen_weekly_report_html(
     Ok(template.render()?)
 }
 
-fn fallback_user_info(user_id: i64) -> UserInfo {
-    UserInfo {
-        user_id,
-        nickname: user_id.to_string(),
-        avatar: bytes::Bytes::new(),
-        fetched_at: std::time::Instant::now(),
-    }
-}
-
 async fn collect_hot_words(
     path: &Path,
     group_id: i64,
@@ -369,7 +340,7 @@ async fn collect_hot_words(
         group_id,
         window.start,
         window.end,
-        MAX_HOTWORD_INPUT_BYTES,
+        crate::db::MAX_TEXT_INPUT_BYTES,
     )
     .await?;
     if text.is_empty() {

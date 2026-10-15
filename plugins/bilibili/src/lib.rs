@@ -1,7 +1,6 @@
 use std::{
     fmt::Write,
     sync::{Arc, LazyLock},
-    time::Duration,
 };
 
 use kovi::{
@@ -24,21 +23,15 @@ pub mod dynamics;
 mod image;
 mod living;
 
-static USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
-
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::REFERER,
         reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
     );
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(16)
+    utils::http_client_builder()
+        .user_agent(dynamics::DEFAULT_USER_AGENT)
         .default_headers(headers)
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
 });
@@ -133,16 +126,7 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
     let group = ctx.group_id()?;
     config::CONFIG
         .modify(|config| {
-            if let Some(subscription) = config.subscribe.iter_mut().find(|item| item.uid == uid) {
-                if !subscription.groups.contains(&group) {
-                    subscription.groups.push(group);
-                }
-            } else {
-                config.subscribe.push(crate::config::Subscribe {
-                    uid,
-                    groups: vec![group],
-                });
-            }
+            config::upsert_subscribe_group(&mut config.subscribe, uid, group);
         })
         .map_err(CommandError::internal)?;
     ctx.reply(format!("已为本群订阅 uid={uid}"));
@@ -154,15 +138,7 @@ fn live_remove(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(1)?;
     let group = ctx.group_id()?;
     config::CONFIG
-        .modify(|config| {
-            if let Some(index) = config.subscribe.iter().position(|item| item.uid == uid) {
-                let subscription = &mut config.subscribe[index];
-                subscription.groups.retain(|item| *item != group);
-                if subscription.groups.is_empty() {
-                    config.subscribe.remove(index);
-                }
-            }
-        })
+        .modify(|config| config::remove_subscribe_group(&mut config.subscribe, uid, group))
         .map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的订阅"));
     Ok(())
@@ -219,13 +195,12 @@ fn dynamic_remove(ctx: CommandContext) -> CommandResult {
 async fn dynamic_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group = ctx.group_id()?;
-    let entries = dynamics::list_subscribes(group);
-    if entries.is_empty() {
+    let uids = dynamics::list_subscribes(group);
+    if uids.is_empty() {
         ctx.reply("本群尚未订阅任何动态");
         return Ok(());
     }
 
-    let uids = entries.iter().map(|(uid, _)| *uid).collect::<Vec<_>>();
     let names = fetch_uid_names(&uids)
         .await
         .map_err(CommandError::internal)?;

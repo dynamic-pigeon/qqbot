@@ -23,6 +23,34 @@ pub struct DynamicCheckpoint {
     pub last_seen: i64,
 }
 
+/// 把 group 加入 uid 的订阅组列表；uid 尚无条目时新建一条。
+/// 返回是否实际发生变更（group 已在列表中时返回 false）。
+pub(crate) fn upsert_subscribe_group(subscribe: &mut Vec<Subscribe>, uid: u64, group: i64) -> bool {
+    if let Some(subscription) = subscribe.iter_mut().find(|item| item.uid == uid) {
+        if subscription.groups.contains(&group) {
+            return false;
+        }
+        subscription.groups.push(group);
+    } else {
+        subscribe.push(Subscribe {
+            uid,
+            groups: vec![group],
+        });
+    }
+    true
+}
+
+/// 从 uid 的订阅中移除 group；组列表清空后整条订阅一并删除。
+pub(crate) fn remove_subscribe_group(subscribe: &mut Vec<Subscribe>, uid: u64, group: i64) {
+    if let Some(index) = subscribe.iter().position(|item| item.uid == uid) {
+        let subscription = &mut subscribe[index];
+        subscription.groups.retain(|item| *item != group);
+        if subscription.groups.is_empty() {
+            subscribe.remove(index);
+        }
+    }
+}
+
 pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
 
 pub fn init() -> anyhow::Result<()> {
