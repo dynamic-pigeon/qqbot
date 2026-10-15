@@ -464,6 +464,9 @@ fn detect_crops_inner(
     // 预筛只会漏检。配对开销的大头是两侧各 384 个描述子的 knn 暴力
     // 比对，千张库并行数分钟可完成。
     // 交错取行分片，各线程负载均衡；match_crop_pair 是纯函数，可并行。
+    // scope 返回前自动 join 全部分片；分片线程 panic 随 scope 上抛，由
+    // 调用方的 spawn_blocking 边界转成扫描错误。join 后丢弃结果把 panic
+    // 吞掉的话，扫描会照常成功并把丢失的分片记进覆盖集，静默永久缺账。
     let sides: Vec<Option<MatchSide>> = images
         .iter()
         .map(|image| MatchSide::new(&image.sift, quantized))
@@ -474,10 +477,9 @@ fn detect_crops_inner(
         .clamp(1, 8);
     let mut shards: Vec<Vec<SimilarGroup>> = vec![Vec::new(); workers];
     std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
         for (t, shard) in shards.iter_mut().enumerate() {
             let sides = &sides;
-            handles.push(scope.spawn(move || {
+            scope.spawn(move || {
                 // BFMatcher 无跨调用状态，分片内复用一个；创建失败视同
                 // 该分片全部匹配失败，与单对匹配失败同语义。VNNI 形态
                 // 用不上它，创建也免了。
@@ -521,10 +523,7 @@ fn detect_crops_inner(
                     }
                     i += workers;
                 }
-            }));
-        }
-        for handle in handles {
-            let _ = handle.join();
+            });
         }
     });
     let pairs: Vec<SimilarGroup> = shards.into_iter().flatten().collect();
