@@ -122,10 +122,6 @@ impl ResolvedCommand {
         self.rest.trim()
     }
 
-    pub fn usage(&self) -> &str {
-        &self.usage
-    }
-
     pub fn permission(&self) -> Permission {
         self.permission
     }

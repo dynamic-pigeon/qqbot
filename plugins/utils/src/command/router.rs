@@ -7,7 +7,7 @@ use super::model::{CommandArguments, CommandHandler};
 use super::{
     AccessError, Command, CommandCatalog, CommandContext, CommandError, CommandRegistrationError,
     CommandTree, MessageSource, Permission, ResolveOutcome, ResolvedCommand, check_access,
-    render_command_error,
+    render_command_error, user_is_bot_admin,
 };
 
 pub struct CommandRouter {
@@ -140,12 +140,7 @@ fn check_event_access(
     } else {
         MessageSource::Private
     };
-    let is_admin = permission == Permission::Everyone
-        || bot
-            .get_all_admin()
-            .unwrap_or_default()
-            .iter()
-            .any(|id| id.try_as_i64() == Some(event.user_id));
+    let is_admin = permission == Permission::Everyone || user_is_bot_admin(bot, event.user_id);
     check_access(scope, permission, source, is_admin)
 }
 

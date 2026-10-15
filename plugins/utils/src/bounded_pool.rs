@@ -13,16 +13,13 @@ use kovi::tokio::sync::OwnedSemaphorePermit;
 #[derive(Clone)]
 pub struct BoundedPool {
     semaphore: Arc<kovi::tokio::sync::Semaphore>,
-    max: usize,
 }
 
 impl BoundedPool {
     /// 创建容量为 `max_concurrent` 的资源池。`max_concurrent` 至少为 1。
     pub fn new(max_concurrent: usize) -> Self {
-        let max = max_concurrent.max(1);
         Self {
-            semaphore: Arc::new(kovi::tokio::sync::Semaphore::new(max)),
-            max,
+            semaphore: Arc::new(kovi::tokio::sync::Semaphore::new(max_concurrent.max(1))),
         }
     }
 
@@ -35,15 +32,5 @@ impl BoundedPool {
             .await
             .map_err(|_| anyhow!("bounded pool 等待许可超时 (>{:?})", wait_timeout))?
             .map_err(|e| anyhow!("semaphore closed: {}", e))
-    }
-
-    /// 当前可用许可数（观测用）。
-    pub fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
-    }
-
-    /// 池容量上限。
-    pub fn max_concurrency(&self) -> usize {
-        self.max
     }
 }
