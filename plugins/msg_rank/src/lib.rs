@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
-use kovi_onebot::{EventRegistrar as _, event::GroupMsgEvent};
+use kovi_onebot::{EventRegistrar as _, OnebotTrait as _, event::GroupMsgEvent};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, CommandRouter, MessageScope, Permission,
 };
@@ -128,16 +128,34 @@ async fn add_msg(event: Arc<GroupMsgEvent>) {
     }
 }
 
+/// 记录 error 日志，并把同样的内容私聊给 bot 主管理员。
+pub(crate) async fn notify_admin(bot: &kovi::RuntimeBot, message: String) {
+    tracing::error!("{message}");
+    if let Some(admin_id) = bot
+        .get_main_admin()
+        .ok()
+        .and_then(|admin| admin.try_as_i64())
+    {
+        bot.send_private_msg(admin_id, message);
+    }
+}
+
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value;
     }
-    let mut boundary = max_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
+    let boundary = floor_char_boundary(&value, max_bytes);
     value.truncate(boundary);
     value
+}
+
+/// 不超过 `index` 的最大字符边界，用于按字节上限截断 UTF-8 文本。
+pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut boundary = index;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 async fn get_text(msg: &Message) -> String {

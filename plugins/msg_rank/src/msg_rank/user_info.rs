@@ -15,6 +15,16 @@ pub(crate) struct UserInfo {
     pub fetched_at: Instant,
 }
 
+/// 拉取失败时的兜底条目：user_id 当昵称、空头像。
+pub(super) fn fallback_user_info(user_id: i64) -> UserInfo {
+    UserInfo {
+        user_id,
+        nickname: user_id.to_string(),
+        avatar: bytes::Bytes::new(),
+        fetched_at: Instant::now(),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct MemberInfoApiResponse {
     card: String,
