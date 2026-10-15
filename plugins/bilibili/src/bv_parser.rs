@@ -30,7 +30,6 @@ struct Data {
     pic: String,
     owner: Owner,
     stat: Stat,
-    duration: i64,
 }
 
 #[derive(Deserialize)]
@@ -55,8 +54,6 @@ pub struct BvInfo {
     pub view: i64,
     pub coin: i64,
     pub like: i64,
-    #[allow(dead_code)]
-    pub duration: i64,
     pub url: String,
     pub favorite: i64,
 }
@@ -72,11 +69,13 @@ impl ApiRes {
         let data = self
             .data
             .ok_or_else(|| BvError::RequestBodyError("API返回缺少data字段".to_string()))?;
-        let pic =
-            crate::image::download_bili_image(&data.pic, 10 * 1024 * 1024, Duration::from_secs(10))
-                .await
-                .map(bytes::Bytes::from)
-                .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
+        let pic = crate::image::fetch_bili_image_bytes(
+            &data.pic,
+            10 * 1024 * 1024,
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
 
         Ok(BvInfo {
             title: data.title,
@@ -85,7 +84,6 @@ impl ApiRes {
             view: data.stat.view,
             coin: data.stat.coin,
             like: data.stat.like,
-            duration: data.duration,
             favorite: data.stat.favorite,
             url,
         })

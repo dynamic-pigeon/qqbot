@@ -2,6 +2,7 @@ use super::backup::{RETAINED_DAYS, date_string};
 use super::derive::is_large_blob;
 use super::*;
 use kovi::tokio;
+use sqlx::Row;
 use utils::sha256_hex;
 
 fn temp_store() -> (Store, PathBuf) {

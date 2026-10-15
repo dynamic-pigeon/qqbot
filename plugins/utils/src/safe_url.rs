@@ -150,35 +150,6 @@ fn literal_ip_from_url(parsed: &reqwest::Url) -> Option<IpAddr> {
     stripped.parse::<IpAddr>().ok()
 }
 
-/// 异步校验图片 URL：在基础 URL 校验上可选对域名做 DNS 预解析，
-/// 确保所有 A/AAAA 记录都是公网单播地址。
-///
-/// 防 DNS rebinding 的关键：attacker 控制权威 DNS 时，可在 URL 字符串校验阶段
-/// 返回公网 IP、HTTP 实际连接阶段返回内网 IP。本函数把这一步前置：
-/// ```text
-/// validate_image_url (字符串层) + lookup_host + is_public_ip
-/// ```
-///
-/// 仍存在极小的 TOCTOU 窗口（attacker 在校验通过后、reqwest 实际 connect 前切 DNS），
-/// 配合 HTTP 客户端的 redirect = none + 短超时足够覆盖绝大多数攻击面。
-///
-/// `protect_private_network` 控制是否拒绝非公网地址并执行 DNS pinning。
-pub async fn validate_image_url_async_with_options(
-    url: &str,
-    allowed_hosts: &[&str],
-    protect_private_network: bool,
-) -> Result<()> {
-    validate_image_url_with_options(url, allowed_hosts, protect_private_network)?;
-
-    if !protect_private_network {
-        return Ok(());
-    }
-
-    resolve_public_addrs(url).await?;
-
-    Ok(())
-}
-
 /// 下载经过白名单校验的图片，并对实际响应体实施硬字节上限。
 ///
 /// 默认复用全局共享 client 以命中连接池；启用私网保护时改用带 DNS pinning 的
@@ -352,14 +323,6 @@ async fn resolve_public_addrs(url: &str) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-/// 异步校验图片 URL，私网保护策略由 `private_network_protection_enabled` 决定。
-///
-/// 未设置环境变量且 `config.toml` 未开启时，关闭私网地址校验和 DNS pinning。
-pub async fn validate_image_url_async(url: &str, allowed_hosts: &[&str]) -> Result<()> {
-    validate_image_url_async_with_options(url, allowed_hosts, private_network_protection_enabled())
-        .await
-}
-
 /// IP 是否是公网单播地址（可路由）。
 /// 拒绝：loopback、unspecified、private、link-local、multicast、broadcast、文档/保留段。
 pub fn is_public_ip(ip: &IpAddr) -> bool {
@@ -456,19 +419,6 @@ fn is_public_v6(ip: &Ipv6Addr) -> bool {
         return false;
     }
     true
-}
-
-/// 把任意 [`SocketAddr`] 列表过滤为仅含公网 IP 的列表，配合 reqwest `resolve_to_addrs` 做强制 pinning。
-///
-/// 通常不需要直接调用此函数；[`validate_image_url_async`] 已经覆盖了校验场景。
-/// 只有当调用方需要把 client 配置为只连指定 IP 时（极致 hardening 场景），才用这个。
-#[allow(dead_code)]
-pub fn filter_public_addrs(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
-    addrs
-        .iter()
-        .copied()
-        .filter(|sa| is_public_ip(&sa.ip()))
-        .collect()
 }
 
 #[cfg(test)]

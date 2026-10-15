@@ -34,7 +34,7 @@ static ENV_COOKIE_INVALID: AtomicBool = AtomicBool::new(false);
 
 /// 默认 User-Agent，用于 `BILIBILI_USER_AGENT` 未设置时的 fallback。
 /// 选用 Chrome Linux 最新稳定版的常见格式。
-const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
 
 /// 从 `BILIBILI_USER_AGENT` 环境变量解析 UA；未设置或空白时回退到默认。

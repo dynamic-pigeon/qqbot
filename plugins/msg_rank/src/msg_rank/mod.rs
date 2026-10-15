@@ -19,6 +19,17 @@ const RANK_COOLDOWN: Duration = Duration::from_secs(30);
 static RANK_COOLDOWN_LIMITER: LazyLock<RateLimiter<i64>> =
     LazyLock::new(|| RateLimiter::new(RANK_COOLDOWN, 1));
 
+/// 按群节流；冷却中返回用户可见的错误。
+pub(super) fn acquire_rank_cooldown(group_id: i64) -> CommandResult {
+    if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
+        return Err(CommandError::user(format!(
+            "刚跑完，{} 秒后再试一次",
+            hit.retry_after_secs()
+        )));
+    }
+    Ok(())
+}
+
 /// 一档 B 话榜：子命令名、根直连触发词、帮助描述与时间范围。
 /// 子命令名带「B话榜」后缀：expose_as_root 会让名字成为裸词触发词，
 /// 用「今日」这类常见句首词会在群聊里误触发。
@@ -101,12 +112,7 @@ pub(crate) fn rank_command() -> Command {
 async fn handle_rank(ctx: CommandContext, kind: RankKind) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
     let group_id = ctx.group_id()?;
-    if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
-        return Err(CommandError::user(format!(
-            "刚跑完，{} 秒后再试一次",
-            hit.retry_after_secs()
-        )));
-    }
+    acquire_rank_cooldown(group_id)?;
 
     let window = rank_window(kind);
     let html = gen_rank_html(ctx.bot(), group_id, &window)
@@ -165,6 +171,11 @@ fn day_window(date: NaiveDate, title: &'static str, period: &'static str) -> Ran
     }
 }
 
+/// today 所在周的周一往前推 `weeks_ago` 周。
+fn monday_weeks_ago(today: NaiveDate, weeks_ago: u32) -> NaiveDate {
+    today.week(Weekday::Mon).first_day() - Days::new(u64::from(weeks_ago) * 7)
+}
+
 /// 周窗口从周一开始。today 由调用方传入，测试才能用固定日期驱动。
 fn week_window(
     today: NaiveDate,
@@ -172,7 +183,7 @@ fn week_window(
     title: &'static str,
     period: &'static str,
 ) -> RankWindow {
-    let monday = today.week(Weekday::Mon).first_day() - Days::new(u64::from(weeks_ago) * 7);
+    let monday = monday_weeks_ago(today, weeks_ago);
     RankWindow {
         start: local_midnight(monday).timestamp(),
         end: local_midnight(monday + Days::new(7)).timestamp(),
@@ -223,15 +234,7 @@ async fn gen_rank_html(bot: &RuntimeBot, group_id: i64, window: &RankWindow) -> 
                 Ok(info) => (info, cnt),
                 Err(e) => {
                     tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
-                    (
-                        user_info::UserInfo {
-                            user_id,
-                            nickname: user_id.to_string(),
-                            avatar: bytes::Bytes::new(),
-                            fetched_at: std::time::Instant::now(),
-                        },
-                        cnt,
-                    )
+                    (user_info::fallback_user_info(user_id), cnt)
                 }
             }
         }))

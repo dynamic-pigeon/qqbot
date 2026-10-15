@@ -87,7 +87,6 @@ const WORDCLOUD_SCALE: u32 = 2;
 
 /// 最大词数，与 Python wordcloud 默认值对齐。
 const MAX_WORDS: usize = 200;
-const MAX_WORDCLOUD_INPUT_BYTES: usize = 2 * 1024 * 1024;
 static WORDCLOUD_POOL: LazyLock<utils::BoundedPool> =
     LazyLock::new(|| utils::BoundedPool::new(crate::config::static_config().wordcloud_concurrency));
 
@@ -140,8 +139,7 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
                 }
             }
             async move {}
-        })
-        .unwrap();
+        })?;
     }
     Ok(())
 }
@@ -239,17 +237,11 @@ async fn send_word_cloud(
             return;
         }
         Err(e) => {
-            tracing::error!("make word cloud failed: {}, group_id: {}", e, group_id);
-            if let Some(admin_id) = bot
-                .get_main_admin()
-                .ok()
-                .and_then(|admin| admin.try_as_i64())
-            {
-                bot.send_private_msg(
-                    admin_id,
-                    format!("make word cloud failed: {}, group_id: {}", e, group_id),
-                );
-            }
+            crate::notify_admin(
+                bot,
+                format!("make word cloud failed: {}, group_id: {}", e, group_id),
+            )
+            .await;
             return;
         }
     };
@@ -280,7 +272,7 @@ async fn make_word_cloud(
         group_id,
         start_time.timestamp(),
         end_time.timestamp(),
-        MAX_WORDCLOUD_INPUT_BYTES,
+        crate::db::MAX_TEXT_INPUT_BYTES,
     )
     .await?;
     if messages.is_empty() {
@@ -295,9 +287,6 @@ async fn make_word_cloud(
     let resources = resource_manager(path.join("font.otf")).await.get().await?;
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        if messages.is_empty() {
-            return Ok(Vec::new());
-        }
         generate_word_cloud_image(&resources, &path, &messages, &stop_words, &background)
     })
     .await

@@ -342,6 +342,9 @@ pub(crate) async fn msg_count_total_with_time_range(
     Ok(total.max(0) as u32)
 }
 
+/// 聚合读取消息原文的字节上限，词云与热词共用。
+pub(crate) const MAX_TEXT_INPUT_BYTES: usize = 2 * 1024 * 1024;
+
 pub(crate) async fn select_text_from_time_range(
     group_id: i64,
     start_time: i64,
@@ -375,10 +378,7 @@ SELECT msg FROM MSG
             text.push_str(&message);
             continue;
         }
-        let mut boundary = remaining;
-        while !message.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
+        let boundary = crate::floor_char_boundary(&message, remaining);
         text.push_str(&message[..boundary]);
         break;
     }
