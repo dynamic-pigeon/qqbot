@@ -308,7 +308,31 @@ pub fn cluster(
         best_by_root[root] = best_by_root[root].min(dist);
     }
 
-    let mut in_duplicate = vec![false; n];
+    let (mut groups, in_duplicate) = duplicate_groups(images, buckets, &best_by_root);
+    groups.extend(maybe_pairs(
+        images,
+        &in_duplicate,
+        duplicate_limit,
+        maybe_limit,
+    ));
+
+    groups.sort_by(|a, b| {
+        b.percent
+            .cmp(&a.percent)
+            .then_with(|| a.hashes.cmp(&b.hashes))
+    });
+    groups
+}
+
+/// 重复组装配：按并查集根聚合成员，percent 用组内最优边换算，成员超
+/// [`MAX_GROUP_MEMBERS`] 截断并置位 truncated。返回的成员标记供
+/// 「也许像」配对排除。
+fn duplicate_groups(
+    images: &[HashedImage],
+    buckets: Vec<Vec<usize>>,
+    best_by_root: &[u32],
+) -> (Vec<SimilarGroup>, Vec<bool>) {
+    let mut in_duplicate = vec![false; images.len()];
     let mut groups = Vec::new();
     for (root, members) in buckets.into_iter().enumerate() {
         if members.len() < 2 {
@@ -331,10 +355,20 @@ pub fn cluster(
             truncated,
         });
     }
+    (groups, in_duplicate)
+}
 
-    // 截断时按扫描顺序保留前 MAX_MAYBE_GROUPS 对，不保证剩下的是最相似的；
-    // 宁可少提示也不让 O(n²) 的组列表把会话内存撑爆。
-    let mut maybe_groups = 0usize;
+/// 「也许像」配对：重复组成员不参与，其余图之间中等相似才成对。
+/// 截断时按扫描顺序保留前 [`MAX_MAYBE_GROUPS`] 对，不保证剩下的
+/// 是最相似的；宁可少提示也不让 O(n²) 的组列表把会话内存撑爆。
+fn maybe_pairs(
+    images: &[HashedImage],
+    in_duplicate: &[bool],
+    duplicate_limit: u32,
+    maybe_limit: u32,
+) -> Vec<SimilarGroup> {
+    let n = images.len();
+    let mut groups = Vec::new();
     'outer: for i in 0..n {
         if in_duplicate[i] {
             continue;
@@ -357,18 +391,11 @@ pub fn cluster(
                 percent: percent_from_distance(maybe_dist),
                 truncated: false,
             });
-            maybe_groups += 1;
-            if maybe_groups >= MAX_MAYBE_GROUPS {
+            if groups.len() >= MAX_MAYBE_GROUPS {
                 break 'outer;
             }
         }
     }
-
-    groups.sort_by(|a, b| {
-        b.percent
-            .cmp(&a.percent)
-            .then_with(|| a.hashes.cmp(&b.hashes))
-    });
     groups
 }
 
