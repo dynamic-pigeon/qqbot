@@ -163,17 +163,19 @@ pub fn group_node_name(
 
 pub struct PackedImage {
     pub hash: String,
-    pub bytes: Vec<u8>,
+    pub image: crate::send::OutgoingImage,
 }
 
 /// 一条消息塞不下整组时拆开连发，组内图片仍全部发出。
 /// 单张超过字节上限时单独成条，这样才能把 15 MiB 的原图发出去。
+/// 预算按原始字节数计，与发图形态无关（file 直发时消息段虽小，
+/// OneBot 端上传给 QQ 的量不变）。
 pub fn packetize_images(images: Vec<PackedImage>) -> Vec<Vec<PackedImage>> {
     let mut packets = Vec::new();
     let mut current: Vec<PackedImage> = Vec::new();
     let mut bytes = 0usize;
     for image in images {
-        let size = image.bytes.len();
+        let size = image.image.size();
         let would_overflow = !current.is_empty()
             && (current.len() >= MAX_IMAGES_PER_MESSAGE
                 || bytes.saturating_add(size) > MAX_BYTES_PER_MESSAGE);
@@ -198,7 +200,7 @@ pub struct ForwardPacket {
 
 impl ForwardPacket {
     pub fn byte_len(&self) -> usize {
-        self.images.iter().map(|image| image.bytes.len()).sum()
+        self.images.iter().map(|image| image.image.size()).sum()
     }
 }
 
@@ -350,7 +352,7 @@ mod tests {
         (0..count)
             .map(|i| PackedImage {
                 hash: format!("{i:064x}"),
-                bytes: vec![1; size],
+                image: crate::send::OutgoingImage::from_size(size),
             })
             .collect()
     }

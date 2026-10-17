@@ -21,6 +21,9 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --all-targets --locked
+      # image_lib 的 send-file 发图形态默认不编进，单独过一遍防烂
+      - run: cargo clippy -p image_lib --all-targets --locked --features send-file -- -D warnings
+      - run: cargo test -p image_lib --all-targets --locked --features send-file
 
   audit:
     runs-on: ubuntu-latest

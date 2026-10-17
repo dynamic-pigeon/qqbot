@@ -14,6 +14,8 @@ default = []
 #   cargo zigbuild --target x86_64-unknown-linux-musl --release --features jemalloc
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
+# image_lib 图库发图改 file:// 路径直发（默认 base64）。
+image-send-file = ["image_lib/send-file"]
 
 [dependencies]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }

@@ -24,13 +24,73 @@ fn hash_prefix(hash: &str) -> &str {
     hash.get(..HASH_PREFIX_CHARS).unwrap_or(hash)
 }
 
-pub(crate) fn image_message(text: Option<&str>, images: &[&[u8]]) -> Message {
+/// 一张待发图片：消息段要用的 URI（`base64://` 或 `file://`）加上
+/// 原始字节数。size 供消息打包预算使用，两种发图形态口径一致。
+pub(crate) struct OutgoingImage {
+    uri: String,
+    size: usize,
+}
+
+impl OutgoingImage {
+    /// 库内 blob。send-file 形态直接把绝对路径写进消息段，由 OneBot
+    /// 端读盘上传，bot 不再把内容读进内存；默认形态读盘转 base64。
+    /// 文件不在（刚被回收或盘坏）返回 None，调用方按图缺失处理。
+    pub(crate) async fn from_blob(
+        store: &crate::store::Store,
+        group_id: i64,
+        hash: &str,
+    ) -> Option<Self> {
+        #[cfg(feature = "send-file")]
+        {
+            let path = store.blob_path(group_id, hash).ok()?;
+            let size = kovi::tokio::fs::metadata(&path).await.ok()?.len() as usize;
+            let absolute = std::path::absolute(&path).unwrap_or(path);
+            Some(Self {
+                uri: format!("file://{}", absolute.display()),
+                size,
+            })
+        }
+        #[cfg(not(feature = "send-file"))]
+        {
+            let bytes = store.read_blob(group_id, hash).await.ok()?;
+            Some(Self::from_bytes(bytes))
+        }
+    }
+
+    /// 不在库里的派生字节图（发送失败降级时切开的上下两半），始终
+    /// base64。
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        let size = bytes.len();
+        Self {
+            uri: utils::base64_image(&bytes),
+            size,
+        }
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    /// 测试专用：按指定体积构造，不分配内容，打包预算测试用。
+    #[cfg(test)]
+    pub(crate) fn from_size(size: usize) -> Self {
+        Self {
+            uri: String::new(),
+            size,
+        }
+    }
+}
+
+pub(crate) fn image_message<'a>(
+    text: Option<&str>,
+    images: impl IntoIterator<Item = &'a OutgoingImage>,
+) -> Message {
     let mut message = match text {
         Some(text) => Message::new().add_text(text),
         None => Message::new(),
     };
-    for bytes in images {
-        message = message.add_image(&utils::base64_image(bytes));
+    for image in images {
+        message = message.add_image(&image.uri);
     }
     message
 }
@@ -165,9 +225,10 @@ where
 
 pub(crate) async fn report_send_fail(
     bot: &RuntimeBot,
+    store: &crate::store::Store,
+    group_id: i64,
     header: String,
     hashes: &[String],
-    originals: &[Vec<u8>],
     error: &SendFail,
 ) {
     let mut text = header;
@@ -191,15 +252,18 @@ pub(crate) async fn report_send_fail(
 
     if matches!(error, SendFail::Api(_)) {
         let mut parts = Vec::new();
-        for bytes in originals {
-            if let Some([first, second]) = split_image(bytes) {
-                parts.push(first);
-                parts.push(second);
+        for hash in hashes {
+            // 切开降级只在失败报告时才需要字节，此时再读盘
+            let Some(bytes) = store.read_blob(group_id, hash).await.ok() else {
+                continue;
+            };
+            if let Some([first, second]) = split_image(&bytes) {
+                parts.push(OutgoingImage::from_bytes(first));
+                parts.push(OutgoingImage::from_bytes(second));
             }
         }
         if !parts.is_empty() {
-            let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-            let message = image_message(Some(&text), &refs);
+            let message = image_message(Some(&text), &parts);
             match send_private_wait(bot, admin_id, &message).await {
                 Ok(()) => return,
                 Err(error) => {
@@ -216,6 +280,9 @@ pub(crate) async fn report_send_fail(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "send-file")]
+    use kovi::tokio;
+
     use super::*;
 
     #[test]
@@ -227,5 +294,56 @@ mod tests {
         assert_eq!(node["data"]["uin"], 10000);
         assert_eq!(node["data"]["content"][0]["type"], "text");
         assert!(node["data"]["content"][0].get("kind").is_none());
+    }
+
+    #[test]
+    fn bytes_image_is_base64_with_raw_size() {
+        let image = OutgoingImage::from_bytes(vec![1, 2, 3]);
+        assert_eq!(image.size(), 3);
+        let message = image_message(None, &[image]);
+        let file = message
+            .iter()
+            .find(|segment| segment.kind == "image")
+            .and_then(|segment| segment.data.get("file"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(file.starts_with("base64://"));
+    }
+
+    #[cfg(feature = "send-file")]
+    #[kovi::tokio::test]
+    async fn blob_image_is_file_uri_with_disk_size() {
+        let dir = std::env::temp_dir().join(format!("image_lib_send_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = crate::store::Store::open_with_quota(
+            dir.clone(),
+            crate::config::DEFAULT_MAX_GROUP_MIB * 1024 * 1024,
+        )
+        .unwrap();
+        let bytes = b"\x89PNGfile-form".to_vec();
+        let hash = utils::sha256_hex(&bytes);
+        let blobs = store.blobs_dir(1);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join(&hash), &bytes).unwrap();
+
+        let image = OutgoingImage::from_blob(&store, 1, &hash).await.unwrap();
+        assert_eq!(image.size(), bytes.len());
+        let message = image_message(None, &[image]);
+        let file = message
+            .iter()
+            .find(|segment| segment.kind == "image")
+            .and_then(|segment| segment.data.get("file"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(file.starts_with("file://"));
+        assert!(file.ends_with(&format!("blobs/{hash}")));
+        assert!(std::path::Path::new(&file["file://".len()..]).is_absolute());
+
+        // blob 已不在盘上时按图缺失处理
+        std::fs::remove_file(blobs.join(&hash)).unwrap();
+        assert!(OutgoingImage::from_blob(&store, 1, &hash).await.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
