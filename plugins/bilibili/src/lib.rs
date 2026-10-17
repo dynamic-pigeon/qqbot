@@ -317,7 +317,7 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
 
         let msg = Message::new()
             .add_text(bv_info.title.as_str())
-            .add_image(&utils::base64_image(&bv_info.pic))
+            .add_image(&bv_info.pic)
             .add_text(format!(
                 "UP主：{}\n点赞：{} 投币：{}\n收藏：{} 观看：{}\n{}",
                 bv_info.name,

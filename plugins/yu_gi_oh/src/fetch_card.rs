@@ -1,12 +1,10 @@
-use std::{fmt::Display, time::Duration};
+use std::fmt::Display;
 
 use anyhow::Result;
-use bytes::Bytes;
 use kovi::serde_json;
 use utils::http_client;
 
 const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_CARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(serde::Deserialize)]
 struct ApiRes {
@@ -30,8 +28,9 @@ pub struct Text {
 }
 
 impl Card {
-    pub async fn fetch_image(&self) -> Result<Bytes> {
-        fetch_img(self.id).await
+    /// 卡图固定托管在 YGOPro CDN，返回 URL 由 onebot 端下载。
+    pub fn image_url(&self) -> String {
+        format!("https://cdn.233.momobako.com/ygopro/pics/{}.jpg", self.id)
     }
 }
 
@@ -64,18 +63,6 @@ pub async fn fetch_card(name: &str) -> Result<Option<Card>> {
 fn parse_search_response(body: &[u8]) -> Result<Option<Card>> {
     let resp: ApiRes = serde_json::from_slice(body)?;
     Ok(resp.result.into_iter().next())
-}
-
-async fn fetch_img(card_id: u64) -> Result<Bytes> {
-    let url = format!("https://cdn.233.momobako.com/ygopro/pics/{}.jpg", card_id);
-    let bytes = utils::download_image_limited(
-        &url,
-        &["cdn.233.momobako.com"],
-        MAX_CARD_IMAGE_BYTES,
-        Duration::from_secs(10),
-    )
-    .await?;
-    Ok(Bytes::from(bytes))
 }
 
 #[cfg(test)]

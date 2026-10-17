@@ -49,7 +49,8 @@ struct Stat {
 
 pub struct BvInfo {
     pub title: String,
-    pub pic: bytes::Bytes,
+    /// 封面图 URL（已归一化为 https、通过域名白名单），由 onebot 端下载。
+    pub pic: String,
     pub name: String,
     pub view: i64,
     pub coin: i64,
@@ -69,13 +70,8 @@ impl ApiRes {
         let data = self
             .data
             .ok_or_else(|| BvError::RequestBodyError("API返回缺少data字段".to_string()))?;
-        let pic = crate::image::fetch_bili_image_bytes(
-            &data.pic,
-            10 * 1024 * 1024,
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|e| BvError::RequestBodyError(format!("封面下载失败: {e}")))?;
+        let pic = crate::image::bili_image_url(&data.pic)
+            .map_err(|e| BvError::RequestBodyError(format!("封面 URL 校验失败: {e}")))?;
 
         Ok(BvInfo {
             title: data.title,
@@ -212,7 +208,7 @@ mod tests {
         let url = "https://www.bilibili.com/video/BV1CVNU6xEom";
         let info = parse_url(url, GROUP_HTTP_COVER).await.unwrap();
 
-        assert!(!info.pic.is_empty());
+        assert!(info.pic.starts_with("https://"));
         assert_eq!(info.url, url);
     }
 
@@ -228,7 +224,7 @@ mod tests {
         let txt = "【Fate/strange Fake】第13话（完结）[图片]UP主：花园字幕组
 点赞：130 投币：47
 收藏：72 观看：8359
-https://www.bilibili.com/video/BV198XLBaEYp";
+https://www.bilibili.com/video/BV1CVNU6xEom";
 
         let res = parse_url(txt, GROUP_V_TEXT).await;
         assert!(res.is_ok());
