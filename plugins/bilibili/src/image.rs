@@ -25,6 +25,14 @@ pub(crate) async fn download_bili_image(
         .await
 }
 
+/// 校验并归一化 B 站图片 URL（http 升 https、host 白名单），
+/// 供消息段直接引用、由 onebot 端下载。
+pub(crate) fn bili_image_url(url: &str) -> Result<String> {
+    let url = normalize_bili_image_url(url)?;
+    utils::validate_image_url(url.as_str(), ALLOWED_BILI_HOSTS)?;
+    Ok(url.to_string())
+}
+
 fn normalize_bili_image_url(url: &str) -> Result<reqwest::Url> {
     // 部分接口返回 HTTP 或协议相对 CDN 地址，对应 CDN 支持 HTTPS，统一升到 https。
     let url = if url.starts_with("//") {
@@ -71,5 +79,14 @@ mod tests {
     #[test]
     fn rejects_unsupported_image_url_scheme() {
         assert!(normalize_bili_image_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn bili_image_url_upgrades_and_checks_host() {
+        assert_eq!(
+            bili_image_url("http://i0.hdslb.com/bfs/archive/cover.jpg").unwrap(),
+            "https://i0.hdslb.com/bfs/archive/cover.jpg"
+        );
+        assert!(bili_image_url("https://evil.com/x.jpg").is_err());
     }
 }

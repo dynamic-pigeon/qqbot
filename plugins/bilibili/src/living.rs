@@ -6,7 +6,7 @@ use std::{
 use kovi::{Message, PluginBuilder as plugin, serde_json::json};
 use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use serde::Deserialize;
-use utils::retry::{retry_async, retry_async_with_backoff};
+use utils::retry::retry_async_with_backoff;
 
 use crate::{CLIENT, config};
 
@@ -130,27 +130,15 @@ async fn notify(
     info: &LiveRoom,
     kind: NotifyKind,
 ) {
-    // 无封面时跳过图片，避免对空 URL 做无意义的下载重试
-    let img = if info.cover_from_user.is_empty() {
-        Default::default()
+    // 封面 URL 直接进消息段，由 onebot 端下载；无封面或 URL 不合法时发纯文本
+    let cover = if info.cover_from_user.is_empty() {
+        None
     } else {
-        match retry_async(
-            async || {
-                crate::image::fetch_bili_image_bytes(
-                    &info.cover_from_user,
-                    10 * 1024 * 1024,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            },
-            3,
-        )
-        .await
-        {
-            Ok(img) => img,
-            Err(_) => {
-                tracing::error!("获取直播封面图失败: {}", info.cover_from_user);
-                Default::default()
+        match crate::image::bili_image_url(&info.cover_from_user) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::warn!("直播封面 URL 校验失败: {e}");
+                None
             }
         }
     };
@@ -162,8 +150,8 @@ async fn notify(
         NotifyKind::End => format!("{}直播结束了", info.uname),
     };
     let mut msg = Message::new().add_text(text);
-    if !img.is_empty() {
-        msg.push_image(&utils::base64_image(&img));
+    if let Some(cover) = cover {
+        msg.push_image(&cover);
     }
 
     for group in cfg

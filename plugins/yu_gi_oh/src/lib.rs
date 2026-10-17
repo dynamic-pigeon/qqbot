@@ -40,18 +40,9 @@ async fn handle_card_query(ctx: CommandContext) -> CommandResult {
     else {
         return Err(CommandError::user(format!("未找到卡片：{card_name}")));
     };
-    let img = match card.fetch_image().await {
-        Ok(data) => data,
-        Err(error) => {
-            tracing::error!("Fetch card image error: {error}");
-            ctx.reply("获取卡片图片失败");
-            ctx.reply(format!("{card}"));
-            return Ok(());
-        }
-    };
 
     let message = Message::new()
-        .add_image(&utils::base64_image(&img))
+        .add_image(&card.image_url())
         .add_text(format!("{card}"));
     ctx.reply(message);
     Ok(())
