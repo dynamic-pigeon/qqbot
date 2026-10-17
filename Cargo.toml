@@ -94,7 +94,7 @@ md-5 = "0.11"
 rand = "0.10"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt"] }
-wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs" }
+wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs", rev = "df7e18812e33ceed79af0bb60f4211dee85f682b" }
 
 [profile.release]
 lto = "thin"
