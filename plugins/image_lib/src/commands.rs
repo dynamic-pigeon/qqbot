@@ -18,12 +18,14 @@ use crate::scan::{
     chunk_forward_packets, group_node_name, group_title, packets_for_group, parse_group_index,
 };
 use crate::send::{
-    forward_node, image_message, report_send_fail, send_group_forward_wait, send_group_wait,
+    OutgoingImage, forward_node, image_message, report_send_fail, send_group_forward_wait,
+    send_group_wait,
 };
 use crate::similar::{cluster, distance_from_percent};
 use crate::store::{CropPlan, StagedImage, Store, StoreError};
 
 /// 查重展示单组读入内存的原始字节预算。大组逐张全读可放大到数百 MiB 常驻。
+#[cfg(not(feature = "send-file"))]
 const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
@@ -335,18 +337,21 @@ async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
     let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
     let group_id = ctx.group_id()?;
-    let bytes = match store.load_by_hash_prefix(group_id, &prefix).await {
-        Ok(bytes) => bytes,
+    let hash = match store.resolve_group_hash(group_id, &prefix).await {
+        Ok(hash) => hash,
         Err(error) => return Err(map_store_user_error(error)),
     };
-    let hash = sha256_hex(&bytes);
-    let message = image_message(None, &[&bytes]);
+    let image = OutgoingImage::from_blob(store, group_id, &hash)
+        .await
+        .ok_or_else(|| CommandError::user("读取图片失败，请再试一次"))?;
+    let message = image_message(None, &[image]);
     if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
         report_send_fail(
             ctx.bot(),
+            store,
+            group_id,
             format!("图库哈希发送失败 group={group_id}"),
             std::slice::from_ref(&hash),
-            std::slice::from_ref(&bytes),
             &error,
         )
         .await;
@@ -495,18 +500,18 @@ async fn handle_draw(
 
     tracing::debug!("图库 draw group_id={} hash={}", group_id, hash);
 
-    let bytes = store
-        .read_blob(group_id, &hash)
+    let image = OutgoingImage::from_blob(store, group_id, &hash)
         .await
-        .map_err(|_| CommandError::user("读取图片失败，请再试一次"))?;
+        .ok_or_else(|| CommandError::user("读取图片失败，请再试一次"))?;
 
-    let message = image_message(None, &[&bytes]);
+    let message = image_message(None, &[image]);
     if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
         report_send_fail(
             ctx.bot(),
+            store,
+            group_id,
             format!("图库来只发送失败 group={group_id} 库={name}"),
             std::slice::from_ref(&hash),
-            std::slice::from_ref(&bytes),
             &error,
         )
         .await;
@@ -830,11 +835,13 @@ async fn show_scan_group(
             }
         }
     }
-    reply_scan_page(ctx, library, page, total).await
+    reply_scan_page(ctx, store, library, page, total).await
 }
 
 /// 在 [`MAX_GROUP_READ_BYTES`] 预算内逐张读入组员图片；预算耗尽即止，
 /// 返回是否被预算截断（组员全读会把大组放大成数百 MiB 常驻）。
+/// send-file 形态不读内容、只 stat 路径，无内存压力，不做预算截断。
+#[cfg(not(feature = "send-file"))]
 async fn read_group_images(
     store: &Store,
     group_id: i64,
@@ -852,15 +859,34 @@ async fn read_group_images(
             budget = budget.saturating_sub(bytes.len());
             images.push(PackedImage {
                 hash: hash.clone(),
-                bytes,
+                image: OutgoingImage::from_bytes(bytes),
             });
         }
     }
     (images, read_cut)
 }
 
+#[cfg(feature = "send-file")]
+async fn read_group_images(
+    store: &Store,
+    group_id: i64,
+    hashes: &[String],
+) -> (Vec<PackedImage>, bool) {
+    let mut images = Vec::new();
+    for hash in hashes {
+        if let Some(image) = OutgoingImage::from_blob(store, group_id, hash).await {
+            images.push(PackedImage {
+                hash: hash.clone(),
+                image,
+            });
+        }
+    }
+    (images, false)
+}
+
 async fn reply_scan_page(
     ctx: &CommandContext,
+    store: &Store,
     library: &str,
     groups: Vec<ScanPageGroup>,
     group_total: usize,
@@ -878,12 +904,8 @@ async fn reply_scan_page(
         let nodes: Vec<_> = chunk
             .iter()
             .map(|packet| {
-                let bytes: Vec<&[u8]> = packet
-                    .images
-                    .iter()
-                    .map(|image| image.bytes.as_slice())
-                    .collect();
-                let message = image_message(Some(&packet.caption), &bytes);
+                let images = packet.images.iter().map(|image| &image.image);
+                let message = image_message(Some(&packet.caption), images);
                 forward_node(&packet.name, self_id, &message)
             })
             .collect();
@@ -895,18 +917,15 @@ async fn reply_scan_page(
                         .flat_map(|packet| packet.images.iter().map(|image| image.hash.clone()))
                 })
                 .collect();
-            let previews: Vec<Vec<u8>> = chunk
-                .iter()
-                .flat_map(|packet| packet.images.iter().map(|image| image.bytes.clone()))
-                .collect();
             report_send_fail(
                 ctx.bot(),
+                store,
+                group_id,
                 format!(
                     "图库查重发送失败 group={group_id} 库={library} 组={from}-{to}/{group_total} 聊天记录={}",
                     i + 1
                 ),
                 &remaining,
-                &previews,
                 &error,
             )
             .await;

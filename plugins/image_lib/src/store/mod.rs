@@ -193,7 +193,7 @@ impl Store {
         self.group_dir(group_id).join("index.db")
     }
 
-    fn blob_path(&self, group_id: i64, hash: &str) -> Result<PathBuf> {
+    pub(crate) fn blob_path(&self, group_id: i64, hash: &str) -> Result<PathBuf> {
         blob_file(&self.blobs_dir(group_id), hash)
     }
 
@@ -528,18 +528,6 @@ impl Store {
             }
         })
         .await
-    }
-
-    /// 解析前缀后读出 blob，供管理员按哈希发图。
-    pub async fn load_by_hash_prefix(
-        &self,
-        group_id: i64,
-        prefix: &str,
-    ) -> Result<Vec<u8>, StoreError> {
-        let hash = self.resolve_group_hash(group_id, prefix).await?;
-        self.read_blob(group_id, &hash)
-            .await
-            .map_err(StoreError::Other)
     }
 
     /// 解析前缀后从本群所有库删掉该图。

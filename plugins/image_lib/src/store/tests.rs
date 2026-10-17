@@ -412,24 +412,45 @@ async fn hash_prefix_loads_deletes_and_rejects_bad_paths() {
 
     let ha = sha256_hex(&a);
     let hb = sha256_hex(&b);
-    assert_eq!(store.load_by_hash_prefix(group, &ha).await.unwrap(), a);
+    assert_eq!(
+        store
+            .read_blob(group, &store.resolve_group_hash(group, &ha).await.unwrap())
+            .await
+            .unwrap(),
+        a
+    );
 
     let prefix = &ha[..12];
     assert!(
         !hb.starts_with(prefix),
         "fixture blobs unexpectedly share a 12-hex prefix"
     );
-    assert_eq!(store.load_by_hash_prefix(group, prefix).await.unwrap(), a);
     assert_eq!(
         store
-            .load_by_hash_prefix(group, &prefix.to_ascii_uppercase())
+            .read_blob(
+                group,
+                &store.resolve_group_hash(group, prefix).await.unwrap()
+            )
+            .await
+            .unwrap(),
+        a
+    );
+    assert_eq!(
+        store
+            .read_blob(
+                group,
+                &store
+                    .resolve_group_hash(group, &prefix.to_ascii_uppercase())
+                    .await
+                    .unwrap(),
+            )
             .await
             .unwrap(),
         a
     );
     assert!(matches!(
         store
-            .load_by_hash_prefix(group, "ffffffffffffffffffffffffffffffff")
+            .resolve_group_hash(group, "ffffffffffffffffffffffffffffffff")
             .await,
         Err(StoreError::ImageMissing)
     ));
@@ -437,11 +458,17 @@ async fn hash_prefix_loads_deletes_and_rejects_bad_paths() {
     let libraries = store.delete_by_hash_prefix(group, prefix).await.unwrap();
     assert_eq!(libraries, vec!["狗".to_owned(), "猫".to_owned()]);
     assert!(matches!(
-        store.load_by_hash_prefix(group, &ha).await,
+        store.resolve_group_hash(group, &ha).await,
         Err(StoreError::ImageMissing)
     ));
     assert_eq!(
-        store.load_by_hash_prefix(group, &hb[..12]).await.unwrap(),
+        store
+            .read_blob(
+                group,
+                &store.resolve_group_hash(group, &hb[..12]).await.unwrap()
+            )
+            .await
+            .unwrap(),
         b
     );
 

@@ -3,6 +3,11 @@ name = "image_lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# 发图形态：默认把图片以 base64 内嵌进消息段；send-file 把库内 blob 以
+# file:// 绝对路径直发，由 OneBot 端读盘上传（要求其能访问图库目录）。
+send-file = []
+
 [dependencies]
 async-channel.workspace = true
 anyhow.workspace = true

@@ -10,7 +10,7 @@ cp config.toml.example config.toml
 cargo run --release
 ```
 
-没有 `kovi.conf.toml` 时会交互生成。Linux 部署请加 `--features jemalloc` 或 `mimalloc`（二者互斥），否则词云/截图后 RSS 不易回落。
+没有 `kovi.conf.toml` 时会交互生成。Linux 部署请加 `--features jemalloc` 或 `mimalloc`（二者互斥），否则词云/截图后 RSS 不易回落。图库发图默认 base64 内嵌；加 `image-send-file` 改为 `file://` 路径直发（要求 OneBot 端能读到 `data/image_lib/` 目录）。
 
 `image_lib` 的裁剪检测动态链接系统 OpenCV，目标机要有相同 minor 版本的运行库。动态链接 OpenCV 后 musl 目标不可用，交叉部署用 cargo-zigbuild 在目标 glibc 版本上钉版编译。
 
