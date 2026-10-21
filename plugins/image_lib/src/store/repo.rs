@@ -349,10 +349,10 @@ pub(super) async fn insert_images(
     library: &str,
     images: &[&StagedImage],
 ) -> Result<(), StoreError> {
-    // 新图按「落后一次」入场（库内最小值 +1），垫底的老图优先于新图。
-    // 空库时 MIN 为 NULL，+1 后仍是 NULL，unwrap_or 兜底为 0。
+    // 新图按库内平均入场（向上取整），与存量图的平均水平同档；
+    // 空库时均值为 NULL，兜底为 0。(SUM + N - 1) / N 是非负整数的向上取整。
     let draw_count = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MIN(draw_count) + 1 FROM images WHERE library = ?",
+        "SELECT (SUM(draw_count) + COUNT(*) - 1) / COUNT(*) FROM images WHERE library = ?",
     )
     .bind(library)
     .fetch_one(pool)
