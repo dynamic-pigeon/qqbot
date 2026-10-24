@@ -15,6 +15,7 @@ use utils::command::{
 use crate::{
     bv_parser::parse_url,
     living::{check_uid, fetch_uid_names},
+    user_agent::user_agent,
 };
 
 mod bv_parser;
@@ -22,6 +23,7 @@ mod config;
 pub mod dynamics;
 mod image;
 mod living;
+mod user_agent;
 
 static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -30,7 +32,7 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::header::HeaderValue::from_static("https://www.bilibili.com/"),
     );
     utils::http_client_builder()
-        .user_agent(dynamics::DEFAULT_USER_AGENT)
+        .user_agent(user_agent())
         .default_headers(headers)
         .build()
         .unwrap()

@@ -52,7 +52,7 @@ impl BrowserManager {
                 ])
                 .arg("disable-blink-features", "AutomationControlled")
                 // B 站风控认 UA；headless 默认带 HeadlessChrome，和 HTTP 直连指纹不一致。
-                .user_agent(super::fetch::user_agent())
+                .user_agent(crate::user_agent::user_agent())
                 .lifecycle_timeout(BROWSER_LIFECYCLE_TIMEOUT)
                 .managed(IDLE_TIMEOUT),
             request_lock: tokio::sync::Mutex::new(()),
