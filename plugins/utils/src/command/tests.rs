@@ -315,134 +315,99 @@ fn catalog_replaces_an_owners_root_and_resolves_alias_paths() {
 }
 
 #[test]
-fn exposed_subcommands_resolve_without_parent_prefix() {
-    let tree = CommandTree::new(vec![
-        Command::new("图库")
-            .sync_handler(|_| Ok(()))
-            .subcommand(endpoint("添加").expose_as_root())
-            .subcommand(endpoint("来只")),
-    ])
-    .unwrap();
-
-    let ResolveOutcome::Matched(add) = tree.resolve("添加 猫") else {
-        panic!("expected exposed subcommand to resolve");
-    };
-    assert_eq!(path(&add), ["图库", "添加"]);
-    assert_eq!(add.args(), ["猫"]);
-
-    let ResolveOutcome::Matched(nested) = tree.resolve("图库 添加 猫") else {
-        panic!("expected nested path to resolve");
-    };
-    assert_eq!(path(&nested), ["图库", "添加"]);
-
-    assert!(matches!(tree.resolve("来只 猫"), ResolveOutcome::Ignored));
-
-    let ResolveOutcome::Matched(parent) = tree.resolve("图库") else {
-        panic!("expected parent handler to resolve");
-    };
-    assert_eq!(path(&parent), ["图库"]);
-
-    let ResolveOutcome::Error(RouteError::UnknownSubcommand { subcommand, .. }) =
-        tree.resolve("图库 乱输")
-    else {
-        panic!("expected unknown subcommand instead of parent args");
-    };
-    assert_eq!(subcommand, "乱输");
-}
-
-#[test]
 fn prefix_match_glues_the_rest_of_the_token_as_the_first_arg() {
     let tree = CommandTree::new(vec![
-        Command::new("图库")
-            .sync_handler(|_| Ok(()))
-            .subcommand(endpoint("来只").expose_as_root().prefix_match())
-            .subcommand(endpoint("删除").expose_as_root().prefix_match())
-            .subcommand(endpoint("删除哈希").expose_as_root().prefix_match()),
+        endpoint("来只").prefix_match(),
+        endpoint("删除").prefix_match(),
+        endpoint("删除哈希").prefix_match(),
     ])
     .unwrap();
 
     let ResolveOutcome::Matched(glued) = tree.resolve("来只猫") else {
         panic!("expected glued prefix match");
     };
-    assert_eq!(path(&glued), ["图库", "来只"]);
+    assert_eq!(path(&glued), ["来只"]);
     assert_eq!(glued.args(), ["猫"]);
     assert_eq!(glued.rest(), "猫");
-
-    let ResolveOutcome::Matched(nested) = tree.resolve("图库 来只猫") else {
-        panic!("expected nested glued child");
-    };
-    assert_eq!(path(&nested), ["图库", "来只"]);
-    assert_eq!(nested.args(), ["猫"]);
-
-    assert!(matches!(
-        tree.resolve("图库来只猫"),
-        ResolveOutcome::Ignored
-    ));
 
     let ResolveOutcome::Matched(hash) = tree.resolve("删除哈希abc") else {
         panic!("expected longest prefix 删除哈希");
     };
-    assert_eq!(path(&hash), ["图库", "删除哈希"]);
+    assert_eq!(path(&hash), ["删除哈希"]);
     assert_eq!(hash.args(), ["abc"]);
 
     let ResolveOutcome::Matched(delete) = tree.resolve("删除abc") else {
         panic!("expected shorter prefix 删除");
     };
-    assert_eq!(path(&delete), ["图库", "删除"]);
+    assert_eq!(path(&delete), ["删除"]);
     assert_eq!(delete.args(), ["abc"]);
 }
 
 #[test]
-fn rejects_exposed_root_name_conflicts_with_real_roots() {
-    let conflict = CommandTree::new(vec![
-        endpoint("添加"),
+fn prefix_match_subcommand_glues_the_rest_of_the_word() {
+    let tree = CommandTree::new(vec![
         Command::new("图库")
             .sync_handler(|_| Ok(()))
-            .subcommand(endpoint("添加").expose_as_root()),
-    ]);
+            .subcommand(endpoint("来只").prefix_match()),
+    ])
+    .unwrap();
+
+    let ResolveOutcome::Matched(glued) = tree.resolve("图库 来只猫") else {
+        panic!("expected nested glued child");
+    };
+    assert_eq!(path(&glued), ["图库", "来只"]);
+    assert_eq!(glued.args(), ["猫"]);
+
     assert!(matches!(
-        conflict,
-        Err(CommandRegistrationError::DuplicateName { .. })
+        tree.resolve("图库来只猫"),
+        ResolveOutcome::Ignored
     ));
 }
 
 #[test]
-fn catalog_groups_exposed_subcommands_under_parent_root() {
+fn catalog_folds_groups_and_expands_by_label() {
     let tree = CommandTree::new(vec![
         Command::new("图库")
             .description("管理本群图库")
-            .sync_handler(|_| Ok(()))
-            .subcommand(
-                endpoint("添加")
-                    .description("写入图库")
-                    .usage("添加 <库名>")
-                    .expose_as_root(),
-            ),
+            .group("图库")
+            .sync_handler(|_| Ok(())),
+        endpoint("添加")
+            .description("写入图库")
+            .usage("添加 <库名>")
+            .group("图库"),
+        endpoint("/help"),
     ])
     .unwrap();
     let mut catalog = CatalogStore::default();
     catalog.register("image_lib", &tree).unwrap();
 
-    assert_eq!(catalog.roots().len(), 1);
-    assert!(catalog.render_help(&[]).contains("`图库`: 管理本群图库"));
-    assert!(!catalog.render_help(&[]).contains("`添加`"));
-    assert!(catalog.render_help(&["图库"]).contains("`添加`: 写入图库"));
+    // 顶层只留组入口一行，成员不外漏。
+    let overview = catalog.render_help(&[]);
+    assert!(overview.contains("• 【图库】2 条: /help 图库 查看"));
+    assert!(!overview.contains("• `添加`"));
+    assert!(!overview.contains("• `图库`: 管理本群图库"));
+    assert!(overview.contains("• `/help`:"));
+
+    // `/help <标签>` 展开组员；单命令详情不受分组影响。
+    let expanded = catalog.render_help(&["图库"]);
+    assert!(expanded.starts_with("📖 【图库】"));
+    assert!(expanded.contains("• `图库`: 管理本群图库"));
+    assert!(expanded.contains("• `添加`: 写入图库"));
+    assert!(catalog.render_help(&["添加"]).contains("用法: 添加 <库名>"));
 
     let help = catalog.find(&["添加"]).unwrap();
-    assert_eq!(help.command.path, ["图库", "添加"]);
-    assert!(catalog.render_help(&["添加"]).contains("用法: 添加 <库名>"));
+    assert_eq!(help.command.path, ["添加"]);
 }
 
 #[test]
 fn catalog_rejects_root_conflicts_between_plugins() {
-    let grouped = CommandTree::new(vec![
-        Command::new("图库")
-            .sync_handler(|_| Ok(()))
-            .subcommand(endpoint("添加").expose_as_root()),
-    ])
-    .unwrap();
     let mut catalog = CatalogStore::default();
-    catalog.register("image_lib", &grouped).unwrap();
+    catalog
+        .register(
+            "image_lib",
+            &CommandTree::new(vec![endpoint("添加").group("图库")]).unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
         catalog.register("other", &CommandTree::new(vec![endpoint("添加")]).unwrap()),
         Err(CommandRegistrationError::RootConflict { ref root, .. }) if root == "添加"

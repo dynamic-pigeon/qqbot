@@ -22,8 +22,17 @@ const REPLY: Duration = Duration::from_secs(8);
 const SLOW: Duration = Duration::from_secs(45);
 
 /// 帮助列表必须出现的命令，同时也是注册完成的判定门槛。
+/// 分组插件折成一行入口，用组标签判定；各插件一次 install 全量注册，
+/// 标签出现即该插件注册完成。
 const HELP_NEEDLES: [&str; 8] = [
-    "/help", "/wordle", "/live", "/dynamic", "图库", "!md", "/查卡", "/周报",
+    "/help",
+    "/wordle",
+    "【B站】",
+    "【图库】",
+    "!md",
+    "/查卡",
+    "/周报",
+    "【B话榜】",
 ];
 
 async fn assert_contains(server: &MockOneBot, cmd: &str, needle: &str) {

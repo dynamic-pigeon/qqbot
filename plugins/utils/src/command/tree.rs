@@ -139,7 +139,6 @@ pub struct CommandTree {
 impl CommandTree {
     pub fn new(mut roots: Vec<Command>) -> Result<Self, CommandRegistrationError> {
         validate_siblings(&roots, &[])?;
-        validate_exposed_root_names(&roots)?;
         for root in &mut roots {
             prepare_node(root, Permission::Everyone, MessageScope::Any, &[])?;
         }
@@ -237,28 +236,16 @@ impl CommandTree {
         &self.roots
     }
 
-    /// `/help 添加` 要命中根别名，`/help 图库 添加` 要走规范路径；路由 resolve 只处理调用。
+    /// `/help /live add` 走规范路径并命中根别名；路由 resolve 只处理调用。
     pub(crate) fn find_for_help(&self, path: &[&str]) -> Option<(&Command, Vec<String>)> {
         if path.is_empty() {
             return None;
         }
-        find_canonical(&self.roots, path).or_else(|| find_exposed(&self.roots, path))
+        find_canonical(&self.roots, path)
     }
 
     pub(crate) fn root_facing_names(&self) -> Vec<&str> {
-        let mut names = Vec::new();
-        fn walk<'a>(command: &'a Command, faces_root: bool, names: &mut Vec<&'a str>) {
-            if faces_root {
-                names.extend(command.names());
-            }
-            for child in &command.children {
-                walk(child, child.expose_as_root, names);
-            }
-        }
-        for root in &self.roots {
-            walk(root, true, &mut names);
-        }
-        names
+        self.roots.iter().flat_map(|root| root.names()).collect()
     }
 }
 
@@ -296,49 +283,12 @@ struct RootHit<'a> {
 }
 
 fn match_root_facing<'a>(roots: &'a [Command], token: &str) -> Option<RootHit<'a>> {
-    let mut best: Option<RootHit<'a>> = None;
-
-    fn consider<'a>(
-        best: &mut Option<RootHit<'a>>,
-        node: &'a Command,
-        path: Vec<String>,
-        token: &str,
-    ) {
-        if let Some(len) = token_match(node, token)
-            && best
-                .as_ref()
-                .is_none_or(|current| len > current.matched_len)
-        {
-            *best = Some(RootHit {
-                node,
-                path,
-                matched_len: len,
-            });
-        }
-    }
-
-    fn walk_exposed<'a>(
-        best: &mut Option<RootHit<'a>>,
-        node: &'a Command,
-        path: &[String],
-        token: &str,
-    ) {
-        for child in &node.children {
-            let mut child_path = path.to_vec();
-            child_path.push(child.name.clone());
-            if child.expose_as_root {
-                consider(best, child, child_path.clone(), token);
-            }
-            walk_exposed(best, child, &child_path, token);
-        }
-    }
-
-    for root in roots {
-        let path = vec![root.name.clone()];
-        consider(&mut best, root, path.clone(), token);
-        walk_exposed(&mut best, root, &path, token);
-    }
-    best
+    let (node, matched_len) = match_siblings(roots, token)?;
+    Some(RootHit {
+        node,
+        path: vec![node.name.clone()],
+        matched_len,
+    })
 }
 
 fn child_names(node: &Command) -> Vec<String> {
@@ -414,42 +364,6 @@ fn find_canonical<'a>(roots: &'a [Command], path: &[&str]) -> Option<(&'a Comman
     None
 }
 
-fn find_exposed<'a>(roots: &'a [Command], path: &[&str]) -> Option<(&'a Command, Vec<String>)> {
-    let (first, rest) = path.split_first()?;
-    for root in roots {
-        if let Some(found) = walk_exposed_help(root, std::slice::from_ref(&root.name), first, rest)
-        {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn walk_exposed_help<'a>(
-    node: &'a Command,
-    path: &[String],
-    first: &str,
-    rest: &[&str],
-) -> Option<(&'a Command, Vec<String>)> {
-    for child in &node.children {
-        let mut child_path = path.to_vec();
-        child_path.push(child.name.clone());
-        if child.expose_as_root && help_token_hits(child, first, true) {
-            if rest.is_empty() {
-                return Some((child, child_path));
-            }
-            let mut canonical = child_path.clone();
-            if let Some(found) = descend(child, &mut canonical, rest, false) {
-                return Some((found, canonical));
-            }
-        }
-        if let Some(found) = walk_exposed_help(child, &child_path, first, rest) {
-            return Some(found);
-        }
-    }
-    None
-}
-
 fn prepare_node(
     node: &mut Command,
     inherited_permission: Permission,
@@ -483,39 +397,6 @@ fn prepare_node(
     validate_siblings(&node.children, &path)?;
     for child in &mut node.children {
         prepare_node(child, permission, scope, &path)?;
-    }
-    Ok(())
-}
-
-fn validate_exposed_root_names(roots: &[Command]) -> Result<(), CommandRegistrationError> {
-    let mut claimed = HashMap::new();
-    for root in roots {
-        for name in root.names() {
-            claimed.insert(name, root.name.as_str());
-        }
-    }
-    for root in roots {
-        claim_exposed_root_names(root, &mut claimed)?;
-    }
-    Ok(())
-}
-
-fn claim_exposed_root_names<'a>(
-    command: &'a Command,
-    claimed: &mut HashMap<&'a str, &'a str>,
-) -> Result<(), CommandRegistrationError> {
-    for child in &command.children {
-        if child.expose_as_root {
-            for name in child.names() {
-                if claimed.insert(name, child.name.as_str()).is_some() {
-                    return Err(CommandRegistrationError::DuplicateName {
-                        parent_path: "<root>".to_owned(),
-                        name: name.to_owned(),
-                    });
-                }
-            }
-        }
-        claim_exposed_root_names(child, claimed)?;
     }
     Ok(())
 }

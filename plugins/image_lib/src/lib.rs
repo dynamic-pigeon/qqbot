@@ -14,7 +14,7 @@ mod send;
 mod similar;
 mod store;
 
-use commands::image_lib_command;
+use commands::image_lib_commands;
 use store::Store;
 
 #[kovi::plugin]
@@ -44,14 +44,14 @@ async fn main() {
         image_config.draw_max_per_window(),
     ));
     CommandRouter::new("image_lib", bot)
-        .register(image_lib_command(store, limiter))
+        .register_all(image_lib_commands(store, limiter))
         .install()
         .expect("注册图库命令失败");
 }
 
 #[cfg(test)]
 mod tests {
-    use utils::command::{CommandTree, Permission, ResolveOutcome};
+    use utils::command::{CommandTree, Permission, ResolveOutcome, RouteError};
 
     use super::*;
 
@@ -70,31 +70,35 @@ mod tests {
     fn command_tree() -> CommandTree {
         let store = dummy_store();
         let config = crate::config::StaticConfig::default();
-        CommandTree::new(vec![image_lib_command(
+        CommandTree::new(image_lib_commands(
             store,
             Arc::new(RateLimiter::new(
                 config.draw_window(),
                 config.draw_max_per_window(),
             )),
-        )])
+        ))
         .unwrap()
     }
 
     #[test]
-    fn root_aliases_share_parent_and_admin_keeps_permission() {
+    fn bare_word_commands_are_group_scoped_roots() {
         let tree = command_tree();
 
         let ResolveOutcome::Matched(add) = tree.resolve("添加 猫") else {
             panic!("expected 添加");
         };
-        assert_eq!(add.path(), ["图库", "添加"]);
+        assert_eq!(add.path(), ["添加"]);
         assert_eq!(add.args(), ["猫"]);
+        assert_eq!(add.scope(), utils::command::MessageScope::Group);
 
-        let ResolveOutcome::Matched(nested) = tree.resolve("图库 添加 猫") else {
-            panic!("expected 图库 添加");
+        // 「图库」下仍有子命令，对不上的下一词按未知子命令报错，
+        // 不会落回图库列表 handler 当参数处理。
+        let ResolveOutcome::Error(RouteError::UnknownSubcommand { subcommand, .. }) =
+            tree.resolve("图库 添加 猫")
+        else {
+            panic!("expected unknown subcommand");
         };
-        assert_eq!(nested.path(), add.path());
-        assert_eq!(nested.args(), add.args());
+        assert_eq!(subcommand, "添加");
 
         let ResolveOutcome::Matched(list) = tree.resolve("图库") else {
             panic!("expected 图库");
@@ -104,17 +108,17 @@ mod tests {
         let ResolveOutcome::Matched(scan) = tree.resolve("查重 猫") else {
             panic!("expected 查重");
         };
-        assert_eq!(scan.path(), ["图库", "查重"]);
+        assert_eq!(scan.path(), ["查重"]);
         assert_eq!(scan.permission(), Permission::BotAdmin);
 
         let ResolveOutcome::Matched(crop) = tree.resolve("查裁剪 猫") else {
             panic!("expected 查裁剪");
         };
-        assert_eq!(crop.path(), ["图库", "查裁剪"]);
+        assert_eq!(crop.path(), ["查裁剪"]);
         assert_eq!(crop.permission(), Permission::BotAdmin);
 
         // 「确认」「取消」必须走完整的「图库 确认」：裸发不触发，防止群里
-        // 随口说「确认」执行待确认的清空；给它们加 expose_as_root 会在此红。
+        // 随口说「确认」执行待确认的清空；把它们提为根命令会在此红。
         assert!(matches!(tree.resolve("确认"), ResolveOutcome::Ignored));
         assert!(matches!(tree.resolve("取消"), ResolveOutcome::Ignored));
         let ResolveOutcome::Matched(confirm) = tree.resolve("图库 确认") else {
