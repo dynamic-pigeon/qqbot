@@ -14,7 +14,7 @@ use md5::{Digest as _, Md5};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE as COOKIE_HEADER};
 use serde::Deserialize;
 
-use crate::CLIENT;
+use crate::{CLIENT, user_agent::user_agent};
 
 /// 从 `BILIBILI_COOKIE` 环境变量读取可选的 cookie 字符串。
 /// 典型值: `"buvid3=xxx; b_nut=xxx"` 或 `"SESSDATA=xxx; buvid3=xxx"`。
@@ -31,27 +31,6 @@ static COOKIE: LazyLock<Option<String>> = LazyLock::new(|| {
 /// `BILIBILI_COOKIE` 被判定登录态失效（API `-101`）后置位，本进程内回退游客会话。
 /// SESSDATA 过期后若继续带坏 cookie 刷新会话，每次轮询都会退化到串行的 Chromium 后备。
 static ENV_COOKIE_INVALID: AtomicBool = AtomicBool::new(false);
-
-/// 默认 User-Agent，用于 `BILIBILI_USER_AGENT` 未设置时的 fallback。
-/// 选用 Chrome Linux 最新稳定版的常见格式。
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-    (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
-
-/// 从 `BILIBILI_USER_AGENT` 环境变量解析 UA；未设置或空白时回退到默认。
-fn resolve_user_agent(raw: Option<&str>) -> String {
-    raw.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
-}
-
-/// HTTP 直连与 Chromium 后备共用同一份 UA，避免两条路径指纹不一致。
-static USER_AGENT: LazyLock<String> =
-    LazyLock::new(|| resolve_user_agent(std::env::var("BILIBILI_USER_AGENT").ok().as_deref()));
-
-pub(super) fn user_agent() -> &'static str {
-    USER_AGENT.as_str()
-}
 
 /// 直连 API 响应字节上限：正常动态 JSON 只有几百 KB，超限说明响应异常
 /// （被风控返回 HTML 或超大 payload），与 Chromium 后备路径的上限一致。
@@ -321,6 +300,12 @@ async fn fetch_mixin_key(cookie: &str) -> Result<String, DynamicsError> {
     mixin_key(&images.img_url, &images.sub_url)
 }
 
+/// 当前会话的 cookie（env `BILIBILI_COOKIE` 优先，游客会话兜底），
+/// 供动态直连之外的出站请求（如 BV 解析）共用同一份登录态/指纹。
+pub(crate) async fn session_cookie() -> Result<String, DynamicsError> {
+    Ok(web_session(false).await?.cookie)
+}
+
 async fn web_session(force_refresh: bool) -> Result<WebSession, DynamicsError> {
     if !force_refresh {
         let state = WEB_SESSION.lock().await;
@@ -365,7 +350,7 @@ async fn fetch_page(
     let url = build_space_url(uid, offset, &session.mixin_key, wts);
     let response = CLIENT
         .get(url)
-        .header(reqwest::header::USER_AGENT, USER_AGENT.as_str())
+        .header(reqwest::header::USER_AGENT, user_agent())
         .header(
             reqwest::header::REFERER,
             format!("https://space.bilibili.com/{uid}/dynamic"),
@@ -452,7 +437,7 @@ fn convert_page_data(data: SpaceData) -> DynamicsPage {
 ///
 /// **Env vars:** 通过 `.env` 文件或系统环境设置以下变量：
 /// - `BILIBILI_COOKIE` — 可选的 B 站 cookie；未设置时自动获取游客 Cookie
-/// - `BILIBILI_USER_AGENT` — HTTP 直连与 Chromium 后备共用的 UA；未设置时用内置 Chrome 147 Linux
+/// - `BILIBILI_USER_AGENT` — 插件全局共享 UA（含 BV 解析的 CLIENT）；未设置时回退内置默认 UA
 ///
 /// 注意: B 站 web dynamic 接口风控较严，依赖 host 的 User-Agent + Referer +
 /// WBI 签名和游客 Cookie。从被风控的 IP 调用仍可能返回 HTML 验证码页、
@@ -744,17 +729,6 @@ mod tests {
 mod url_tests {
     use super::*;
     use crate::dynamics::types::{ArticleRaw, LiveRaw, MajorRaw, ModulesRaw};
-
-    #[test]
-    fn user_agent_trims_and_falls_back() {
-        assert_eq!(resolve_user_agent(None), DEFAULT_USER_AGENT);
-        assert_eq!(resolve_user_agent(Some("")), DEFAULT_USER_AGENT);
-        assert_eq!(resolve_user_agent(Some("  \t")), DEFAULT_USER_AGENT);
-        assert_eq!(
-            resolve_user_agent(Some("  CustomBot/1.0  ")),
-            "CustomBot/1.0"
-        );
-    }
 
     #[test]
     fn space_url_includes_uid_features_and_optional_offset() {

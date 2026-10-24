@@ -184,7 +184,13 @@ async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
 
 async fn parse_bv(bv: &str) -> Result<BvInfo, BvError> {
     let url = format!("https://api.bilibili.com/x/web-interface/view?bvid={}", bv);
-    let res = CLIENT.get(&url).send().await?.json::<ApiRes>().await?;
+    // view API 对裸请求返回 412 风控页，必须带会话 cookie（与动态直连共用同一份）。
+    let mut request = CLIENT.get(&url);
+    match crate::dynamics::session_cookie().await {
+        Ok(cookie) => request = request.header(reqwest::header::COOKIE, cookie),
+        Err(e) => tracing::warn!("获取会话 cookie 失败，BV 裸请求继续: {e}"),
+    }
+    let res = request.send().await?.json::<ApiRes>().await?;
 
     res.into_bv_info(format!("https://www.bilibili.com/video/{}", bv))
         .await

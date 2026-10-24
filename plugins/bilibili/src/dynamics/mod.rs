@@ -2,8 +2,8 @@ mod browser;
 mod fetch;
 mod types;
 
-pub(crate) use fetch::DEFAULT_USER_AGENT;
 pub use fetch::fetch_user_dynamics;
+pub(crate) use fetch::session_cookie;
 pub use types::{DynamicAuthor, DynamicItem, Pic, RichText};
 
 /// B 站动态 / 封面图片域名白名单，用于 `validate_image_url` 的 SSRF 防御。
