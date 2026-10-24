@@ -33,7 +33,7 @@ pub(crate) struct OutgoingImage {
 
 impl OutgoingImage {
     /// 库内 blob。send-file 形态直接把绝对路径写进消息段，由 OneBot
-    /// 端读盘上传，bot 不再把内容读进内存；默认形态读盘转 base64。
+    /// 端读盘上传，bot 侧不读内容；默认形态读盘转 base64。
     /// 文件不在（刚被回收或盘坏）返回 None，调用方按图缺失处理。
     pub(crate) async fn from_blob(
         store: &crate::store::Store,

@@ -28,15 +28,33 @@ use crate::store::{CropPlan, StagedImage, Store, StoreError};
 #[cfg(not(feature = "send-file"))]
 const MAX_GROUP_READ_BYTES: usize = 32 * 1024 * 1024;
 
-pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
+/// 图库命令集：各工厂自带群聊范围与「图库」分组，这里只决定注册顺序；
+/// 分组在 /help 顶层折成一行入口（/help 图库 展开）。
+pub fn image_lib_commands(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Vec<Command> {
     let scans = Arc::new(ScanSessions::new());
     // 裁剪会话与查重会话同库同人也互不覆盖：两个命令各自翻页。
     let crop_scans = Arc::new(ScanSessions::new());
     let wipes = Arc::new(WipeConfirmations::new());
+    vec![
+        list_command(Arc::clone(&store), Arc::clone(&wipes)),
+        add_command(Arc::clone(&store)),
+        draw_command(Arc::clone(&store), limiter),
+        delete_command(Arc::clone(&store), Arc::clone(&wipes)),
+        alias_command(Arc::clone(&store)),
+        unalias_command(Arc::clone(&store)),
+        send_hash_command(Arc::clone(&store)),
+        delete_hash_command(Arc::clone(&store)),
+        scan_command(Arc::clone(&store), scans),
+        crop_scan_command(store, crop_scans),
+    ]
+}
+
+fn list_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
     Command::new("图库")
         .description("管理本群图库")
         .usage("图库")
         .scope(MessageScope::Group)
+        .group("图库")
         .handler({
             let store = Arc::clone(&store);
             move |ctx| {
@@ -44,24 +62,16 @@ pub fn image_lib_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> C
                 async move { handle_list(ctx, &store).await }
             }
         })
-        .subcommand(add_command(Arc::clone(&store)))
-        .subcommand(draw_command(Arc::clone(&store), limiter))
-        .subcommand(delete_command(Arc::clone(&store), Arc::clone(&wipes)))
         .subcommand(confirm_command(Arc::clone(&store), Arc::clone(&wipes)))
         .subcommand(cancel_command(wipes))
-        .subcommand(alias_command(Arc::clone(&store)))
-        .subcommand(unalias_command(Arc::clone(&store)))
-        .subcommand(send_hash_command(Arc::clone(&store)))
-        .subcommand(delete_hash_command(Arc::clone(&store)))
-        .subcommand(scan_command(Arc::clone(&store), scans))
-        .subcommand(crop_scan_command(store, crop_scans))
 }
 
 fn add_command(store: Arc<Store>) -> Command {
     Command::new("添加")
         .description("把本条消息或回复里的图写入本群指定图库")
         .usage("添加 <库名>")
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -73,7 +83,8 @@ fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
     Command::new("来只")
         .description("从本群指定图库随机发一张图")
         .usage("来只 <库名>")
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -88,7 +99,8 @@ fn delete_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
             "带图或回复一张图删除该图；管理员删除库名或别名会登记待清空，需「图库 确认」执行",
         )
         .usage("删除\n删除 <库名或别名>")
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -97,7 +109,8 @@ fn delete_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
         })
 }
 
-/// 不 expose_as_root：确认入口必须走完整的「图库 确认」，避免群里随口说「确认」误触发。
+/// 挂在「图库」下而不提为根命令：确认入口必须走完整的「图库 确认」，
+/// 避免群里随口说「确认」误触发。
 fn confirm_command(store: Arc<Store>, wipes: Arc<WipeConfirmations>) -> Command {
     Command::new("确认")
         .description("确认执行登记的清空图库操作")
@@ -127,7 +140,8 @@ fn alias_command(store: Arc<Store>) -> Command {
     Command::new("别名")
         .description("给已有图库起别名；末尾加「合并」会把原库并进目标库")
         .usage("别名 <别名> <库名> [合并]")
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -139,7 +153,8 @@ fn unalias_command(store: Arc<Store>) -> Command {
     Command::new("取消别名")
         .description("去掉一个图库别名，不删除图片")
         .usage("取消别名 <别名>")
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -152,7 +167,8 @@ fn send_hash_command(store: Arc<Store>) -> Command {
         .description("按内容哈希发送本群已存的图")
         .usage("哈希 <哈希或前缀>")
         .permission(Permission::BotAdmin)
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -165,7 +181,8 @@ fn delete_hash_command(store: Arc<Store>) -> Command {
         .description("按内容哈希删除本群已存的图")
         .usage("删除哈希 <哈希或前缀>")
         .permission(Permission::BotAdmin)
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -178,7 +195,8 @@ fn scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
         .description("扫指定图库的近重复，聊天记录每次最多 5 组")
         .usage("查重 <库名> [组号|下一组|相似度%]")
         .permission(Permission::BotAdmin)
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);
@@ -192,7 +210,8 @@ fn crop_scan_command(store: Arc<Store>, scans: Arc<ScanSessions>) -> Command {
         .description("扫指定图库的裁剪局部对，先整体后局部，每次最多 5 组")
         .usage("查裁剪 <库名> [组号|下一组]")
         .permission(Permission::BotAdmin)
-        .expose_as_root()
+        .scope(MessageScope::Group)
+        .group("图库")
         .prefix_match()
         .handler(move |ctx| {
             let store = Arc::clone(&store);

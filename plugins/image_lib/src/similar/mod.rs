@@ -132,7 +132,7 @@ pub(super) fn difference_hash(gray: &GrayImage) -> [u64; FINGERPRINT_WORDS] {
 }
 
 /// 32×32 DCT 后取 (1,1) 起的 16×16 AC 系数 = 256 bit。
-/// 比旧的 8×8 窗口多收中频结构，对低频格局撞车的图区分度更高。
+/// 比 8×8 窗口多收中频结构，对低频格局撞车的图区分度更高。
 fn perceptual_hash(gray: &GrayImage) -> [u64; FINGERPRINT_WORDS] {
     let small = image::imageops::resize(gray, PHASH_SIZE, PHASH_SIZE, FilterType::Triangle);
     let mut values = [[0.0f64; PHASH_SIZE as usize]; PHASH_SIZE as usize];

@@ -30,6 +30,11 @@ impl CommandRouter {
         self
     }
 
+    pub fn register_all(mut self, commands: impl IntoIterator<Item = Command>) -> Self {
+        self.commands.extend(commands);
+        self
+    }
+
     pub fn install(self) -> Result<(), CommandRegistrationError> {
         let tree = Arc::new(CommandTree::new(self.commands)?);
         CommandCatalog::register(&self.owner, &tree)?;

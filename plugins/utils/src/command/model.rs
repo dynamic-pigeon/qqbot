@@ -261,7 +261,7 @@ pub struct Command {
     pub(crate) scope: Option<MessageScope>,
     pub(crate) children: Vec<Command>,
     pub(crate) handler: Option<CommandHandler>,
-    pub(crate) expose_as_root: bool,
+    pub(crate) group: Option<String>,
     pub(crate) prefix_match: bool,
 }
 
@@ -276,7 +276,7 @@ impl Command {
             scope: None,
             children: Vec::new(),
             handler: None,
-            expose_as_root: false,
+            group: None,
             prefix_match: false,
         }
     }
@@ -315,10 +315,10 @@ impl Command {
         self
     }
 
-    /// 子命令仍挂在父节点下，同时允许不带父路径按根命令匹配。
-    /// 帮助目录只展示父命令。
-    pub fn expose_as_root(mut self) -> Self {
-        self.expose_as_root = true;
+    /// 帮助目录的分组标签：同标签的根命令在 /help 顶层折成一行入口，
+    /// 经 `/help <标签>` 展开成员。只影响展示，不参与路由匹配。
+    pub fn group(mut self, label: impl Into<String>) -> Self {
+        self.group = Some(label.into());
         self
     }
 

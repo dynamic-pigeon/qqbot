@@ -61,6 +61,7 @@ fn live_command() -> Command {
         .description("管理本群的 B 站直播订阅")
         .usage("/live <add|rm|list>")
         .scope(MessageScope::Group)
+        .group("B站")
         .subcommand(
             Command::new("add")
                 .description("添加直播订阅")
@@ -89,6 +90,7 @@ fn dynamic_command() -> Command {
         .description("管理本群的 B 站动态订阅")
         .usage("/dynamic <add|rm|list|fetch>")
         .scope(MessageScope::Group)
+        .group("B站")
         .subcommand(
             Command::new("add")
                 .description("添加动态订阅")

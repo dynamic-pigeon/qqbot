@@ -30,12 +30,10 @@ pub(super) fn acquire_rank_cooldown(group_id: i64) -> CommandResult {
     Ok(())
 }
 
-/// 一档 B 话榜：子命令名、根直连触发词、帮助描述与时间范围。
-/// 子命令名带「B话榜」后缀：expose_as_root 会让名字成为裸词触发词，
-/// 用「今日」这类常见句首词会在群聊里误触发。
+/// 一档 B 话榜：命令名（带 `/` 的触发词）、不带斜杠的裸词别名、帮助描述与时间范围。
 struct RankSpan {
-    sub: &'static str,
-    trigger: &'static str,
+    name: &'static str,
+    bare: &'static str,
     description: &'static str,
     kind: RankKind,
 }
@@ -52,61 +50,74 @@ enum RankKind {
 
 const RANK_SPANS: [RankSpan; 6] = [
     RankSpan {
-        sub: "今日B话榜",
-        trigger: "/今日B话榜",
+        name: "/今日B话榜",
+        bare: "今日B话榜",
         description: "看看今天的群友发了多少消息！",
         kind: RankKind::Today,
     },
     RankSpan {
-        sub: "昨日B话榜",
-        trigger: "/昨日B话榜",
+        name: "/昨日B话榜",
+        bare: "昨日B话榜",
         description: "看看昨天的群友发了多少消息！",
         kind: RankKind::Yesterday,
     },
     RankSpan {
-        sub: "前日B话榜",
-        trigger: "/前日B话榜",
+        name: "/前日B话榜",
+        bare: "前日B话榜",
         description: "看看前天的群友发了多少消息！",
         kind: RankKind::BeforeYesterday,
     },
     RankSpan {
-        sub: "本周B话榜",
-        trigger: "/本周B话榜",
+        name: "/本周B话榜",
+        bare: "本周B话榜",
         description: "看看本周的群友发了多少消息！",
         kind: RankKind::ThisWeek,
     },
     RankSpan {
-        sub: "上周B话榜",
-        trigger: "/上周B话榜",
+        name: "/上周B话榜",
+        bare: "上周B话榜",
         description: "看看上周的群友发了多少消息！",
         kind: RankKind::LastWeek,
     },
     RankSpan {
-        sub: "本月B话榜",
-        trigger: "/本月B话榜",
+        name: "/本月B话榜",
+        bare: "本月B话榜",
         description: "看看这个月的群友发了多少消息！",
         kind: RankKind::ThisMonth,
     },
 ];
 
-/// 六档榜单挂在 `/B话榜` 父命令下；子命令 expose_as_root，
-/// `/今日B话榜` 这类直连写法可用，而 `/help` 根列表只占一行。
-pub(crate) fn rank_command() -> Command {
-    let parent = Command::new("/B话榜")
-        .description("群友发言排行（今日/昨日/前日/本周/上周/本月）")
-        .usage("/B话榜 <档位>")
-        .scope(MessageScope::Group);
-    RANK_SPANS.iter().fold(parent, |parent, span| {
+/// 六档榜单是六个独立根命令，折进 /help 的「B话榜」分组（/help B话榜 展开）；
+/// `/B话榜` 本体保留为入口，直接回档位用法。
+pub(crate) fn rank_commands() -> Vec<Command> {
+    let mut commands = vec![
+        Command::new("/B话榜")
+            .description("群友发言排行（今日/昨日/前日/本周/上周/本月）")
+            .usage("/B话榜 <档位>")
+            .scope(MessageScope::Group)
+            .group("B话榜")
+            .sync_handler(rank_usage),
+    ];
+    commands.extend(RANK_SPANS.iter().map(|span| {
         let kind = span.kind;
-        parent.subcommand(
-            Command::new(span.sub)
-                .alias(span.trigger)
-                .description(span.description)
-                .usage(span.trigger)
-                .handler(move |ctx| handle_rank(ctx, kind))
-                .expose_as_root(),
-        )
-    })
+        Command::new(span.name)
+            .alias(span.bare)
+            .description(span.description)
+            .usage(span.name)
+            .scope(MessageScope::Group)
+            .group("B话榜")
+            .handler(move |ctx| handle_rank(ctx, kind))
+    }));
+    commands
+}
+
+fn rank_usage(ctx: CommandContext) -> CommandResult {
+    let spans: Vec<&str> = RANK_SPANS.iter().map(|span| span.name).collect();
+    ctx.reply(format!(
+        "用法: /B话榜 <档位>\n可用档位: {}",
+        spans.join(" | ")
+    ));
+    Ok(())
 }
 
 async fn handle_rank(ctx: CommandContext, kind: RankKind) -> CommandResult {
@@ -323,7 +334,7 @@ mod command_tests {
 
     #[test]
     fn rank_commands_are_public_group_commands() {
-        let tree = utils::command::CommandTree::new(vec![super::rank_command()]).unwrap();
+        let tree = utils::command::CommandTree::new(super::rank_commands()).unwrap();
         for trigger in [
             "/今日B话榜",
             "/昨日B话榜",
@@ -331,8 +342,8 @@ mod command_tests {
             "/本周B话榜",
             "/上周B话榜",
             "/本月B话榜",
-            "/B话榜 今日B话榜",
-            "/B话榜 上周B话榜",
+            "今日B话榜",
+            "上周B话榜",
         ] {
             let ResolveOutcome::Matched(command) = tree.resolve(trigger) else {
                 panic!("{trigger} 应能解析");
@@ -342,24 +353,12 @@ mod command_tests {
         }
         // 裸的「今日」是常见聊天句首词，不应误触发。
         assert!(matches!(tree.resolve("今日"), ResolveOutcome::Ignored));
-        // 光打父命令应提示选择子命令，而不是被忽略。
-        let ResolveOutcome::Error(error) = tree.resolve("/B话榜") else {
-            panic!("`/B话榜` 应返回缺少子命令错误");
+        // 光打 `/B话榜` 直接命中入口命令，由 handler 回档位用法。
+        let ResolveOutcome::Matched(entry) = tree.resolve("/B话榜") else {
+            panic!("`/B话榜` 应解析为入口命令");
         };
-        let utils::command::RouteError::MissingSubcommand { available, .. } = error else {
-            panic!("`/B话榜` 应是缺少子命令错误: {error:?}");
-        };
-        assert_eq!(
-            available,
-            [
-                "今日B话榜",
-                "昨日B话榜",
-                "前日B话榜",
-                "本周B话榜",
-                "上周B话榜",
-                "本月B话榜"
-            ]
-        );
+        assert_eq!(entry.path(), ["/B话榜"]);
+        assert_eq!(entry.scope(), MessageScope::Group);
         assert!(matches!(
             tree.resolve("#今日发言排行"),
             ResolveOutcome::Ignored

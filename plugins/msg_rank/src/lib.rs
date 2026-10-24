@@ -41,7 +41,7 @@ async fn main() {
     CommandRouter::new("msg_rank", Arc::clone(&bot))
         .register(record_command())
         .register(word_cloud::wordcloud_command(Arc::clone(&path)))
-        .register(msg_rank::rank_command())
+        .register_all(msg_rank::rank_commands())
         .register(msg_rank::weekly_report::weekly_report_command(Arc::clone(
             &path,
         )))

@@ -1,5 +1,5 @@
 //! 全局感知哈希对裁剪天然失明：构图一变频谱就漂移，实测中心裁剪保留 96%
-//! 时 pHash 距离已 88/256。裁剪的判据换成局部特征：B 是 A 的裁剪 ⇔ B 的
+//! 时 pHash 距离已 88/256。裁剪的判据是局部特征：B 是 A 的裁剪 ⇔ B 的
 //! SIFT 特征几乎全部能按一张单应矩阵映射进 A；findHomography 的 RANSAC
 //! inlier 数就是几何一致的证据，随机图凑不出。链接的 OpenCV 版本由
 //! pkg-config 决定（指向见 .cargo/config.toml，未入库），SONAME 必须与
@@ -308,8 +308,7 @@ impl DotKernel for K256 {
     }
 }
 
-/// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。CPU flags 在
-/// 虚拟化环境有虚报前科,换部署目标时先实测。
+/// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。
 fn quantized_kernel_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
