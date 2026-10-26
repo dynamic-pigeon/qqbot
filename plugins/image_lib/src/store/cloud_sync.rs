@@ -5,23 +5,33 @@
 //! 恢复一律以 backups/ 下的 VACUUM 快照为准,见 backup.rs 的恢复步骤。
 //! 镜像与本地同构:本地回收的图次日在云端删除,云端大小随各群容量
 //! 上限封顶;超过 `cloud_sync_max_gib` 的体积闸门时跳过同步并报错,
-//! 防止涨过对象存储免费额度。
+//! 防止涨过对象存储免费额度。完成日志按 rclone 的 JSON 操作行报出
+//! 新增/删除文件数与耗时。
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use kovi::tokio::io::AsyncReadExt as _;
+use kovi::tokio::io::{AsyncBufReadExt as _, BufReader};
 use kovi::tokio::process::Command;
 
 use super::Store;
 
 /// rclone 单次运行上限;超时杀进程放弃本轮,明日备份后重试。
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-/// 失败日志里保留的 rclone stderr 尾部。
-const STDERR_TAIL: usize = 2000;
 const GIB: u64 = 1024 * 1024 * 1024;
+/// 失败日志里保留的 stderr 行数上限。
+const STDERR_LINES: usize = 30;
+
+/// 一轮同步的统计,来自 rclone JSON 日志的操作行。
+#[derive(Default)]
+struct SyncStats {
+    copied: u64,
+    deleted: u64,
+    bytes: u64,
+}
 
 impl Store {
     pub(super) async fn cloud_sync(&self, destination: &str) {
@@ -75,6 +85,7 @@ async fn dir_size(path: &Path) -> Result<u64> {
 }
 
 async fn run_rclone(root: &Path, destination: &str) -> Result<()> {
+    let started = Instant::now();
     let mut child = Command::new("rclone")
         .arg("sync")
         .arg(root)
@@ -91,16 +102,25 @@ async fn run_rclone(root: &Path, destination: &str) -> Result<()> {
         .arg("--exclude=*.db-wal")
         .arg("--exclude=*.db-shm")
         .arg("--exclude=*.tmp")
+        // JSON 日志的操作行用来统计增删;--stats 0 去掉周期性统计噪声。
+        .arg("-v")
+        .arg("--use-json-log")
+        .arg("--stats")
+        .arg("0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("启动 rclone 失败,运行环境装有 rclone 吗")?;
-    let mut handle = child.stderr.take().expect("stderr 已设 piped");
-    let mut stderr = Vec::new();
+    let handle = child.stderr.take().expect("stderr 已设 piped");
+    let mut stats = SyncStats::default();
+    let mut tail = VecDeque::new();
     let status = match kovi::tokio::time::timeout(SYNC_TIMEOUT, async {
-        let status = child.wait().await;
-        let _ = handle.read_to_end(&mut stderr).await;
-        status
+        // 先读到 EOF 再收尸:管道在 rclone 退出时关闭,顺序反了会卡死。
+        let mut lines = BufReader::new(handle).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            classify(&line, &mut stats, &mut tail);
+        }
+        child.wait().await
     })
     .await
     {
@@ -112,32 +132,70 @@ async fn run_rclone(root: &Path, destination: &str) -> Result<()> {
         }
     };
     if status.success() {
-        tracing::info!("图库云同步完成: {destination}");
+        tracing::info!(
+            "图库云同步完成({destination}): 新增 {} 个({}), 删除 {} 个, 用时 {}",
+            stats.copied,
+            crate::commands::format_bytes(stats.bytes),
+            stats.deleted,
+            format_duration(started.elapsed())
+        );
         Ok(())
     } else {
         anyhow::bail!(
-            "rclone 异常退出({status}):{}",
-            tail(&String::from_utf8_lossy(&stderr))
+            "rclone 异常退出({status}): {}",
+            tail.make_contiguous().join("\n")
         )
     }
 }
 
-fn tail(text: &str) -> &str {
-    if text.len() <= STDERR_TAIL {
-        return text;
+/// 归类一行 rclone JSON 日志:操作行累计进统计,任何行滚动保留最后
+/// STDERR_LINES 行,失败时错误就在末尾。
+fn classify(line: &str, stats: &mut SyncStats, tail: &mut VecDeque<String>) {
+    if line.contains("\"msg\":\"Copied") {
+        stats.copied += 1;
+        stats.bytes += copied_size(line);
+    } else if line.contains("\"msg\":\"Deleted\"") {
+        stats.deleted += 1;
     }
-    let mut start = text.len() - STDERR_TAIL;
-    while !text.is_char_boundary(start) {
-        start += 1;
+    tail.push_back(line.to_owned());
+    while tail.len() > STDERR_LINES {
+        tail.pop_front();
     }
-    &text[start..]
+}
+
+/// 取操作行的 `"size":<n>` 字段,解析不出按 0。
+fn copied_size(line: &str) -> u64 {
+    line.split("\"size\":")
+        .nth(1)
+        .and_then(|rest| {
+            rest.chars()
+                .take_while(|byte| byte.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        // 整数取整:按浮点 {:.0} 会把 1.53 分进成 2m。
+        let total = duration.as_secs();
+        format!("{}m{}s", total / 60, total % 60)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
     use kovi::tokio;
 
-    use super::dir_size;
+    use super::{STDERR_LINES, SyncStats, classify, copied_size, dir_size, format_duration};
 
     #[tokio::test]
     async fn dir_size_sums_nested_regular_files() {
@@ -158,5 +216,37 @@ mod tests {
         let total = dir_size(&root).await.unwrap();
         assert_eq!(total, 22);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copied_size_reads_json_field() {
+        let line = r#"{"level":"info","msg":"Copied (new)","size":131072,"object":"f1"}"#;
+        assert_eq!(copied_size(line), 131072);
+        assert_eq!(copied_size(r#"{"msg":"Deleted","object":"f2"}"#), 0);
+    }
+
+    #[test]
+    fn format_duration_splits_minutes() {
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_duration(Duration::from_secs(92)), "1m32s");
+    }
+
+    #[test]
+    fn classify_counts_ops_and_caps_tail() {
+        let mut stats = SyncStats::default();
+        let mut tail = VecDeque::new();
+        for noise in 0..STDERR_LINES + 10 {
+            classify(
+                &format!("{{\"msg\":\"noise {noise}\"}}"),
+                &mut stats,
+                &mut tail,
+            );
+        }
+        classify(r#"{"msg":"Copied (new)","size":10}"#, &mut stats, &mut tail);
+        classify(r#"{"msg":"Deleted","object":"x"}"#, &mut stats, &mut tail);
+        assert_eq!(stats.copied, 1);
+        assert_eq!(stats.bytes, 10);
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(tail.len(), STDERR_LINES);
     }
 }
