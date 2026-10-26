@@ -31,11 +31,14 @@ async fn main() {
     let store = Arc::new(Store::open(bot.get_data_path()).expect("初始化图库存储失败"));
     let cron_store = Arc::clone(&store);
     // cron 重复触发的坑由「同日已备跳过」幂等吸收,不需要额外去抖;
-    // 备份与对账的先后语义见 Store::run_daily_maintenance。
+    // 备份、云同步与对账的先后语义见 Store::run_daily_maintenance。
     plugin::cron(&image_config.backup_cron, move || {
         let store = Arc::clone(&cron_store);
+        let sync_destination = image_config.cloud_sync_destination.clone();
         async move {
-            store.run_daily_maintenance().await;
+            store
+                .run_daily_maintenance(sync_destination.as_deref())
+                .await;
         }
     })
     .expect("注册图库备份 cron 失败");

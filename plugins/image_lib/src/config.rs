@@ -16,6 +16,8 @@ pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 64;
 /// 未配置时备份与对账回收的 cron（本地时区，每天凌晨四点）。必须是
 /// kovi（croner，秒位可选）可解析的五字段表达式，解析失败会在启动期 panic。
 pub(crate) const DEFAULT_BACKUP_CRON: &str = "0 4 * * *";
+/// 未配置时云同步的图库体积闸门，单位 GiB。
+pub(crate) const DEFAULT_CLOUD_SYNC_MAX_GIB: u64 = 9;
 
 /// 根目录 `config.toml` 的 `[image_lib]`。
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -31,6 +33,13 @@ pub(crate) struct StaticConfig {
     /// UTC 日期记，本地凌晨触发时 UTC 仍是前一天，目录名会比本地日期
     /// 早一天；内部自洽，仅观感。
     pub backup_cron: String,
+    /// rclone 云同步目标（`remote:path`），缺省不启用。启用前提是
+    /// 运行环境装有 rclone 且已配好该 remote；每日备份落成后镜像整个
+    /// 图库根目录。
+    pub cloud_sync_destination: Option<String>,
+    /// 云同步体积闸门，单位 GiB：图库根目录超过该值时跳过同步并报错，
+    /// 防止云端涨过对象存储免费额度；调大可实质解除。
+    pub cloud_sync_max_gib: u64,
 }
 
 impl Default for StaticConfig {
@@ -43,6 +52,8 @@ impl Default for StaticConfig {
             duplicate_distance: DEFAULT_DUPLICATE_DISTANCE,
             maybe_distance: DEFAULT_MAYBE_DISTANCE,
             backup_cron: DEFAULT_BACKUP_CRON.into(),
+            cloud_sync_destination: None,
+            cloud_sync_max_gib: DEFAULT_CLOUD_SYNC_MAX_GIB,
         }
     }
 }
@@ -50,6 +61,10 @@ impl Default for StaticConfig {
 impl StaticConfig {
     pub fn max_group_bytes(&self) -> u64 {
         self.max_group_mib.saturating_mul(1024 * 1024)
+    }
+
+    pub fn cloud_sync_limit_bytes(&self) -> u64 {
+        self.cloud_sync_max_gib.saturating_mul(1024 * 1024 * 1024)
     }
 
     pub fn max_image_mib(&self) -> u64 {

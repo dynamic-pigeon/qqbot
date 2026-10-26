@@ -23,6 +23,7 @@ use crate::similar::{
 
 mod backup;
 mod blob_fs;
+mod cloud_sync;
 mod derive;
 mod repo;
 mod schema;
@@ -785,9 +786,14 @@ impl Store {
 
     /// 每日维护入口:同一天数先备份再对账。「今天」只取一次传给两者,
     /// 避免备份跨 UTC 午夜后对账多算一天,把还有目录护着的记录提前清掉。
-    pub(crate) async fn run_daily_maintenance(&self) {
+    pub(crate) async fn run_daily_maintenance(&self, cloud_sync: Option<&str>) {
         let today = backup::today_utc_days();
         self.backup_daily_at(today).await;
+        // 云同步夹在备份与对账之间:先让云端拿到全部快照要引用的文件,
+        // 再允许对账回收过期孤儿。
+        if let Some(destination) = cloud_sync {
+            self.cloud_sync(destination).await;
+        }
         self.reconcile_all_at(today).await;
     }
 
