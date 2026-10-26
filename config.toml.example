@@ -46,3 +46,10 @@ maybe_distance = 64
 # 备份与对账回收的触发时刻（本地时区，五字段 cron）。备份保留七天，
 # 备份还指向的图不会被回收。
 backup_cron = "0 4 * * *"
+# 可选：云同步目标（rclone 语法 remote:path），不写即关闭。启用需运行
+# 环境装有 rclone 且已配好该 remote；每日备份完成后镜像整个图库根目录，
+# 删除会同步传播到云端，恢复时整树拷回再按 backup.rs 模块注释恢复各群库。
+# cloud_sync_destination = "r2:qqbot-image-lib"
+# 云同步体积闸门（单位 GiB）：图库根目录超过该值时跳过同步并报错，
+# 防止云端超出对象存储免费额度；调大可实质解除。
+cloud_sync_max_gib = 9
