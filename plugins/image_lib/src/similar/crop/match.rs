@@ -135,7 +135,8 @@ impl MatchSide {
 /// u8 域数据量是 f32 的四分之一,描述子两两比对的带宽压力随之降四倍。
 /// 逐对折叠(而非按 train 行分块摊销)是实测结论:块化省下的只是 query
 /// 行重复装载,编译器本就把 train 行融进 vpdpbusd 内存操作数并穿插
-/// 调度折叠,块化在 AVX-VNNI 上实测反而慢约四分之一。
+/// 调度折叠,块化在 AVX-VNNI 上实测反而慢约四分之一。四路独立累加
+/// 同样慢约 5%,热循环保持逐对。
 trait DotKernel {
     unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32;
 }
@@ -145,7 +146,7 @@ struct K256;
 
 impl DotKernel for K512 {
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512f,avx512vnni")]
+    #[target_feature(enable = "avx512f,avx512vnni,avx2")]
     unsafe fn dot(a: &[u8; SIFT_DIMS], b_flipped: &[u8; SIFT_DIMS]) -> i32 {
         use std::arch::x86_64::*;
         // edition 2024 的 unsafe fn 体内不再隐式 unsafe,intrinsic 逐块包好。
@@ -156,11 +157,7 @@ impl DotKernel for K512 {
                 unsafe { _mm512_loadu_si512(b_flipped.as_ptr().add(c * 64) as *const __m512i) };
             acc = _mm512_dpbusd_epi32(acc, va, vb);
         }
-        // 不用 _mm512_reduce_add_epi32:横向折叠序列在部分虚拟化环境
-        // 踩非法指令,store 回内存再标量求和只依赖 F+VNNI 基础指令。
-        let mut tmp = [0i32; 16];
-        unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc) };
-        tmp.iter().sum()
+        unsafe { hsum_i32_avx512(acc) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     unsafe fn dot(_: &[u8; SIFT_DIMS], _: &[u8; SIFT_DIMS]) -> i32 {
@@ -204,6 +201,17 @@ unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
     _mm_cvtsi128_si32(sum1)
 }
 
+/// 16 个 i32 通道求和。先折成 256 位再走 [`hsum_i32_avx2`]。
+/// 不用 `_mm512_reduce_add_epi32`：那条横向折叠在部分虚拟机上是非法指令。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2")]
+unsafe fn hsum_i32_avx512(v: std::arch::x86_64::__m512i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi = _mm512_extracti64x4_epi64(v, 1);
+    let lo = _mm512_castsi512_si256(v);
+    unsafe { hsum_i32_avx2(_mm256_add_epi32(lo, hi)) }
+}
+
 /// 量化域是否可用:有 512 位或 256 位 VNNI 即走自写 knn。
 pub(super) fn quantized_kernel_available() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -241,7 +249,7 @@ fn dist_from_base(base: i32, norm_b: i32, dpb: i32) -> u32 {
 /// 的 call 开销在低频核上占可观比例。外壳把 feature 声明补齐,层级
 /// 内联得以发生;安全性由调用点的运行时检测兜底。
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512vnni")]
+#[target_feature(enable = "avx512f,avx512vnni,avx2")]
 unsafe fn knn_quantized_avx512(
     query: &QuantizedSide,
     train: &QuantizedSide,
@@ -261,7 +269,7 @@ unsafe fn knn_quantized_avxvnni(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512vnni")]
+#[target_feature(enable = "avx512f,avx512vnni,avx2")]
 unsafe fn knn_quantized_both_avx512(
     query: &QuantizedSide,
     train: &QuantizedSide,

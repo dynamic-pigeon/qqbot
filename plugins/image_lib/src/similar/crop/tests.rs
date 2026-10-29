@@ -184,8 +184,18 @@ fn bench_crop_pair_kernel() {
         std::hint::black_box(match_crop_pair_both(a, b, matcher.as_ref()));
     }
     let elapsed = start.elapsed();
+    #[cfg(target_arch = "x86_64")]
+    let isa = if std::arch::is_x86_feature_detected!("avx512vnni") {
+        "avx512vnni"
+    } else if std::arch::is_x86_feature_detected!("avxvnni") {
+        "avxvnni"
+    } else {
+        "fallback"
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let isa = "fallback";
     println!(
-        "形态={} match_crop_pair_both: {} 对合计 {:?}, 单对 {:?}",
+        "形态={} isa={isa} match_crop_pair_both: {} 对合计 {:?}, 单对 {:?}",
         if quantized { "VNNI" } else { "BFMatcher" },
         rounds,
         elapsed,
@@ -282,10 +292,55 @@ fn dist_from_dot_matches_bruteforce() {
     }
 }
 
-/// VNNI 内核与逐对标量 knn 的一致性:随机描述子下两条路产出的点对
-/// 下标必须完全一致。train 侧含 query 行的精确副本与重复行,覆盖
-/// 距离为零与并列取先扫到行的语义;标量参照独立展开 top-2 更新,
-/// 不复用生产代码的路径。
+/// 标量参照:query 的每一行在 train 里找 top-2,过 Lowe 的点对下标。
+/// 距离用翻转后的字节按 i8 相乘,与 dpbusd 的 Σa·(b−128) 同一式。
+#[cfg(target_arch = "x86_64")]
+fn scalar_lowe_pairs(
+    query: &super::pairing::QuantizedSide,
+    train: &super::pairing::QuantizedSide,
+) -> Vec<((u16, u16), (u16, u16))> {
+    let mut expected = Vec::new();
+    for (qi, qrow) in query.plain.iter().enumerate() {
+        let (mut best, mut second) = (u32::MAX, u32::MAX);
+        let mut best_t = 0usize;
+        for (ti, trow) in train.flipped.iter().enumerate() {
+            let dpb: i32 = qrow
+                .iter()
+                .zip(trow.iter())
+                .map(|(&x, &y)| i32::from(x) * i32::from(y as i8))
+                .sum();
+            let d = dist_from_dot(dpb, query.sum[qi], query.norm_sq[qi], train.norm_sq[ti]);
+            if d < best {
+                second = best;
+                best = d;
+                best_t = ti;
+            } else if d < second {
+                second = d;
+            }
+        }
+        if second != u32::MAX && LOWE_NUM * u64::from(best) < LOWE_DEN * u64::from(second) {
+            expected.push(((qi as u16, 0), (best_t as u16, 0)));
+        }
+    }
+    expected
+}
+
+#[cfg(target_arch = "x86_64")]
+fn quantized_side(descriptors: Vec<[u8; SIFT_DIMS]>) -> super::pairing::QuantizedSide {
+    let sift = SiftFeatures {
+        points: (0..descriptors.len() as u16).map(|i| (i, 0)).collect(),
+        descriptors,
+        centers: [[0; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
+    };
+    let MatchSide::Quantized(side) = MatchSide::new(&sift, true).expect("side") else {
+        unreachable!("强设 Quantized 形态")
+    };
+    side
+}
+
+/// VNNI 内核与逐对标量 knn 的一致性。多组 query/train 长度下点对下标
+/// 必须完全一致;前若干行是 query 的精确副本再加一行重复,覆盖距离为零
+/// 与并列取先扫到行。标量参照独立展开 top-2,不走生产路径。
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn simd_knn_matches_scalar_knn() {
@@ -299,77 +354,49 @@ fn simd_knn_matches_scalar_knn() {
         x ^= x << 5;
         (x >> 24) as u8
     };
-    let mut descriptors_a = vec![[0u8; SIFT_DIMS]; 40];
-    for row in &mut descriptors_a {
+    let mut pool_a = vec![[0u8; SIFT_DIMS]; 48];
+    for row in &mut pool_a {
         for v in row.iter_mut() {
             *v = next();
         }
     }
-    let mut descriptors_b = Vec::with_capacity(45);
-    descriptors_b.extend_from_slice(&descriptors_a);
-    descriptors_b.push(descriptors_a[0]);
-    for _ in 0..4 {
+    // 前 16 行与 a 相同(唯一零距离),第 17 行再抄 a[0](并列零距离)。
+    let mut pool_b = pool_a[..16].to_vec();
+    pool_b.push(pool_a[0]);
+    while pool_b.len() < 48 {
         let mut row = [0u8; SIFT_DIMS];
         for v in row.iter_mut() {
             *v = next();
         }
-        descriptors_b.push(row);
+        pool_b.push(row);
     }
-    // 下标编码进点坐标,u16 直接当行号用。
-    let side = |descriptors: Vec<[u8; SIFT_DIMS]>| {
-        let sift = SiftFeatures {
-            points: (0..descriptors.len() as u16).map(|i| (i, 0)).collect(),
-            descriptors,
-            centers: [[0; FINGERPRINT_WORDS]; CENTER_KEEPS.len()],
-        };
-        MatchSide::new(&sift, true).expect("side")
-    };
-    let (a, b) = (side(descriptors_a), side(descriptors_b));
-    let (MatchSide::Quantized(a), MatchSide::Quantized(b)) = (&a, &b) else {
-        unreachable!("强设 Quantized 形态")
-    };
-    let mut pts = Vec::new();
-    knn_quantized_dispatch(a, b, &mut pts);
-    let mut expected = Vec::new();
-    for (qi, qrow) in a.plain.iter().enumerate() {
-        let (mut best, mut second) = (u32::MAX, u32::MAX);
-        let mut best_t = 0usize;
-        for (ti, trow) in b.flipped.iter().enumerate() {
-            let dpb: i32 = qrow
-                .iter()
-                .zip(trow.iter())
-                .map(|(&x, &y)| i32::from(x) * i32::from(y as i8))
-                .sum();
-            let d = dist_from_dot(dpb, a.sum[qi], a.norm_sq[qi], b.norm_sq[ti]);
-            if d < best {
-                second = best;
-                best = d;
-                best_t = ti;
-            } else if d < second {
-                second = d;
-            }
-        }
-        if second != u32::MAX && LOWE_NUM * u64::from(best) < LOWE_DEN * u64::from(second) {
-            expected.push(((qi as u16, 0), (best_t as u16, 0)));
-        }
-    }
-    assert!(!expected.is_empty(), "夹具必须产生非平凡点对");
     let key = |pts: &[(opencv::core::Point2f, opencv::core::Point2f)]| -> Vec<_> {
         pts.iter()
             .map(|(q, t)| ((q.x as u16, q.y as u16), (t.x as u16, t.y as u16)))
             .collect::<Vec<_>>()
     };
-    let got = key(&pts);
-    assert_eq!(got, expected);
-    // 一次对称扫描的两个方向必须与两次单向 knn 的点对完全一致,
-    // 包括并列距离取先扫到行的下标。
-    let mut fwd = Vec::new();
-    let mut bwd = Vec::new();
-    knn_quantized_both_dispatch(a, b, &mut fwd, &mut bwd);
-    assert_eq!(key(&fwd), got);
-    let mut rev = Vec::new();
-    knn_quantized_dispatch(b, a, &mut rev);
-    assert_eq!(key(&bwd), key(&rev));
+    // (query 长, train 长)。单向与双向的 train 都是第二参,再对调扫一遍。
+    for (na, nb) in [(40, 44), (41, 45), (42, 46), (43, 47)] {
+        let a = quantized_side(pool_a[..na].to_vec());
+        let b = quantized_side(pool_b[..nb].to_vec());
+        let expected = scalar_lowe_pairs(&a, &b);
+        assert!(
+            !expected.is_empty(),
+            "na={na} nb={nb} 夹具必须产生非平凡点对"
+        );
+        let mut pts = Vec::new();
+        knn_quantized_dispatch(&a, &b, &mut pts);
+        assert_eq!(key(&pts), expected, "na={na} nb={nb} 单向");
+        let mut fwd = Vec::new();
+        let mut bwd = Vec::new();
+        knn_quantized_both_dispatch(&a, &b, &mut fwd, &mut bwd);
+        assert_eq!(key(&fwd), expected, "na={na} nb={nb} 双向正向");
+        let mut rev = Vec::new();
+        knn_quantized_dispatch(&b, &a, &mut rev);
+        assert_eq!(key(&bwd), key(&rev), "na={na} nb={nb} 双向反向");
+        let expected_rev = scalar_lowe_pairs(&b, &a);
+        assert_eq!(key(&rev), expected_rev, "na={na} nb={nb} 对调后的单向尾数");
+    }
 }
 
 #[test]
