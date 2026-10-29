@@ -538,6 +538,7 @@ pub(crate) fn crop_group(whole: &str, part: &str, percent: u8) -> SimilarGroup {
         hashes: vec![whole.to_owned(), part.to_owned()],
         percent,
         truncated: false,
+        fresh: false,
     }
 }
 

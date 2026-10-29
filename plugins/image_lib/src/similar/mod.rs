@@ -43,6 +43,9 @@ pub struct SimilarGroup {
     pub percent: u8,
     /// 组员超过 [`MAX_GROUP_MEMBERS`] 被截断或展示超字节预算时置位，标题提示「仅列部分」。
     pub truncated: bool,
+    /// 查裁剪本轮新落库的裁剪对，命令层据此把本轮新增单独发一份；
+    /// 查重路径与缓存全命中重建恒为 false。
+    pub fresh: bool,
 }
 
 const DHASH_WIDTH: u32 = 17;
@@ -353,6 +356,7 @@ fn duplicate_groups(
             hashes,
             percent: percent_from_distance(best_by_root[root]),
             truncated,
+            fresh: false,
         });
     }
     (groups, in_duplicate)
@@ -390,6 +394,7 @@ fn maybe_pairs(
                 hashes,
                 percent: percent_from_distance(maybe_dist),
                 truncated: false,
+                fresh: false,
             });
             if groups.len() >= MAX_MAYBE_GROUPS {
                 break 'outer;

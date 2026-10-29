@@ -196,7 +196,9 @@ impl Store {
 
     /// 执行 [`CropPlan`]：全命中直接返回；补算只跑两端任一不在覆盖集里的
     /// 对，新正结果落库、本轮成员写进覆盖标记，最后统一从缓存重建（含
-    /// 此前部分扫描攒下的正结果），排序截断与全量路径同一条代码。
+    /// 此前部分扫描攒下的正结果），排序截断与全量路径同一条代码。重建
+    /// 对照落库前的存量对，把本轮新入库的对标成 fresh，命令层据此单独
+    /// 发一份新增。
     pub async fn crop_scan_run(
         &self,
         group_id: i64,
@@ -229,15 +231,27 @@ impl Store {
             })
             .collect();
         self.with_group(group_id, |pool| async move {
+            // 落库前的存量对：补算重检出或并发扫描已写入的对不算本轮新增。
+            let known: HashSet<(String, String)> = library_crop_pairs(&pool, &library)
+                .await?
+                .into_iter()
+                .map(|(whole, part, _)| (whole, part))
+                .collect();
             insert_crop_pairs(&pool, &fresh).await?;
             save_crop_covered(&pool, &library, &members).await?;
             let stored = library_crop_pairs(&pool, &library).await?;
-            Ok(assemble_crop_groups(
+            let mut groups = assemble_crop_groups(
                 stored
                     .into_iter()
                     .map(|(whole, part, percent)| crop_group(&whole, &part, percent))
                     .collect(),
-            ))
+            );
+            for group in &mut groups {
+                if let [whole, part] = group.hashes.as_slice() {
+                    group.fresh = !known.contains(&(whole.clone(), part.clone()));
+                }
+            }
+            Ok(groups)
         })
         .await
     }
