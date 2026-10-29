@@ -269,6 +269,7 @@ mod tests {
             hashes: vec![hash.to_owned()],
             percent: 90,
             truncated: false,
+            fresh: false,
         }
     }
 

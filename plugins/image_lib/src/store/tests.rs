@@ -640,17 +640,21 @@ async fn crop_scan_repeats_from_cache() {
         groups[0].hashes,
         vec![sha256_hex(&whole), sha256_hex(&part)]
     );
+    // 首扫：配对缓存从空起步，检出的对全是本轮新增。
+    assert!(groups.iter().all(|group| group.fresh));
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
     // 覆盖集按成员一行：两张图都在库里。
     assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 2);
 
-    // 重扫：覆盖完整，直接从缓存拼出同一份结果。
+    // 重扫：覆盖完整，直接从缓存拼出同一份结果，无新增不带标记。
     let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
     let cached = match plan {
         CropPlan::Complete(groups) => groups,
         other => panic!("应全命中: {other:?}"),
     };
-    assert_eq!(cached, groups);
+    assert_eq!(cached.len(), groups.len());
+    assert_eq!(cached[0].hashes, groups[0].hashes);
+    assert!(cached.iter().all(|group| !group.fresh));
 
     // 新增一张无关图：只补算带新端点的对，无新增正结果。
     must_add(&store, group, "猫", vec![photo_like_jpeg(9, None)]).await;
@@ -663,7 +667,9 @@ async fn crop_scan_repeats_from_cache() {
         }
     ));
     let again = store.crop_scan_run(group, plan).await.unwrap();
-    assert_eq!(again, groups);
+    assert_eq!(again.len(), groups.len());
+    assert_eq!(again[0].hashes, groups[0].hashes);
+    assert!(again.iter().all(|group| !group.fresh));
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 1);
 
     // 逻辑删掉局部图：缓存原样保留（行数不变），重查仍全命中——
@@ -687,7 +693,38 @@ async fn crop_scan_repeats_from_cache() {
         CropPlan::Complete(groups) => groups,
         other => panic!("保护期内加回应零成本: {other:?}"),
     };
-    assert_eq!(restored, groups);
+    assert_eq!(restored.len(), groups.len());
+    assert_eq!(restored[0].hashes, groups[0].hashes);
+}
+
+#[tokio::test]
+async fn crop_scan_marks_new_pairs_on_incremental() {
+    let (store, _dir) = temp_store();
+    let group = 64;
+    let whole = photo_like_jpeg(3, None);
+    let part = photo_like_jpeg(3, Some(40));
+    must_add(&store, group, "猫", vec![whole.clone(), part.clone()]).await;
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let first = store.crop_scan_run(group, plan).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(first[0].fresh);
+
+    // 加入另一组的整体与局部：增量只检出新对，标 fresh；旧对不带标记。
+    let whole2 = photo_like_jpeg(5, None);
+    let part2 = photo_like_jpeg(5, Some(40));
+    must_add(&store, group, "猫", vec![whole2.clone(), part2.clone()]).await;
+    let (_, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
+    let second = match plan {
+        CropPlan::Incremental { .. } => store.crop_scan_run(group, plan).await.unwrap(),
+        other => panic!("加图后应走增量: {other:?}"),
+    };
+    assert_eq!(second.len(), 2);
+    let fresh: Vec<_> = second.iter().filter(|group| group.fresh).collect();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(
+        fresh[0].hashes,
+        vec![sha256_hex(&whole2), sha256_hex(&part2)]
+    );
 }
 
 #[tokio::test]

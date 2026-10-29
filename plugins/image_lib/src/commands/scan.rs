@@ -238,8 +238,14 @@ async fn begin_crop(
         .await
         .map_err(|error| missing_library(name, error))?;
     // 缓存全命中时不回提示，结果直接出；只有真要算的库才说「别急」。
-    if let CropPlan::Incremental { had_coverage, .. } = &plan {
-        ctx.reply(if *had_coverage {
+    let mut had_coverage = false;
+    if let CropPlan::Incremental {
+        had_coverage: covered,
+        ..
+    } = &plan
+    {
+        had_coverage = *covered;
+        ctx.reply(if *covered {
             format!("正在补算「{canonical}」新增图片的裁剪比对，稍等")
         } else {
             format!(
@@ -255,7 +261,48 @@ async fn begin_crop(
         ctx.reply(format!("「{canonical}」里没有裁剪关系的图"));
         return Ok(None);
     }
+    if had_coverage {
+        send_fresh_crop_groups(ctx, store, group_id, &canonical, &groups).await?;
+    }
     Ok(Some((canonical, groups)))
+}
+
+/// 补算检出新对时，把本轮新增的裁剪对在全新量列表之前单独发一份。
+/// 首扫缓存从空起步、全量即新增，不再重复发一份。
+async fn send_fresh_crop_groups(
+    ctx: &CommandContext,
+    store: &Store,
+    group_id: i64,
+    library: &str,
+    groups: &[SimilarGroup],
+) -> CommandResult {
+    let fresh: Vec<&SimilarGroup> = groups.iter().filter(|group| group.fresh).collect();
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let total = fresh.len();
+    let mut page = Vec::with_capacity(total);
+    for (offset, group) in fresh.iter().enumerate() {
+        let index = offset + 1;
+        let (images, read_cut) = read_group_images(store, group_id, &group.hashes).await;
+        if images.len() < 2 {
+            continue;
+        }
+        let truncated = group.truncated || read_cut;
+        page.push(ScanPageGroup {
+            title: format!(
+                "新增{}",
+                group_title(group.kind, index, total, group.percent, truncated)
+            ),
+            name: format!(
+                "新增{}",
+                group_node_name(group.kind, index, total, group.percent, truncated)
+            ),
+            images,
+            index,
+        });
+    }
+    reply_scan_page(ctx, store, library, page, total).await
 }
 
 /// 恢复进行中的扫描会话并展示对应页；`jump` 是组号，`None` 表示翻下一组。
