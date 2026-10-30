@@ -14,7 +14,7 @@ use kovi::tokio::sync::Mutex;
 use anyhow::{Context, Result};
 use rand::seq::IndexedRandom;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::similar::{SiftableImage, SimilarGroup};
 
@@ -227,7 +227,9 @@ impl Store {
         let db_path = self.db_path(group_id);
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
