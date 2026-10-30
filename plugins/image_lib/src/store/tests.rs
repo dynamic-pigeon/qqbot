@@ -801,20 +801,16 @@ async fn sifts_cover_and_persist() {
 
     let (canonical, plan) = store.crop_scan_prepare(group, "猫").await.unwrap();
     assert_eq!(canonical, "猫");
-    let images = match plan {
-        CropPlan::Incremental { images, .. } => images,
-        other => panic!("无覆盖时应走增量: {other:?}"),
-    };
-    // 无纹理的假 PNG 提不出指纹，与查重口径一致地跳过。
-    assert_eq!(images.len(), 2);
-    assert!(images.iter().all(|image| !image.sift.points.is_empty()));
+    assert!(matches!(plan, CropPlan::Incremental { .. }));
+    store.crop_scan_run(group, plan).await.unwrap();
 
     // 落库断言：特征必须持久化，否则每次查裁剪都会全库重算。
+    // 无纹理的假 PNG 提不出指纹，与查重口径一致地跳过。
     assert_eq!(
         db_i64(&group_db(&dir, group), "SELECT COUNT(*) FROM sift").await,
         2,
         "SIFT 特征未落库"
-    );
+    )
 }
 
 /// 旧版窄 sift 表：主键哈希 64 字符、无对齐约束，用于触发换代重建。

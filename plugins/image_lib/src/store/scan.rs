@@ -76,8 +76,8 @@ impl Store {
     /// 按规范库名补齐指纹与 SIFT 特征：两张表共用一次解码
     /// （[`fingerprint_and_sift`]），任一缺失的图都会重算——存量库首次
     /// 查裁剪等于全库重算一遍，与首查重同量级。锁外解码期间同群的
-    /// 抽图/加图不会被卡住（同上）。[`crop_scan_prepare`] 在锁内判完缓存
-    /// 覆盖才走到这里，规范名直传，避免两段锁之间别名被并发改指。
+    /// 抽图/加图不会被卡住（同上）。[`crop_scan_run`] 拿着判完缓存的
+    /// 计划才走到这里，规范名直传，避免两段锁之间别名被并发改指。
     async fn siftables_for_canonical(
         &self,
         group_id: i64,
@@ -181,14 +181,12 @@ impl Store {
             return Ok((library, CropPlan::Complete(groups)));
         }
         let had_coverage = !covered.is_empty();
-        let images = self.siftables_for_canonical(group_id, &library).await?;
         Ok((
             library.clone(),
             CropPlan::Incremental {
                 library,
                 members,
                 covered,
-                images,
                 had_coverage,
             },
         ))
@@ -204,16 +202,16 @@ impl Store {
         group_id: i64,
         plan: CropPlan,
     ) -> Result<Vec<SimilarGroup>, StoreError> {
-        let (library, members, covered, images) = match plan {
+        let (library, members, covered) = match plan {
             CropPlan::Complete(groups) => return Ok(groups),
             CropPlan::Incremental {
                 library,
                 members,
                 covered,
-                images,
                 ..
-            } => (library, members, covered, images),
+            } => (library, members, covered),
         };
+        let images = self.siftables_for_canonical(group_id, &library).await?;
         let duplicate = crate::config::static_config().duplicate_distance();
         // 两两特征匹配是纯 CPU 的 O(n²)，让出 async worker（同查重）。
         let found = kovi::tokio::task::spawn_blocking(move || {

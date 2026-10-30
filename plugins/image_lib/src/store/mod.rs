@@ -16,7 +16,7 @@ use rand::seq::IndexedRandom;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
-use crate::similar::{SiftableImage, SimilarGroup};
+use crate::similar::SimilarGroup;
 
 mod backup;
 mod blob_fs;
@@ -133,8 +133,6 @@ pub enum CropPlan {
         members: Vec<String>,
         /// 已比对过的图集合，计算时跳过两端都在其中的对。
         covered: HashSet<String>,
-        /// 特征齐全、参与比对的成员图。
-        images: Vec<SiftableImage>,
         /// 之前是否完成过整轮：区分首扫与补算的提示文案。
         had_coverage: bool,
     },
