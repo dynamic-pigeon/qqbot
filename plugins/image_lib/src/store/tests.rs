@@ -1,4 +1,4 @@
-use super::backup::{RETAINED_DAYS, date_string};
+use super::backup::date_string;
 use super::derive::is_large_blob;
 use super::*;
 use kovi::tokio;
@@ -37,6 +37,7 @@ fn temp_store() -> (Store, TempDir) {
         Store::open_with_quota(
             dir.clone(),
             crate::config::DEFAULT_MAX_GROUP_MIB * 1024 * 1024,
+            crate::config::DEFAULT_BACKUP_RETAINED_DAYS,
         )
         .unwrap(),
         TempDir(dir),
@@ -307,7 +308,12 @@ async fn wipe_ignores_repointing() {
 async fn rejects_over_quota() {
     let dir = TempDir(std::env::temp_dir().join(format!("image_lib_quota_{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Store::open_with_quota(dir.to_path_buf(), 40).unwrap();
+    let store = Store::open_with_quota(
+        dir.to_path_buf(),
+        40,
+        crate::config::DEFAULT_BACKUP_RETAINED_DAYS,
+    )
+    .unwrap();
     must_add(&store, 7, "小", vec![png_like(3)]).await;
     let err = add_images(&store, 7, "小", vec![png_like(4)])
         .await
@@ -775,7 +781,12 @@ async fn crop_cache_wiped_on_marker() {
     .await;
 
     // 新开的 Store 会在 ensure_pool → init_schema 里按标记弃账。
-    let reopened = Store::open_with_quota(dir.to_path_buf(), u64::MAX).unwrap();
+    let reopened = Store::open_with_quota(
+        dir.to_path_buf(),
+        u64::MAX,
+        crate::config::DEFAULT_BACKUP_RETAINED_DAYS,
+    )
+    .unwrap();
     reopened.stats(group).await.unwrap();
     assert_eq!(table_count(&dir, group, "crop_pairs").await, 0);
     assert_eq!(table_count(&dir, group, "crop_scan_covered").await, 0);
@@ -943,7 +954,9 @@ async fn deleted_blob_survives_window() {
     );
 
     // 过了保护期,对账把孤儿文件连同过期记录一起收走。
-    store.reconcile_all_at(day + RETAINED_DAYS as i64).await;
+    store
+        .reconcile_all_at(day + store.retained_days as i64)
+        .await;
     assert!(!live_blob.exists(), "保护期外孤儿文件应被回收");
 }
 
@@ -1049,6 +1062,37 @@ async fn backup_rolls_seven_days() {
     assert!(backups.join("manual-copy").is_dir());
 }
 
+/// 自定义保留天数要同时驱动目录滚动与对账保护期两条过期路径。
+#[tokio::test]
+async fn custom_retained_days_shortens_both_expiries() {
+    let dir =
+        TempDir(std::env::temp_dir().join(format!("image_lib_retain_{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Store::open_with_quota(dir.to_path_buf(), u64::MAX, 2).unwrap();
+    let group = 50;
+    let a = png_like(1);
+    must_add(&store, group, "猫", vec![a.clone()]).await;
+
+    let day = 20_000;
+    store.backup_daily_at(day).await;
+    let hash = sha256_hex(&a);
+    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+
+    store.delete_hash(group, &hash).await.unwrap();
+    store.reconcile_all_at(day + 1).await;
+    assert!(live_blob.is_file(), "保留两天:一天后仍在保护期");
+
+    store.reconcile_all_at(day + 2).await;
+    assert!(!live_blob.exists(), "保留两天:两天后回收孤儿");
+
+    store.backup_daily_at(day + 2).await;
+    assert!(
+        !dir.join("backups").join(date_string(day)).exists(),
+        "保留两天:旧目录应被滚动删除"
+    );
+    assert!(dir.join("backups").join(date_string(day + 2)).is_dir());
+}
+
 #[tokio::test]
 async fn wiped_files_kept_till_expiry() {
     let (store, dir) = temp_store();
@@ -1065,7 +1109,9 @@ async fn wiped_files_kept_till_expiry() {
 
     store.reconcile_all_at(day + 3).await;
     assert!(live_blob.is_file(), "保护期内对账不得回收清库后的文件");
-    store.reconcile_all_at(day + RETAINED_DAYS as i64).await;
+    store
+        .reconcile_all_at(day + store.retained_days as i64)
+        .await;
     assert!(!live_blob.exists(), "保护期外文件应被回收");
 }
 

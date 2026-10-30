@@ -67,7 +67,10 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        Arc::new(Store::open_with_quota(dir, u64::MAX).unwrap())
+        Arc::new(
+            Store::open_with_quota(dir, u64::MAX, crate::config::DEFAULT_BACKUP_RETAINED_DAYS)
+                .unwrap(),
+        )
     }
 
     fn command_tree() -> CommandTree {
