@@ -110,6 +110,7 @@ pub(super) async fn insert_fingerprints(
     pool: &SqlitePool,
     fingerprints: &[(String, Fingerprint)],
 ) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
     for (hash, fingerprint) in fingerprints {
         // 只忽略主键冲突（并发补指纹的幂等）；CHECK 违约必须报错，
         // 不能像 OR IGNORE 那样把约束错误也静默吞掉。
@@ -120,9 +121,10 @@ pub(super) async fn insert_fingerprints(
         .bind(hash)
         .bind(pack_words(&fingerprint.dhash))
         .bind(pack_words(&fingerprint.phash))
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -167,6 +169,7 @@ pub(super) async fn insert_sifts(
     pool: &SqlitePool,
     features: &[(String, SiftFeatures)],
 ) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
     for (hash, features) in features {
         // 与指纹同款：只忽略主键冲突（并发补特征的幂等）。
         sqlx::query(
@@ -175,9 +178,10 @@ pub(super) async fn insert_sifts(
         )
         .bind(hash)
         .bind(sift_to_bytes(features))
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -358,6 +362,7 @@ pub(super) async fn insert_images(
     .fetch_one(pool)
     .await?
     .unwrap_or(0);
+    let mut tx = pool.begin().await?;
     for image in images {
         sqlx::query(
             "INSERT OR IGNORE INTO images (library, hash, size, draw_count) VALUES (?, ?, ?, ?)",
@@ -366,9 +371,10 @@ pub(super) async fn insert_images(
         .bind(&image.hash)
         .bind(image.size as i64)
         .bind(draw_count)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
