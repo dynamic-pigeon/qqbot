@@ -73,7 +73,7 @@ B 站动态订阅默认游客身份。普通 HTTP 被风控时改用本机 Chrom
 
 容量、单图上限和抽图限流见 `[image_lib]`。数据在 `data/image_lib/`。
 
-备份与对账由 `backup_cron` 触发（默认 `0 4 * * *`，本地时区）。快照在 `data/image_lib/backups/<日期>/`，保留七天。删除只清索引，文件在备份保护期结束后由对账统一回收，磁盘释放最多滞后七天。保护期内可按 `plugins/image_lib/src/store/backup.rs` 模块注释里的步骤把快照拷回恢复。
+备份与对账由 `backup_cron` 触发（默认 `0 4 * * *`，本地时区）。快照在 `data/image_lib/backups/<日期>/`，保留 `backup_retained_days` 天（默认 7）。删除只清索引，文件在备份保护期结束后由对账统一回收，磁盘释放最多滞后一个保留期。保护期内可按 `plugins/image_lib/src/store/backup.rs` 模块注释里的步骤把快照拷回恢复。
 
 配 `cloud_sync_destination`（rclone 的 `remote:path`，服务器需装有 rclone）后，每日备份完成会把图库根目录镜像到该远端，不配即关闭；正式库的 `index.db` 不上传，云端恢复以快照为准。图库超过 `cloud_sync_max_gib`（缺省 9 GiB）时跳过同步并报错。
 

@@ -143,6 +143,8 @@ pub enum CropPlan {
 pub struct Store {
     root: PathBuf,
     max_group_bytes: u64,
+    /// 备份保留天数，目录滚动与对账保护期必须用同一个值。
+    retained_days: usize,
     /// 群锁和连接池都在 async 路径上取，用 tokio Mutex 以免卡住 runtime。
     locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
     pools: Mutex<HashMap<i64, SqlitePool>>,
@@ -150,15 +152,21 @@ pub struct Store {
 
 impl Store {
     pub fn open(root: PathBuf) -> Result<Self> {
-        Self::open_with_quota(root, crate::config::static_config().max_group_bytes())
+        let config = crate::config::static_config();
+        Self::open_with_quota(root, config.max_group_bytes(), config.backup_retained_days)
     }
 
-    pub(crate) fn open_with_quota(root: PathBuf, max_group_bytes: u64) -> Result<Self> {
+    pub(crate) fn open_with_quota(
+        root: PathBuf,
+        max_group_bytes: u64,
+        retained_days: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("创建图库目录失败: {}", root.display()))?;
         Ok(Self {
             root,
             max_group_bytes,
+            retained_days: retained_days.max(1),
             locks: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
         })
@@ -604,7 +612,7 @@ impl Store {
     async fn reconcile_group(&self, group_id: i64, today: i64) -> Result<(), StoreError> {
         let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
-            purge_expired_backup_refs(&pool, backup::RETAINED_DAYS as i64, today).await?;
+            purge_expired_backup_refs(&pool, self.retained_days as i64, today).await?;
             let protected = backed_up_hashes(&pool).await?;
 
             let disk = blob_hashes_on_disk(&blobs).await?;

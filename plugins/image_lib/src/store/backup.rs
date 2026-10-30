@@ -29,9 +29,6 @@ use anyhow::{Context as _, Result};
 use super::Store;
 use super::repo::refresh_backup_refs;
 
-/// 保留最近多少个日期目录,即备份份数,也是孤儿文件的保护天数。
-pub(super) const RETAINED_DAYS: usize = 7;
-
 impl Store {
     pub(crate) async fn backup_daily_at(&self, today: i64) {
         if let Err(error) = self.run_daily_backup(today).await {
@@ -69,7 +66,7 @@ impl Store {
             tracing::info!("图库每日备份完成: {date}");
         }
 
-        prune_old_backups(&backups, today).await
+        prune_old_backups(&backups, today, self.retained_days).await
     }
 
     /// 备份单个群:群锁内先做快照、快照落成后才刷保护记录——refs 指向
@@ -121,11 +118,12 @@ async fn clean_stale_tmp(backups: &Path) {
 }
 
 /// 删除日期已过保留期的备份目录,与对账清保护记录用同一个谓词
-/// (`目录日 + RETAINED_DAYS <= today`)。两者必须同日失效,「备份目录
-/// 还在 ⟺ 其指向的文件还受保护」才在停机隔天等非连续备份下也成立;
-/// 按份数滚动会在停机后把时间跨度拉长,让记录先于目录过期。名字不像
-/// 日期的条目不动,避免误删人工放进去的东西。
-async fn prune_old_backups(backups: &Path, today: i64) -> Result<()> {
+/// (`目录日 + retained_days <= today`,两处的值都来自 Store 的同一个
+/// 字段)。两者必须同日失效,「备份目录还在 ⟺ 其指向的文件还受保护」
+/// 才在停机隔天等非连续备份下也成立;按份数滚动会在停机后把时间跨度
+/// 拉长,让记录先于目录过期。名字不像日期的条目不动,避免误删人工
+/// 放进去的东西。
+async fn prune_old_backups(backups: &Path, today: i64, retained_days: usize) -> Result<()> {
     let mut dates = BTreeSet::new();
     let mut entries = kovi::tokio::fs::read_dir(backups).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -136,7 +134,7 @@ async fn prune_old_backups(backups: &Path, today: i64) -> Result<()> {
         }
     }
     while let Some(oldest) = dates.first()
-        && date_epoch_day(oldest) + RETAINED_DAYS as i64 <= today
+        && date_epoch_day(oldest) + retained_days as i64 <= today
     {
         let oldest = dates.pop_first().expect("first 刚校验过");
         kovi::tokio::fs::remove_dir_all(backups.join(&oldest))

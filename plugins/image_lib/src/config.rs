@@ -16,6 +16,8 @@ pub(crate) const DEFAULT_MAYBE_DISTANCE: u32 = 64;
 /// 未配置时备份与对账回收的 cron（本地时区，每天凌晨四点）。必须是
 /// kovi（croner，秒位可选）可解析的五字段表达式，解析失败会在启动期 panic。
 pub(crate) const DEFAULT_BACKUP_CRON: &str = "0 4 * * *";
+/// 未配置时备份保留天数：日期目录保留份数，也是孤儿文件的保护期天数。
+pub(crate) const DEFAULT_BACKUP_RETAINED_DAYS: usize = 7;
 /// 未配置时云同步的图库体积闸门，单位 GiB。
 pub(crate) const DEFAULT_CLOUD_SYNC_MAX_GIB: u64 = 9;
 
@@ -33,6 +35,9 @@ pub(crate) struct StaticConfig {
     /// UTC 日期记，本地凌晨触发时 UTC 仍是前一天，目录名会比本地日期
     /// 早一天；内部自洽，仅观感。
     pub backup_cron: String,
+    /// 备份保留天数：日期目录保留份数，也是孤儿文件的保护期天数。有效
+    /// 下限 1，再小会在备份当天就清掉当日目录与保护记录。
+    pub backup_retained_days: usize,
     /// rclone 云同步目标（`remote:path`），缺省不启用。启用前提是
     /// 运行环境装有 rclone 且已配好该 remote；每日备份落成后镜像整个
     /// 图库根目录。
@@ -52,6 +57,7 @@ impl Default for StaticConfig {
             duplicate_distance: DEFAULT_DUPLICATE_DISTANCE,
             maybe_distance: DEFAULT_MAYBE_DISTANCE,
             backup_cron: DEFAULT_BACKUP_CRON.into(),
+            backup_retained_days: DEFAULT_BACKUP_RETAINED_DAYS,
             cloud_sync_destination: None,
             cloud_sync_max_gib: DEFAULT_CLOUD_SYNC_MAX_GIB,
         }

@@ -319,6 +319,7 @@ mod tests {
         let store = crate::store::Store::open_with_quota(
             dir.clone(),
             crate::config::DEFAULT_MAX_GROUP_MIB * 1024 * 1024,
+            crate::config::DEFAULT_BACKUP_RETAINED_DAYS,
         )
         .unwrap();
         let bytes = b"\x89PNGfile-form".to_vec();
