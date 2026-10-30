@@ -30,10 +30,7 @@ async fn main() {
     }
 
     let db_path = path.join("msg.db");
-    if !db_path.exists() {
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        std::fs::File::create(&db_path).unwrap();
-    }
+    std::fs::create_dir_all(db_path.parent().expect("join 产物必有父目录")).unwrap();
 
     db::init_db(&db_path).await.unwrap();
     plugin::drop(|| async move { db::flush_on_shutdown().await });
