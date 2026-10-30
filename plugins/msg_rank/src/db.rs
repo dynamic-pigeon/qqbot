@@ -8,7 +8,10 @@ use kovi::chrono;
 use kovi::futures_util::TryStreamExt as _;
 use kovi::tokio::sync::{OnceCell, mpsc, oneshot};
 use kovi::tokio::time::timeout;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 
 static SQLITE_POOL: OnceCell<SqlitePool> = OnceCell::const_new();
 static MSG_SENDER: OnceCell<mpsc::Sender<MsgRecord>> = OnceCell::const_new();
@@ -104,32 +107,18 @@ fn restrict_database_permissions(path: &Path) -> Result<()> {
 }
 
 fn build_pool(path: &Path) -> Result<SqlitePool> {
-    let url = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("数据库路径包含非法字符"))?;
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .pragma("temp_store", "MEMORY");
 
     Ok(SqlitePoolOptions::new()
         .max_connections(2)
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(10))
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::query("PRAGMA journal_mode = WAL;")
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("PRAGMA synchronous = NORMAL;")
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("PRAGMA busy_timeout = 5000;")
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("PRAGMA temp_store = MEMORY;")
-                    .execute(&mut *conn)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_lazy(url)?)
+        .connect_lazy_with(options))
 }
 
 fn init_buffer() {
