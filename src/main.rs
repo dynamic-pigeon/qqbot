@@ -1,6 +1,5 @@
 use kovi::tokio;
 use kovi_onebot::{OneBotDriver, load_local_conf};
-use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 // musl 系统分配器对词云、截图这类周期性大分配几乎不归还内存，
@@ -16,6 +15,90 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// 按本地日期滚动的日志文件 writer：tracing-appender 的 DAILY 只认
+/// UTC 日界（本地早八点才切文件，文件名与内容错位八小时）。文件名
+/// `<prefix>.<本地日期>.log`，切日即换文件；启动时按文件名排序清理，
+/// 只保留最近 30 份。
+struct DailyLocalWriter {
+    dir: std::path::PathBuf,
+    prefix: String,
+    state: std::sync::Mutex<(String, std::fs::File)>,
+}
+
+impl DailyLocalWriter {
+    fn new(dir: impl Into<std::path::PathBuf>, prefix: &str) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        let today = Self::today();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(format!("{prefix}.{today}.log")))?;
+        Self::prune(&dir, prefix);
+        Ok(Self {
+            dir,
+            prefix: prefix.to_owned(),
+            state: std::sync::Mutex::new((today, file)),
+        })
+    }
+
+    fn today() -> String {
+        let format = time::format_description::parse_owned::<2>("[year]-[month]-[day]")
+            .expect("日期格式合法");
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        now.format(&format).expect("日期格式化")
+    }
+
+    /// 删除最旧的日志，只留最近 30 份。
+    fn prune(dir: &std::path::Path, prefix: &str) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut logs: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                name.to_string_lossy().starts_with(prefix)
+                    && name.to_string_lossy().ends_with(".log")
+            })
+            .collect();
+        let keep = 30;
+        if logs.len() > keep {
+            logs.sort();
+            for name in &logs[..logs.len() - keep] {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+        }
+    }
+}
+
+impl std::io::Write for DailyLocalWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let today = Self::today();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if today != state.0 {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.dir.join(format!("{}.{today}.log", self.prefix)))?;
+            *state = (today, file);
+        }
+        state.1.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.1.flush()
+    }
+}
 
 fn restrict_sensitive_file(path: impl AsRef<std::path::Path>) {
     let path = path.as_ref();
@@ -46,23 +129,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     });
 
-    let file_appender = tracing_appender::rolling::Builder::new()
-        .filename_prefix("bot")
-        .filename_suffix("log")
-        .max_log_files(30)
-        .rotation(Rotation::DAILY)
-        .build("./logs")
-        .unwrap();
+    let rolling = DailyLocalWriter::new("./logs", "bot")?;
 
     // 日志 channel 按行数预分配 slot：4096 行约 130KB 常驻内存，足够覆盖日常日志突发。
     let (non_blocking, _guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .buffered_lines_limit(4096)
-        .finish(file_appender);
+        .finish(rolling);
 
+    // 时间戳用本地时区（服务器 CST），读日志不用再做 +8 换算。
+    let format = time::format_description::parse_owned::<2>(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6] [offset_hour sign:mandatory]:[offset_minute]",
+    )
+    .expect("日志时间格式合法");
+    let timer = tracing_subscriber::fmt::time::LocalTime::new(format);
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
             fmt::layer()
+                .with_timer(timer.clone())
                 .with_target(true)
                 .with_level(true)
                 .with_line_number(true)
@@ -72,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with(
             fmt::layer()
+                .with_timer(timer)
                 .with_target(true)
                 .with_level(true)
                 .with_line_number(true)

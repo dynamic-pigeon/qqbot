@@ -29,6 +29,7 @@ msg_rank = { version = "0.3.0", path = "plugins/msg_rank" }
 utils.workspace = true
 wordle = { version = "0.1.0", path = "plugins/wordle", features = ["qq"] }
 yu_gi_oh = { version = "0.1.0", path = "plugins/yu_gi_oh" }
+time.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 dotenvy.workspace = true
@@ -78,10 +79,12 @@ tracing-subscriber = { version = "0.3.6", features = [
     "env-filter",
     "fmt",
     "ansi",
+    "local-time",
 ] }
 tracing-appender = "0.2.3"
 arc-swap = "1"
 thiserror = "2"
+time = "0.3"
 dotenvy = "0.15"
 pulldown-cmark = "0.13"
 regex = "1"
