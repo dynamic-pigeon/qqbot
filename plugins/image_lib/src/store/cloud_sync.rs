@@ -95,9 +95,10 @@ async fn run_rclone(root: &Path, destination: &str) -> Result<()> {
         .arg("--s3-no-check-bucket")
         // 群目录下的正式 index.db 与热日志不进云端;快照库在
         // backups/<日期>/<群号>/index.db,层级更深,不受这些规则影响。
-        // *.tmp 兼挡入库半成品与未 rename 完的备份目录。排除式不能带
-        // 前导 /:rclone 的 /=*/ 式样会静默匹配不到任何路径。
-        .arg("--exclude=[0-9]*/index.db")
+        // 前导 / 把式样锚定到根:不带时 [0-9]* 会从任意路径段起吃,
+        // backups 下的快照也会被误排(rclone 1.60 与 1.75 实测同病)。
+        // *.tmp 兼挡入库半成品与未 rename 完的备份目录。
+        .arg("--exclude=/[0-9]*/index.db")
         .arg("--exclude=*.db-journal")
         .arg("--exclude=*.db-wal")
         .arg("--exclude=*.db-shm")
