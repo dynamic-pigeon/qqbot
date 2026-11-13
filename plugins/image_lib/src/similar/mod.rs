@@ -473,11 +473,11 @@ mod tests {
     #[test]
     fn dct_cos_table_matches_direct_formula() {
         // 表与逐次 cos() 调用必须逐位一致,否则查表会改变存量指纹。
-        for u in 0..32 {
-            for x in 0..32 {
+        for (u, row) in DCT_COS.iter().enumerate() {
+            for (x, expected) in row.iter().enumerate() {
                 let direct =
                     (std::f64::consts::PI * (2.0 * x as f64 + 1.0) * u as f64 / 64.0).cos();
-                assert_eq!(DCT_COS[u][x].to_bits(), direct.to_bits(), "u={u} x={x}");
+                assert_eq!(expected.to_bits(), direct.to_bits(), "u={u} x={x}");
             }
         }
     }

@@ -410,10 +410,7 @@ fn knn_opencv(
     {
         return;
     }
-    for i in 0..matches.len() {
-        let Ok(pair) = matches.get(i) else {
-            continue;
-        };
+    for (i, pair) in matches.iter().enumerate() {
         if pair.len() < 2 {
             continue;
         }
