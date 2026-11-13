@@ -38,7 +38,7 @@ pub fn init() {
         let bot = Arc::clone(&bot);
         scheduled_task(map, bot)
     })
-    .unwrap();
+    .expect("直播轮询 cron 注册失败");
 
     // 每天凌晨0点清理一次订阅列表，移除已取消订阅的uid，避免map无限增长
     plugin::cron("0 0 * * *", move || {
@@ -51,7 +51,7 @@ pub fn init() {
             tracing::info!("已清理直播订阅列表，当前订阅数: {}", map.len());
         }
     })
-    .unwrap();
+    .expect("订阅清理 cron 注册失败");
 }
 
 /// 轮询防重入：上一轮还没跑完时直接跳过本轮。
