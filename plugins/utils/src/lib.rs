@@ -1,3 +1,4 @@
+pub mod bot;
 mod bounded_pool;
 pub mod command;
 pub mod config;

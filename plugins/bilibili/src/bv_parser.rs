@@ -90,11 +90,11 @@ impl ApiRes {
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
 const RATE_LIMIT_MAX_PER_WINDOW: usize = 3;
 
-static RATE_LIMITER: LazyLock<RateLimiter<i64>> =
+static RATE_LIMITER: LazyLock<RateLimiter<String>> =
     LazyLock::new(|| RateLimiter::new(RATE_LIMIT_WINDOW, RATE_LIMIT_MAX_PER_WINDOW));
 
-fn check_rate_limit(group_id: i64) -> bool {
-    RATE_LIMITER.try_acquire(group_id).is_ok()
+fn check_rate_limit(group: &str) -> bool {
+    RATE_LIMITER.try_acquire(group.to_owned()).is_ok()
 }
 
 static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -105,10 +105,10 @@ static LONG_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static SHORT_URL_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"https?://b23\.tv/(\w+)").unwrap());
 
-pub async fn parse_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
-    match parse_long_url(url, group_id).await {
+pub async fn parse_url(url: &str, group: &str) -> Result<BvInfo, BvError> {
+    match parse_long_url(url, group).await {
         Ok(info) => Ok(info),
-        Err(BvError::ParseFailed(_)) => parse_short_url(url, group_id).await,
+        Err(BvError::ParseFailed(_)) => parse_short_url(url, group).await,
         Err(e) => Err(e),
     }
 }
@@ -119,9 +119,9 @@ fn extract_bvid(url: &str) -> Option<&str> {
         .and_then(|caps| caps.name("bv").map(|m| m.as_str()))
 }
 
-async fn parse_long_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
+async fn parse_long_url(url: &str, group: &str) -> Result<BvInfo, BvError> {
     if let Some(bv) = extract_bvid(url) {
-        if !check_rate_limit(group_id) {
+        if !check_rate_limit(group) {
             return Err(BvError::RateLimited);
         }
         parse_bv(bv).await
@@ -147,7 +147,7 @@ fn is_bilibili_url(url: &str) -> bool {
     .any(|prefix| url.starts_with(prefix))
 }
 
-async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
+async fn parse_short_url(url: &str, group: &str) -> Result<BvInfo, BvError> {
     let caps = SHORT_URL_RE
         .captures(url)
         .ok_or(BvError::ParseFailed("未匹配到短链接"))?;
@@ -157,7 +157,7 @@ async fn parse_short_url(url: &str, group_id: i64) -> Result<BvInfo, BvError> {
         .as_str();
 
     // 短链 GET 必须先占额度，避免刷 b23.tv 堵住 current_thread。
-    if !check_rate_limit(group_id) {
+    if !check_rate_limit(group) {
         return Err(BvError::RateLimited);
     }
 
@@ -204,9 +204,9 @@ mod tests {
 
     // 集成测试统一使用 i64::MAX 附近的独立 group_id，
     // 避免与 `test_rate_limit_per_group` 的 i64::MAX / i64::MAX - 1 互相污染限流状态。
-    const GROUP_INVALID: i64 = i64::MAX - 101;
-    const GROUP_V_TEXT: i64 = i64::MAX - 102;
-    const GROUP_HTTP_COVER: i64 = i64::MAX - 103;
+    const GROUP_INVALID: &str = "9223372036854775706";
+    const GROUP_V_TEXT: &str = "9223372036854775705";
+    const GROUP_HTTP_COVER: &str = "9223372036854775704";
 
     #[tokio::test]
     #[ignore = "依赖公网 B 站 API，非本地/CI 环境跳过"]
@@ -255,13 +255,17 @@ https://www.bilibili.com/video/BV1CVNU6xEom";
         // 每次取新的群号，避免静态限流器在同进程重复跑测试时被污染。
         static NEXT_GROUP: std::sync::atomic::AtomicI64 =
             std::sync::atomic::AtomicI64::new(i64::MAX);
-        let group_a = NEXT_GROUP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let group_b = NEXT_GROUP.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let group_a = NEXT_GROUP
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        let group_b = NEXT_GROUP
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
 
-        assert!(check_rate_limit(group_a));
-        assert!(check_rate_limit(group_a));
-        assert!(check_rate_limit(group_a));
-        assert!(!check_rate_limit(group_a));
-        assert!(check_rate_limit(group_b));
+        assert!(check_rate_limit(&group_a));
+        assert!(check_rate_limit(&group_a));
+        assert!(check_rate_limit(&group_a));
+        assert!(!check_rate_limit(&group_a));
+        assert!(check_rate_limit(&group_b));
     }
 }

@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 utils = { workspace = true, features = ["screenshot"] }
 kovi.workspace = true
-kovi-onebot.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 askama.workspace = true

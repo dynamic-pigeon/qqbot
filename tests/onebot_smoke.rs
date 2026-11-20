@@ -1,3 +1,6 @@
+// onebot 栈专属烟测；official 栈的对应物是 P3 的 official_smoke。
+#![cfg(not(feature = "official"))]
+
 //! 用内存 OneBot V11 正向 WS 冒烟：current_thread 下各插件命令能否正常回复。
 //!
 //! 配置、词库和样图都写在临时目录，不读 gitignore 的 `data/` / `config.toml`。

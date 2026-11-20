@@ -52,20 +52,20 @@ fn parse_hash_prefix(raw: &str) -> Result<String, CommandError> {
 async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
     let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
-    let hash = match store.resolve_group_hash(group_id, &prefix).await {
+    let group_id = ctx.group_key()?;
+    let hash = match store.resolve_group_hash(&group_id, &prefix).await {
         Ok(hash) => hash,
         Err(error) => return Err(map_store_user_error(error)),
     };
-    let image = OutgoingImage::from_blob(store, group_id, &hash)
+    let image = OutgoingImage::from_blob(store, &group_id, &hash)
         .await
         .ok_or_else(|| CommandError::user("读取图片失败，请再试一次"))?;
     let message = image_message(None, &[image]);
-    if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
+    if let Err(error) = send_group_wait(ctx.bot(), &group_id, &message).await {
         report_send_fail(
             ctx.bot(),
             store,
-            group_id,
+            &group_id,
             format!("图库哈希发送失败 group={group_id}"),
             std::slice::from_ref(&hash),
             &error,
@@ -79,8 +79,8 @@ async fn handle_send_hash(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_delete_hash(ctx: CommandContext, store: &Store) -> CommandResult {
     let prefix = parse_hash_prefix(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
-    match store.delete_by_hash_prefix(group_id, &prefix).await {
+    let group_id = ctx.group_key()?;
+    match store.delete_by_hash_prefix(&group_id, &prefix).await {
         Ok(libraries) => {
             ctx.reply(format!(
                 "已从{}删除这张图",

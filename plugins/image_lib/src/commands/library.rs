@@ -50,7 +50,7 @@ pub(super) fn add_command(store: Arc<Store>) -> Command {
         })
 }
 
-pub(super) fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Command {
+pub(super) fn draw_command(store: Arc<Store>, limiter: Arc<RateLimiter<String>>) -> Command {
     Command::new("来只")
         .description("从本群指定图库随机发一张图")
         .usage("来只 <库名>")
@@ -136,10 +136,10 @@ pub(super) fn unalias_command(store: Arc<Store>) -> Command {
 async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
     let name = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
+    let group_id = ctx.group_key()?;
     let segments = add_image_segments(&ctx).await?;
-    let staged = stage_all(store, group_id, &segments).await?;
-    match store.add_images(group_id, name, staged).await {
+    let staged = stage_all(store, &group_id, &segments).await?;
+    match store.add_images(&group_id, name, staged).await {
         Ok(result) if result.added == 0 => {
             ctx.reply(format!("都已在「{name}」里"));
             Ok(())
@@ -156,7 +156,7 @@ async fn handle_add(ctx: CommandContext, store: &Store) -> CommandResult {
 /// 中途失败时清理已落盘的临时文件，不留半成品。
 async fn stage_all(
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     segments: &[Segment],
 ) -> Result<Vec<StagedImage>, CommandError> {
     let blobs = store.blobs_dir(group_id);
@@ -192,8 +192,8 @@ async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
         Some(_) => return Err(CommandError::UnexpectedArgument),
     };
     ctx.ensure_no_extra_args(if merge { 3 } else { 2 })?;
-    let group_id = ctx.group_id()?;
-    match store.set_alias(group_id, alias, target, merge).await {
+    let group_id = ctx.group_key()?;
+    match store.set_alias(&group_id, alias, target, merge).await {
         Ok(result) => {
             let canonical = &result.canonical;
             let message = if let Some(from) = &result.merged_from {
@@ -213,8 +213,8 @@ async fn handle_alias(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_unalias(ctx: CommandContext, store: &Store) -> CommandResult {
     let alias = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
-    match store.remove_alias(group_id, alias).await {
+    let group_id = ctx.group_key()?;
+    match store.remove_alias(&group_id, alias).await {
         Ok(()) => {
             ctx.reply(format!("已取消别名「{alias}」"));
             Ok(())
@@ -226,13 +226,13 @@ async fn handle_unalias(ctx: CommandContext, store: &Store) -> CommandResult {
 async fn handle_draw(
     ctx: CommandContext,
     store: &Store,
-    limiter: &RateLimiter<i64>,
+    limiter: &RateLimiter<String>,
 ) -> CommandResult {
     let name = parse_library_name(ctx.arg(0).unwrap_or(""))?;
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
+    let group_id = ctx.group_key()?;
 
-    match store.resolve_name(group_id, name).await {
+    match store.resolve_name(&group_id, name).await {
         Ok(_) => {}
         Err(StoreError::LibraryMissing) => {
             ctx.reply(format!("「{name}」里还没有图"));
@@ -242,11 +242,11 @@ async fn handle_draw(
     }
 
     // 空库不占限流。先占名额再抽并计数，打满的请求不会把次数加上。
-    if let Err(hit) = limiter.try_acquire(group_id) {
+    if let Err(hit) = limiter.try_acquire(group_id.clone()) {
         return Err(rate_limited(hit));
     }
 
-    let hash = match store.pick_random(group_id, name).await {
+    let hash = match store.pick_random(&group_id, name).await {
         Ok(hash) => hash,
         Err(StoreError::LibraryMissing | StoreError::LibraryEmpty) => {
             ctx.reply(format!("「{name}」里还没有图"));
@@ -257,16 +257,16 @@ async fn handle_draw(
 
     tracing::debug!("图库 draw group_id={} hash={}", group_id, hash);
 
-    let image = OutgoingImage::from_blob(store, group_id, &hash)
+    let image = OutgoingImage::from_blob(store, &group_id, &hash)
         .await
         .ok_or_else(|| CommandError::user("读取图片失败，请再试一次"))?;
 
     let message = image_message(None, &[image]);
-    if let Err(error) = send_group_wait(ctx.bot(), group_id, &message).await {
+    if let Err(error) = send_group_wait(ctx.bot(), &group_id, &message).await {
         report_send_fail(
             ctx.bot(),
             store,
-            group_id,
+            &group_id,
             format!("图库来只发送失败 group={group_id} 库={name}"),
             std::slice::from_ref(&hash),
             &error,
@@ -283,15 +283,15 @@ async fn handle_delete(
     wipes: &WipeConfirmations,
 ) -> CommandResult {
     ctx.ensure_no_extra_args(1)?;
-    let group_id = ctx.group_id()?;
+    let group_id = ctx.group_key()?;
     match ctx.arg(0) {
-        None => delete_one_image(&ctx, store, group_id).await,
+        None => delete_one_image(&ctx, store, &group_id).await,
         Some(name) => {
             ctx.require_admin()?;
             let name = parse_library_name(name)?;
-            match store.library_overview(group_id, name).await {
+            match store.library_overview(&group_id, name).await {
                 Ok(overview) => {
-                    wipes.begin(confirm_key(&ctx, group_id), overview.canonical.clone());
+                    wipes.begin(confirm_key(&ctx, &group_id), overview.canonical.clone());
                     ctx.reply(format!(
                         "「{}」有 {} 张图（约 {}）。确认清空请发送「图库 确认」，发送「图库 取消」可撤销，{} 分钟内有效",
                         overview.canonical,
@@ -313,13 +313,13 @@ async fn handle_confirm(
     wipes: &WipeConfirmations,
 ) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    let Some(library) = wipes.take(&confirm_key(&ctx, group_id)) else {
+    let group_id = ctx.group_key()?;
+    let Some(library) = wipes.take(&confirm_key(&ctx, &group_id)) else {
         return Err(CommandError::user(
             "没有待确认的清空操作，或已超时。可先发送「删除 <库名>」",
         ));
     };
-    match store.wipe_canonical_library(group_id, &library).await {
+    match store.wipe_canonical_library(&group_id, &library).await {
         Ok(canonical) => {
             ctx.reply(format!("已清空「{canonical}」"));
             Ok(())
@@ -333,8 +333,8 @@ async fn handle_confirm(
 
 async fn handle_cancel(ctx: CommandContext, wipes: &WipeConfirmations) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    match wipes.take(&confirm_key(&ctx, group_id)) {
+    let group_id = ctx.group_key()?;
+    match wipes.take(&confirm_key(&ctx, &group_id)) {
         Some(library) => {
             ctx.reply(format!("已取消清空「{library}」"));
             Ok(())
@@ -343,7 +343,7 @@ async fn handle_cancel(ctx: CommandContext, wipes: &WipeConfirmations) -> Comman
     }
 }
 
-async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) -> CommandResult {
+async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: &str) -> CommandResult {
     let segments = collect_image_segments(
         ctx,
         1,
@@ -367,9 +367,9 @@ async fn delete_one_image(ctx: &CommandContext, store: &Store, group_id: i64) ->
 
 async fn handle_list(ctx: CommandContext, store: &Store) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group_id = ctx.group_key()?;
     let stats = store
-        .stats(group_id)
+        .stats(&group_id)
         .await
         .map_err(CommandError::internal)?;
     if stats.libraries.is_empty() {
@@ -418,7 +418,7 @@ async fn collect_image_segments(
     single: bool,
     missing_hint: &str,
 ) -> Result<Vec<Segment>, CommandError> {
-    let message = &ctx.event().message;
+    let message = ctx.event().message();
     match resolve_add_source(message) {
         AddImageSource::Current => {
             let images = select_images(message.iter(), max, single)?;

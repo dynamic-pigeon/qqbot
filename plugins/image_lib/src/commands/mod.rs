@@ -13,7 +13,7 @@ use crate::store::{Store, StoreError};
 
 /// 图库命令集：各工厂自带群聊范围与「图库」分组，这里只决定注册顺序；
 /// 分组在 /help 顶层折成一行入口（/help 图库 展开）。
-pub fn image_lib_commands(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> Vec<Command> {
+pub fn image_lib_commands(store: Arc<Store>, limiter: Arc<RateLimiter<String>>) -> Vec<Command> {
     let scans = Arc::new(ScanSessions::new());
     // 裁剪会话与查重会话同库同人也互不覆盖：两个命令各自翻页。
     let crop_scans = Arc::new(ScanSessions::new());
@@ -32,10 +32,10 @@ pub fn image_lib_commands(store: Arc<Store>, limiter: Arc<RateLimiter<i64>>) -> 
     ]
 }
 
-pub(super) fn confirm_key(ctx: &CommandContext, group_id: i64) -> ConfirmKey {
+pub(super) fn confirm_key(ctx: &CommandContext, group_id: &str) -> ConfirmKey {
     ConfirmKey {
-        group_id,
-        user_id: ctx.event().user_id,
+        group_id: group_id.to_owned(),
+        user_id: ctx.user_key(),
     }
 }
 

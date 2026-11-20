@@ -57,7 +57,7 @@ impl Store {
             let _ = kovi::tokio::fs::remove_dir_all(&tmp_dir).await;
             kovi::tokio::fs::create_dir_all(&tmp_dir).await?;
             for group_id in self.list_group_ids().await? {
-                if let Err(error) = self.backup_group(group_id, today, &tmp_dir).await {
+                if let Err(error) = self.backup_group(&group_id, today, &tmp_dir).await {
                     tracing::error!("图库备份群 {group_id} 失败,已跳过: {error}");
                     let _ =
                         kovi::tokio::fs::remove_dir_all(tmp_dir.join(group_id.to_string())).await;
@@ -74,11 +74,11 @@ impl Store {
     /// 今天当且仅当今天的快照存在。反过来先刷表再 VACUUM,磁盘满时会
     /// 恰好停在「有保护期却无快照」的状态。代价是快照里带到的是前一天
     /// 的 refs,恢复出的库保护期最多少一天。
-    async fn backup_group(&self, group_id: i64, today: i64, tmp_root: &Path) -> Result<()> {
+    async fn backup_group(&self, group_id: &str, today: i64, tmp_root: &Path) -> Result<()> {
         let group_tmp = tmp_root.join(group_id.to_string());
         let snapshot = group_tmp.join("index.db");
         kovi::tokio::fs::create_dir_all(&group_tmp).await?;
-        self.with_group(group_id, {
+        self.with_group(&group_id, {
             let snapshot = snapshot.clone();
             move |pool| async move {
                 sqlx::query("VACUUM INTO ?")

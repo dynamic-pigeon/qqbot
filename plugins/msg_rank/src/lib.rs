@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use kovi::{Message, PluginBuilder as plugin, futures_util::future::join_all};
-use kovi_onebot::{EventRegistrar as _, OnebotTrait as _, event::GroupMsgEvent};
+use utils::bot::{self, BotMsgEvent};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, CommandRouter, MessageScope, Permission,
 };
@@ -34,6 +34,7 @@ async fn main() {
 
     db::init_db(&db_path).await.unwrap();
     plugin::drop(|| async move { db::flush_on_shutdown().await });
+    msg_rank::user_info::init(&path);
 
     CommandRouter::new("msg_rank", Arc::clone(&bot))
         .register(record_command())
@@ -45,7 +46,7 @@ async fn main() {
         .install()
         .expect("注册发言排行、消息采集、词云与周报命令失败");
 
-    plugin::on_group_msg(add_msg);
+    bot::on_group_msg(add_msg);
     word_cloud::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
     msg_rank::weekly_report::init(Arc::clone(&bot), Arc::clone(&path)).unwrap();
 }
@@ -78,9 +79,9 @@ fn record_command() -> Command {
 
 fn record_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     config::CONFIG
-        .modify(|config| config.enable_recording(group_id))
+        .modify(|config| config.enable_recording(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("消息采集已启用");
     Ok(())
@@ -88,9 +89,9 @@ fn record_enable(ctx: CommandContext) -> CommandResult {
 
 fn record_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     config::CONFIG
-        .modify(|config| config.disable_recording(group_id))
+        .modify(|config| config.disable_recording(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("消息采集已停用");
     Ok(())
@@ -98,8 +99,8 @@ fn record_disable(ctx: CommandContext) -> CommandResult {
 
 fn record_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    ctx.reply(if config::CONFIG.get().recording_enabled(group_id) {
+    let group = ctx.group_key()?;
+    ctx.reply(if config::CONFIG.get().recording_enabled(&group) {
         "消息采集已启用"
     } else {
         "消息采集未启用"
@@ -107,33 +108,23 @@ fn record_status(ctx: CommandContext) -> CommandResult {
     Ok(())
 }
 
-async fn add_msg(event: Arc<GroupMsgEvent>) {
-    let group = event.group_id;
-    let user = event.user_id;
+async fn add_msg(event: Arc<dyn BotMsgEvent>) {
+    let Some(group) = event.group_key() else {
+        return;
+    };
+    let user = event.user_key();
 
-    if !config::CONFIG.get().recording_enabled(group) {
+    if !config::CONFIG.get().recording_enabled(&group) {
         return;
     }
 
-    let text = truncate_utf8(get_text(&event.message).await, MAX_STORED_MESSAGE_BYTES);
+    let text = truncate_utf8(get_text(event.message()).await, MAX_STORED_MESSAGE_BYTES);
     if text.trim().is_empty() {
         return;
     }
 
-    if let Err(e) = db::add_msg(group, user, text, event.time) {
+    if let Err(e) = db::add_msg(&group, &user, text, event.timestamp()) {
         tracing::error!("添加消息失败: {}", e);
-    }
-}
-
-/// 记录 error 日志，并把同样的内容私聊给 bot 主管理员。
-pub(crate) async fn notify_admin(bot: &kovi::RuntimeBot, message: String) {
-    tracing::error!("{message}");
-    if let Some(admin_id) = bot
-        .get_main_admin()
-        .ok()
-        .and_then(|admin| admin.try_as_i64())
-    {
-        bot.send_private_msg(admin_id, message);
     }
 }
 

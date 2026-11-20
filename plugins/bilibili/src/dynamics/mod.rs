@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
-use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
+use utils::bot::{MessageExt as _, send_group_message};
 
 use crate::config;
 
@@ -62,11 +62,11 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("fetch 超时"))??;
 
     let cfg = crate::config::CONFIG.get();
-    let groups: Vec<i64> = cfg
+    let groups: Vec<String> = cfg
         .dynamic_subscribe
         .iter()
         .filter(|s| s.uid == uid)
-        .flat_map(|s| s.groups.iter().copied())
+        .flat_map(|s| s.groups.iter().cloned())
         .collect();
 
     if groups.is_empty() {
@@ -83,7 +83,7 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
         let last_seen = cfg
             .dynamic_checkpoints
             .iter()
-            .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == group)
+            .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == *group)
             .map(|checkpoint| checkpoint.last_seen);
         let Some(last_seen) = last_seen else {
             updates.push((group, latest_id));
@@ -95,7 +95,7 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
         let mut delivered_through = last_seen;
         for (id, item) in new_items {
             let author = author_of(item);
-            if let Err(e) = push_dynamic(bot, group, &author, item).await {
+            if let Err(e) = push_dynamic(bot, &group, &author, item).await {
                 tracing::warn!("推送失败 uid={} group={}: {e}", uid, group);
                 break;
             }
@@ -108,9 +108,9 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
 
     if !updates.is_empty() {
         config::CONFIG.modify(|cfg| {
-            for &(group, last_seen) in &updates {
+            for (group, last_seen) in &updates {
                 let still_subscribed = cfg.dynamic_subscribe.iter().any(|subscription| {
-                    subscription.uid == uid && subscription.groups.contains(&group)
+                    subscription.uid == uid && subscription.groups.iter().any(|item| item == group)
                 });
                 if !still_subscribed {
                     continue;
@@ -118,15 +118,15 @@ async fn poll_one_uid(bot: &RuntimeBot, uid: u64) -> anyhow::Result<()> {
                 if let Some(checkpoint) = cfg
                     .dynamic_checkpoints
                     .iter_mut()
-                    .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == group)
+                    .find(|checkpoint| checkpoint.uid == uid && checkpoint.group == *group)
                 {
-                    checkpoint.last_seen = checkpoint.last_seen.max(last_seen);
+                    checkpoint.last_seen = checkpoint.last_seen.max(*last_seen);
                 } else {
                     cfg.dynamic_checkpoints
                         .push(crate::config::DynamicCheckpoint {
                             uid,
-                            group,
-                            last_seen,
+                            group: group.clone(),
+                            last_seen: *last_seen,
                         });
                 }
             }
@@ -207,7 +207,7 @@ pub async fn fetch_recent(uid: u64, count: usize) -> anyhow::Result<Vec<DynamicI
     Ok(all)
 }
 
-pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
+pub fn add_subscribe(uid: u64, group: &str) -> anyhow::Result<bool> {
     let mut changed = false;
     config::CONFIG.modify(|cfg| {
         changed = config::upsert_subscribe_group(&mut cfg.dynamic_subscribe, uid, group);
@@ -215,7 +215,7 @@ pub fn add_subscribe(uid: u64, group: i64) -> anyhow::Result<bool> {
     Ok(changed)
 }
 
-pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
+pub fn remove_subscribe(uid: u64, group: &str) -> anyhow::Result<()> {
     config::CONFIG.modify(|cfg| {
         config::remove_subscribe_group(&mut cfg.dynamic_subscribe, uid, group);
         cfg.dynamic_checkpoints
@@ -223,18 +223,18 @@ pub fn remove_subscribe(uid: u64, group: i64) -> anyhow::Result<()> {
     })
 }
 
-pub fn list_subscribes(group: i64) -> Vec<u64> {
+pub fn list_subscribes(group: &str) -> Vec<u64> {
     let cfg = config::CONFIG.get();
     cfg.dynamic_subscribe
         .iter()
-        .filter(|s| s.groups.contains(&group))
+        .filter(|s| s.groups.iter().any(|item| item == group))
         .map(|s| s.uid)
         .collect()
 }
 
 pub async fn push_dynamic(
     bot: &RuntimeBot,
-    group: i64,
+    group: &str,
     author: &DynamicAuthor,
     item: &DynamicItem,
 ) -> anyhow::Result<()> {
@@ -270,9 +270,9 @@ pub async fn push_dynamic(
         msg.push_image(&utils::base64_image(bytes));
     }
 
-    // 用 send_group_msg_return 真正等待 onebot 确认送达；
-    // 这样调用方（/dynamic fetch、cron 推送）才能正确反映"已推送 N/N"。
-    bot.send_group_msg_return(group, msg)
+    // 等待协议端确认送达，调用方（/dynamic fetch、cron 推送）
+    // 才能正确反映「已推送 N/N」。
+    send_group_message(bot, group, msg)
         .await
         .map_err(|e| anyhow::anyhow!("发送群消息失败: {e}"))?;
     Ok(())

@@ -49,8 +49,8 @@ fn note_recovered() {
 }
 
 struct MsgRecord {
-    group_id: i64,
-    user_id: i64,
+    group_id: String,
+    user_id: String,
     msg: String,
     timestamp: i64,
 }
@@ -217,8 +217,8 @@ async fn flush_batch(state: &mut BufferState) {
         "INSERT INTO MSG (group_id, user_id, msg, timestamp) ",
     );
     builder.push_values(&state.records[..chunk_size], |mut row, record| {
-        row.push_bind(record.group_id)
-            .push_bind(record.user_id)
+        row.push_bind(&record.group_id)
+            .push_bind(&record.user_id)
             .push_bind(&record.msg)
             .push_bind(record.timestamp);
     });
@@ -262,10 +262,10 @@ pub(crate) async fn flush_on_shutdown() {
 
 /// `timestamp` 用事件时刻而不是入库时刻：OCR 下载识别会推迟入库，
 /// 23:59 发出的带图消息不应被计入第二天。
-pub(crate) fn add_msg(group_id: i64, user_id: i64, msg: String, timestamp: i64) -> Result<()> {
+pub(crate) fn add_msg(group_id: &str, user_id: &str, msg: String, timestamp: i64) -> Result<()> {
     let record = MsgRecord {
-        group_id,
-        user_id,
+        group_id: group_id.to_owned(),
+        user_id: user_id.to_owned(),
         msg,
         timestamp,
     };
@@ -284,13 +284,13 @@ pub(crate) fn add_msg(group_id: i64, user_id: i64, msg: String, timestamp: i64) 
 }
 
 pub(crate) async fn msg_count_top_with_time_range(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
     limit: i64,
-) -> Result<Vec<(i64, u32)>> {
+) -> Result<Vec<(String, u32)>> {
     let conn = get_pool()?;
-    let rows: Vec<(i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64)> = sqlx::query_as(
         "
 SELECT user_id, COUNT(*) as count FROM MSG
     WHERE group_id = ? AND timestamp >= ? AND timestamp < ?
@@ -314,7 +314,7 @@ SELECT user_id, COUNT(*) as count FROM MSG
 
 /// 时间范围内的消息总数，用作排行头部的总计与占比分母。
 pub(crate) async fn msg_count_total_with_time_range(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
 ) -> Result<u32> {
@@ -335,7 +335,7 @@ pub(crate) async fn msg_count_total_with_time_range(
 pub(crate) const MAX_TEXT_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 pub(crate) async fn select_text_from_time_range(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
     max_bytes: usize,
@@ -377,11 +377,11 @@ SELECT msg FROM MSG
 /// 周报聚合：按用户返回 (user_id, 消息数, 发言覆盖的本地日期数)，消息数降序。
 /// 不加 LIMIT：行数以群成员数为上界，榜单、活跃人数与全勤统计共用这一份结果。
 pub(crate) async fn msg_count_with_active_days(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
-) -> Result<Vec<(i64, u32, u32)>> {
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+) -> Result<Vec<(String, u32, u32)>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "
 SELECT user_id, COUNT(*) AS cnt,
        COUNT(DISTINCT date(timestamp, 'unixepoch', 'localtime')) AS days
@@ -405,7 +405,7 @@ ORDER BY cnt DESC
 
 /// 按本地日期统计消息数，键为 `YYYY-MM-DD`，升序返回；周报每日柱状图用。
 pub(crate) async fn msg_count_by_local_date(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
 ) -> Result<Vec<(String, u32)>> {
@@ -433,12 +433,12 @@ ORDER BY d
 /// 给定本地小时集合内发言最多的用户；不足 min_count 时返回 None。
 /// 夜聊/早起时段共用；IN 列表元素个数随调用方常量变化，用 QueryBuilder 绑定参数构建。
 pub(crate) async fn msg_count_top_at_local_hours(
-    group_id: i64,
+    group_id: &str,
     start_time: i64,
     end_time: i64,
     hours: &[u32],
     min_count: u32,
-) -> Result<Option<(i64, u32)>> {
+) -> Result<Option<(String, u32)>> {
     let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         "SELECT user_id, COUNT(*) AS cnt FROM MSG
 WHERE group_id = ",
@@ -457,8 +457,8 @@ WHERE group_id = ",
     builder.push_bind(i64::from(min_count));
     builder.push(" ORDER BY cnt DESC LIMIT 1");
 
-    let row: Option<(i64, i64)> = builder
-        .build_query_as::<(i64, i64)>()
+    let row: Option<(String, i64)> = builder
+        .build_query_as::<(String, i64)>()
         .fetch_optional(get_pool()?)
         .await?;
 
@@ -482,8 +482,8 @@ async fn init_table() -> Result<()> {
     sqlx::query(
         "
 CREATE TABLE IF NOT EXISTS MSG (
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
     msg TEXT NOT NULL,
     timestamp INTEGER NOT NULL
 );
@@ -493,6 +493,7 @@ CREATE TABLE IF NOT EXISTS MSG (
     .await?;
 
     rebuild_msg_without_id_column(pool).await?;
+    migrate_integer_identity_to_text(pool).await?;
 
     sqlx::query(
         "
@@ -516,6 +517,54 @@ ON MSG (timestamp);
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// 身份键从 INTEGER 迁到 TEXT：旧库存的是 OneBot 群号/QQ 号，
+/// 统一 CAST 成十进制串，历史数据继续可查。
+async fn migrate_integer_identity_to_text(pool: &SqlitePool) -> Result<()> {
+    let columns: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, type FROM pragma_table_info('MSG')")
+            .fetch_all(pool)
+            .await?;
+    let is_integer = columns.iter().any(|(name, kind)| {
+        (name == "group_id" || name == "user_id") && kind.eq_ignore_ascii_case("integer")
+    });
+    if !is_integer {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS MSG_migrated")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "
+CREATE TABLE MSG_migrated (
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    msg TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+);
+",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let moved = sqlx::query(
+        "
+INSERT INTO MSG_migrated (group_id, user_id, msg, timestamp)
+SELECT CAST(group_id AS TEXT), CAST(user_id AS TEXT), msg, timestamp FROM MSG;
+",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query("DROP TABLE MSG").execute(&mut *tx).await?;
+    sqlx::query("ALTER TABLE MSG_migrated RENAME TO MSG")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    tracing::info!("消息库身份键已迁移为 TEXT，共 {moved} 行");
     Ok(())
 }
 
@@ -582,18 +631,18 @@ mod tests {
 
             // 时间戳取近期值：保留期清理会把过老的行当过期删掉，影响下面的计数。
             let now = chrono::Local::now().timestamp();
-            add_msg(1, 100, "hello".into(), now - 10).unwrap();
-            add_msg(1, 101, "world".into(), now - 5).unwrap();
-            add_msg(2, 100, "other".into(), now - 1).unwrap();
+            add_msg("1", "100", "hello".into(), now - 10).unwrap();
+            add_msg("1", "101", "world".into(), now - 5).unwrap();
+            add_msg("2", "100", "other".into(), now - 1).unwrap();
 
             flush_on_shutdown().await;
 
-            let group1 = msg_count_top_with_time_range(1, 0, i64::MAX, 10)
+            let group1 = msg_count_top_with_time_range("1", 0, i64::MAX, 10)
                 .await
                 .unwrap();
             assert_eq!(group1.len(), 2);
 
-            let group2 = msg_count_top_with_time_range(2, 0, i64::MAX, 10)
+            let group2 = msg_count_top_with_time_range("2", 0, i64::MAX, 10)
                 .await
                 .unwrap();
             assert_eq!(group2.len(), 1);
@@ -604,7 +653,7 @@ mod tests {
                 .unwrap();
             assert_eq!(total.0, 3);
 
-            let text = select_text_from_time_range(1, 0, i64::MAX, 7)
+            let text = select_text_from_time_range("1", 0, i64::MAX, 7)
                 .await
                 .unwrap();
             assert!(text.len() <= 7);
@@ -663,13 +712,20 @@ mod tests {
         insert(2, ts(2, 23, 30)).await.unwrap();
         insert(3, ts(1, 0, 30)).await.unwrap();
 
-        let rows = msg_count_with_active_days(90210, 0, i64::MAX)
+        let rows = msg_count_with_active_days("90210", 0, i64::MAX)
             .await
             .unwrap();
-        assert_eq!(rows, vec![(1, 7, 2), (2, 4, 1), (3, 1, 1)]);
+        assert_eq!(
+            rows,
+            vec![
+                ("1".to_owned(), 7, 2),
+                ("2".to_owned(), 4, 1),
+                ("3".to_owned(), 1, 1)
+            ]
+        );
 
         let daily: std::collections::HashMap<String, u32> =
-            msg_count_by_local_date(90210, 0, i64::MAX)
+            msg_count_by_local_date("90210", 0, i64::MAX)
                 .await
                 .unwrap()
                 .into_iter()
@@ -679,16 +735,16 @@ mod tests {
         assert_eq!(daily.get(&day_ago(2).to_string()), Some(&9));
         assert_eq!(daily.get(&day_ago(1).to_string()), Some(&3));
 
-        let night = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[23, 0, 1, 2, 3, 4, 5], 3)
+        let night = msg_count_top_at_local_hours("90210", 0, i64::MAX, &[23, 0, 1, 2, 3, 4, 5], 3)
             .await
             .unwrap();
-        assert_eq!(night, Some((1, 5)));
-        let early = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[6, 7, 8], 3)
+        assert_eq!(night, Some(("1".to_owned(), 5)));
+        let early = msg_count_top_at_local_hours("90210", 0, i64::MAX, &[6, 7, 8], 3)
             .await
             .unwrap();
-        assert_eq!(early, Some((2, 3)));
+        assert_eq!(early, Some(("2".to_owned(), 3)));
         // 门槛过滤：时段内没人达到 6 条时不加冕。
-        let none = msg_count_top_at_local_hours(90210, 0, i64::MAX, &[6, 7, 8], 6)
+        let none = msg_count_top_at_local_hours("90210", 0, i64::MAX, &[6, 7, 8], 6)
             .await
             .unwrap();
         assert_eq!(none, None);
@@ -705,14 +761,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            msg_count_total_with_time_range(90211, 0, boundary)
+            msg_count_total_with_time_range("90211", 0, boundary)
                 .await
                 .unwrap(),
             0,
             "端点消息不得计入以它为 end 的窗口"
         );
         assert_eq!(
-            msg_count_total_with_time_range(90211, boundary, boundary + 1)
+            msg_count_total_with_time_range("90211", boundary, boundary + 1)
                 .await
                 .unwrap(),
             1,

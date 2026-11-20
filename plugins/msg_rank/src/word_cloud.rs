@@ -13,8 +13,8 @@ use std::{
 use anyhow::Result;
 use image::{DynamicImage, GrayImage, ImageFormat, Luma, Pixel as _, Rgba, imageops::FilterType};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, chrono, tokio};
-use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
 use tracing::{self, info};
+use utils::bot::{MessageExt as _, send_group_message};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
 };
@@ -122,19 +122,14 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
             let bot = &bot;
             if mark_cron_fire(&last_fire_ts, chrono::Local::now().timestamp()) {
                 let config = CONFIG.get();
-                for &group_id in &config.wordcloud_group {
+                for group in &config.wordcloud_group {
                     let bot = Arc::clone(bot);
                     let path = Arc::clone(path);
                     let title = title.clone();
+                    let group = group.clone();
                     kovi::spawn(async move {
-                        send_word_cloud(
-                            &bot,
-                            group_id,
-                            &path,
-                            chrono::Duration::days(days),
-                            &title,
-                        )
-                        .await;
+                        send_word_cloud(&bot, &group, &path, chrono::Duration::days(days), &title)
+                            .await;
                     });
                 }
             }
@@ -182,20 +177,20 @@ pub(crate) fn wordcloud_command(path: Arc<PathBuf>) -> Command {
 
 fn wordcloud_once(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     let bot = Arc::clone(ctx.bot());
     ctx.reply("⏳ 正在生成词云...");
     kovi::spawn(async move {
-        send_word_cloud(&bot, group_id, &path, chrono::Duration::days(1), "临时词云").await;
+        send_word_cloud(&bot, &group, &path, chrono::Duration::days(1), "临时词云").await;
     });
     Ok(())
 }
 
 fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     CONFIG
-        .modify(|config| config.enable_wordcloud(group_id))
+        .modify(|config| config.enable_wordcloud(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("启用成功");
     Ok(())
@@ -203,9 +198,9 @@ fn wordcloud_enable(ctx: CommandContext) -> CommandResult {
 
 fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     CONFIG
-        .modify(|config| config.disable_wordcloud(group_id))
+        .modify(|config| config.disable_wordcloud(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("停用成功");
     Ok(())
@@ -213,8 +208,8 @@ fn wordcloud_disable(ctx: CommandContext) -> CommandResult {
 
 fn wordcloud_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    let enabled = CONFIG.get().wordcloud_enabled(group_id);
+    let group = ctx.group_key()?;
+    let enabled = CONFIG.get().wordcloud_enabled(&group);
     ctx.reply(if enabled {
         "词云功能已启用"
     } else {
@@ -225,42 +220,43 @@ fn wordcloud_status(ctx: CommandContext) -> CommandResult {
 
 async fn send_word_cloud(
     bot: &RuntimeBot,
-    group_id: i64,
+    group: &str,
     path: &Path,
     duration: chrono::Duration,
     dsc: &str,
 ) {
-    let image = match make_word_cloud(path, group_id, duration).await {
+    let image = match make_word_cloud(path, group, duration).await {
         Ok(image) if !image.is_empty() => image,
         Ok(_) => {
-            info!("word cloud is empty, group_id: {}", group_id);
+            info!("word cloud is empty, group: {}", group);
             return;
         }
         Err(e) => {
-            crate::notify_admin(
+            utils::bot::notify_admin(
                 bot,
-                format!("make word cloud failed: {}, group_id: {}", e, group_id),
+                format!("make word cloud failed: {}, group: {}", e, group),
             )
             .await;
             return;
         }
     };
 
-    info!("send word cloud to group: {}", group_id);
+    info!("send word cloud to group: {}", group);
 
-    bot.send_group_msg(
-        group_id,
+    if let Err(e) = send_group_message(
+        bot,
+        group,
         Message::new()
             .add_text(dsc)
             .add_image(&utils::base64_image(&image)),
-    );
+    )
+    .await
+    {
+        tracing::error!("发送词云失败: {}", e);
+    }
 }
 
-async fn make_word_cloud(
-    path: &Path,
-    group_id: i64,
-    duration: chrono::Duration,
-) -> Result<Vec<u8>> {
+async fn make_word_cloud(path: &Path, group: &str, duration: chrono::Duration) -> Result<Vec<u8>> {
     // 生成全局串行，排队的任务需等待前一个个完成，超时时间需覆盖最坏等待。
     let _permit = WORDCLOUD_POOL
         .acquire(std::time::Duration::from_secs(10 * 60))
@@ -269,7 +265,7 @@ async fn make_word_cloud(
     let start_time = end_time - duration;
 
     let messages = crate::db::select_text_from_time_range(
-        group_id,
+        group,
         start_time.timestamp(),
         end_time.timestamp(),
         crate::db::MAX_TEXT_INPUT_BYTES,

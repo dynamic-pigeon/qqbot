@@ -11,6 +11,7 @@ use crate::scan::{
 };
 use crate::send::{
     OutgoingImage, forward_node, image_message, report_send_fail, send_group_forward_wait,
+    send_group_wait,
 };
 use crate::similar::{SimilarGroup, cluster, distance_from_percent};
 use crate::store::{CropPlan, Store};
@@ -145,18 +146,18 @@ async fn handle_scan(
     kind: ScanKind,
 ) -> CommandResult {
     let op = parse_scan_op(ctx.args(), kind)?;
-    let group_id = ctx.group_id()?;
-    let user_id = ctx.event().user_id;
+    let group_id = ctx.group_key()?;
+    let user_id = ctx.user_key();
     let hint = kind.hint();
     match op {
         ScanOp::Start { name, percent } => {
             let Some((canonical, groups)) =
-                begin_scan(&ctx, store, group_id, name, percent, kind).await?
+                begin_scan(&ctx, store, &group_id, name, percent, kind).await?
             else {
                 return Ok(());
             };
             let key = ScanKey {
-                group_id,
+                group_id: group_id.clone(),
                 user_id,
                 library: canonical.clone(),
             };
@@ -165,7 +166,7 @@ async fn handle_scan(
                 ctx: &ctx,
                 store,
                 scans,
-                group_id,
+                group_id: &group_id,
                 library: &canonical,
                 key: &key,
                 command_hint: hint,
@@ -173,9 +174,9 @@ async fn handle_scan(
             .show(None, true)
             .await
         }
-        ScanOp::Next { name } => resume_scan(&ctx, store, scans, group_id, name, None, hint).await,
+        ScanOp::Next { name } => resume_scan(&ctx, store, scans, &group_id, name, None, hint).await,
         ScanOp::Jump { name, index } => {
-            resume_scan(&ctx, store, scans, group_id, name, Some(index), hint).await
+            resume_scan(&ctx, store, scans, &group_id, name, Some(index), hint).await
         }
     }
 }
@@ -184,7 +185,7 @@ async fn handle_scan(
 async fn begin_scan(
     ctx: &CommandContext,
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     name: &str,
     percent: Option<u32>,
     kind: ScanKind,
@@ -198,7 +199,7 @@ async fn begin_scan(
 async fn begin_duplicate(
     ctx: &CommandContext,
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     name: &str,
     percent: Option<u32>,
 ) -> Result<Option<(String, Vec<SimilarGroup>)>, CommandError> {
@@ -230,7 +231,7 @@ async fn begin_duplicate(
 async fn begin_crop(
     ctx: &CommandContext,
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     name: &str,
 ) -> Result<Option<(String, Vec<SimilarGroup>)>, CommandError> {
     let (canonical, plan) = store
@@ -272,7 +273,7 @@ async fn begin_crop(
 async fn send_fresh_crop_groups(
     ctx: &CommandContext,
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     library: &str,
     groups: &[SimilarGroup],
 ) -> CommandResult {
@@ -310,12 +311,12 @@ async fn resume_scan(
     ctx: &CommandContext,
     store: &Store,
     scans: &ScanSessions,
-    group_id: i64,
+    group_id: &str,
     name: &str,
     jump: Option<usize>,
     command_hint: &str,
 ) -> CommandResult {
-    let (canonical, key) = open_scan_key(store, group_id, ctx.event().user_id, name).await?;
+    let (canonical, key) = open_scan_key(store, group_id, &ctx.user_key(), name).await?;
     ScanPage {
         ctx,
         store,
@@ -331,8 +332,8 @@ async fn resume_scan(
 
 async fn open_scan_key(
     store: &Store,
-    group_id: i64,
-    user_id: i64,
+    group_id: &str,
+    user_id: &str,
     name: &str,
 ) -> Result<(String, ScanKey), CommandError> {
     let canonical = store
@@ -342,8 +343,8 @@ async fn open_scan_key(
     Ok((
         canonical.clone(),
         ScanKey {
-            group_id,
-            user_id,
+            group_id: group_id.to_owned(),
+            user_id: user_id.to_owned(),
             library: canonical,
         },
     ))
@@ -360,7 +361,7 @@ struct ScanPage<'a> {
     ctx: &'a CommandContext,
     store: &'a Store,
     scans: &'a ScanSessions,
-    group_id: i64,
+    group_id: &'a str,
     library: &'a str,
     key: &'a ScanKey,
     command_hint: &'a str,
@@ -466,7 +467,7 @@ impl ScanPage<'_> {
 #[cfg(not(feature = "send-file"))]
 async fn read_group_images(
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     hashes: &[String],
 ) -> (Vec<PackedImage>, bool) {
     let mut budget = MAX_GROUP_READ_BYTES;
@@ -491,12 +492,12 @@ async fn read_group_images(
 #[cfg(feature = "send-file")]
 async fn read_group_images(
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     hashes: &[String],
 ) -> (Vec<PackedImage>, bool) {
     let mut images = Vec::new();
     for hash in hashes {
-        if let Some(image) = OutgoingImage::from_blob(store, group_id, hash).await {
+        if let Some(image) = OutgoingImage::from_blob(store, &group_id, hash).await {
             images.push(PackedImage {
                 hash: hash.clone(),
                 image,
@@ -513,8 +514,8 @@ async fn reply_scan_page(
     groups: Vec<ScanPageGroup>,
     group_total: usize,
 ) -> CommandResult {
-    let group_id = ctx.group_id()?;
-    let self_id = ctx.event().self_id;
+    let group_id = ctx.group_key()?;
+    let actor_key = utils::bot::bot_key(ctx.bot()).await;
     let from = groups.first().map(|group| group.index).unwrap_or(1);
     let to = groups.last().map(|group| group.index).unwrap_or(from);
     let mut grouped = Vec::new();
@@ -528,10 +529,35 @@ async fn reply_scan_page(
             .map(|packet| {
                 let images = packet.images.iter().map(|image| &image.image);
                 let message = image_message(Some(&packet.caption), images);
-                forward_node(&packet.name, self_id, &message)
+                forward_node(&packet.name, &actor_key, &message)
             })
             .collect();
-        if let Err(error) = send_group_forward_wait(ctx.bot(), group_id, &nodes).await {
+        if let Err(error) = send_group_forward_wait(ctx.bot(), &group_id, &nodes).await {
+            if utils::bot::is_official() {
+                // 官方栈没有合并转发：逐条发文字 + 图，消息形态不同但结果完整。
+                for packet in chunk {
+                    let images = packet.images.iter().map(|image| &image.image);
+                    let message = image_message(Some(&packet.caption), images);
+                    if let Err(error) = send_group_wait(ctx.bot(), &group_id, &message).await {
+                        let remaining: Vec<String> = packet
+                            .images
+                            .iter()
+                            .map(|image| image.hash.clone())
+                            .collect();
+                        report_send_fail(
+                            ctx.bot(),
+                            store,
+                            &group_id,
+                            format!("图库查重逐图降级发送失败 group={group_id} 库={library}"),
+                            &remaining,
+                            &error,
+                        )
+                        .await;
+                        return Err(CommandError::user("查重结果发送失败"));
+                    }
+                }
+                continue;
+            }
             let remaining: Vec<String> = chunks[i..]
                 .iter()
                 .flat_map(|part| {
@@ -542,7 +568,7 @@ async fn reply_scan_page(
             report_send_fail(
                 ctx.bot(),
                 store,
-                group_id,
+                &group_id,
                 format!(
                     "图库查重发送失败 group={group_id} 库={library} 组={from}-{to}/{group_total} 聊天记录={}",
                     i + 1

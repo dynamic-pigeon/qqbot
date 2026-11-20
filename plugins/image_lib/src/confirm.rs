@@ -10,8 +10,8 @@ const PENDING_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ConfirmKey {
-    pub group_id: i64,
-    pub user_id: i64,
+    pub group_id: String,
+    pub user_id: String,
 }
 
 struct PendingWipe {
@@ -70,14 +70,17 @@ fn expire(sessions: &mut HashMap<ConfirmKey, PendingWipe>) {
 mod tests {
     use super::*;
 
-    fn key(group_id: i64, user_id: i64) -> ConfirmKey {
-        ConfirmKey { group_id, user_id }
+    fn key(group_id: &str, user_id: &str) -> ConfirmKey {
+        ConfirmKey {
+            group_id: group_id.to_owned(),
+            user_id: user_id.to_owned(),
+        }
     }
 
     #[test]
     fn begin_then_take_consumes_once() {
         let confirmations = WipeConfirmations::new();
-        let key = key(1, 2);
+        let key = key("1", "2");
         confirmations.begin(key.clone(), "猫".to_owned());
 
         assert_eq!(confirmations.take(&key).as_deref(), Some("猫"));
@@ -87,19 +90,19 @@ mod tests {
     #[test]
     fn keys_isolate_by_group_and_user() {
         let confirmations = WipeConfirmations::new();
-        confirmations.begin(key(1, 2), "猫".to_owned());
-        confirmations.begin(key(1, 3), "狗".to_owned());
-        confirmations.begin(key(2, 2), "鸟".to_owned());
+        confirmations.begin(key("1", "2"), "猫".to_owned());
+        confirmations.begin(key("1", "3"), "狗".to_owned());
+        confirmations.begin(key("2", "2"), "鸟".to_owned());
 
-        assert_eq!(confirmations.take(&key(1, 2)).as_deref(), Some("猫"));
-        assert_eq!(confirmations.take(&key(1, 3)).as_deref(), Some("狗"));
-        assert_eq!(confirmations.take(&key(2, 2)).as_deref(), Some("鸟"));
+        assert_eq!(confirmations.take(&key("1", "2")).as_deref(), Some("猫"));
+        assert_eq!(confirmations.take(&key("1", "3")).as_deref(), Some("狗"));
+        assert_eq!(confirmations.take(&key("2", "2")).as_deref(), Some("鸟"));
     }
 
     #[test]
     fn begin_overrides_previous_pending() {
         let confirmations = WipeConfirmations::new();
-        let key = key(1, 2);
+        let key = key("1", "2");
         confirmations.begin(key.clone(), "猫".to_owned());
         confirmations.begin(key.clone(), "狗".to_owned());
 

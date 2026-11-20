@@ -5,23 +5,23 @@ use askama::Template;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kovi::RuntimeBot;
 use kovi::chrono::{self, Datelike as _, Days, Months, NaiveDate, TimeZone as _, Weekday};
-use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
+use utils::bot::MessageExt as _;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, MessageScope};
 
-mod user_info;
+pub(crate) mod user_info;
 pub(crate) mod weekly_report;
 
 /// 每群连续两次 B 话榜之间的最短间隔。
 const RANK_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// 按群节流，避免连续刷排行打满 DB 连接池和 chromium。
-static RANK_COOLDOWN_LIMITER: LazyLock<RateLimiter<i64>> =
+static RANK_COOLDOWN_LIMITER: LazyLock<RateLimiter<String>> =
     LazyLock::new(|| RateLimiter::new(RANK_COOLDOWN, 1));
 
 /// 按群节流；冷却中返回用户可见的错误。
-pub(super) fn acquire_rank_cooldown(group_id: i64) -> CommandResult {
-    if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group_id) {
+pub(super) fn acquire_rank_cooldown(group: &str) -> CommandResult {
+    if let Err(hit) = RANK_COOLDOWN_LIMITER.try_acquire(group.to_owned()) {
         return Err(CommandError::user(format!(
             "刚跑完，{} 秒后再试一次",
             hit.retry_after_secs()
@@ -113,8 +113,8 @@ pub(crate) fn rank_commands() -> Vec<Command> {
 
 fn rank_usage(ctx: CommandContext) -> CommandResult {
     let spans: Vec<&str> = RANK_SPANS.iter().map(|span| span.name).collect();
-    ctx.reply(format!(
-        "用法: /B话榜 <档位>\n可用档位: {}",
+    ctx.reply_markdown(&format!(
+        "用法: `/B话榜 <档位>`\n可用档位: {}",
         spans.join(" | ")
     ));
     Ok(())
@@ -122,11 +122,11 @@ fn rank_usage(ctx: CommandContext) -> CommandResult {
 
 async fn handle_rank(ctx: CommandContext, kind: RankKind) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    acquire_rank_cooldown(group_id)?;
+    let group = ctx.group_key()?;
+    acquire_rank_cooldown(&group)?;
 
     let window = rank_window(kind);
-    let html = gen_rank_html(ctx.bot(), group_id, &window)
+    let html = gen_rank_html(ctx.bot(), &group, &window)
         .await
         .map_err(CommandError::internal)?;
     // 按卡片元素截取，图片不带视口边距。
@@ -221,9 +221,9 @@ fn month_window(today: NaiveDate, title: &'static str, period: &'static str) -> 
 }
 
 /// 生成一档 B 话榜 HTML。
-async fn gen_rank_html(bot: &RuntimeBot, group_id: i64, window: &RankWindow) -> Result<String> {
+async fn gen_rank_html(bot: &RuntimeBot, group: &str, window: &RankWindow) -> Result<String> {
     let top = crate::db::msg_count_top_with_time_range(
-        group_id,
+        group,
         window.start,
         window.end,
         crate::config::static_config().rank_top(),
@@ -234,18 +234,20 @@ async fn gen_rank_html(bot: &RuntimeBot, group_id: i64, window: &RankWindow) -> 
         anyhow::bail!("该时间范围暂无发言数据");
     }
 
-    let total =
-        crate::db::msg_count_total_with_time_range(group_id, window.start, window.end).await?;
+    let total = crate::db::msg_count_total_with_time_range(group, window.start, window.end).await?;
 
     // 每个用户都要走群成员 API + 头像下载且各自带重试，串行拉取会让
     // 命令响应时间叠加上去，并行后总耗时约等于最慢的一个用户。
     let entries: Vec<(user_info::UserInfo, u32)> =
-        kovi::futures_util::future::join_all(top.into_iter().map(|(user_id, cnt)| async move {
-            match user_info::get_user_info(bot, group_id, user_id).await {
-                Ok(info) => (info, cnt),
-                Err(e) => {
-                    tracing::error!("获取用户 {} 信息失败: {}", user_id, e);
-                    (user_info::fallback_user_info(user_id), cnt)
+        kovi::futures_util::future::join_all(top.into_iter().map(|(user_key, cnt)| {
+            let group = group.to_owned();
+            async move {
+                match user_info::get_user_info(bot, &group, &user_key).await {
+                    Ok(info) => (info, cnt),
+                    Err(e) => {
+                        tracing::error!("获取用户 {} 信息失败: {}", user_key, e);
+                        (user_info::fallback_user_info(&user_key), cnt)
+                    }
                 }
             }
         }))

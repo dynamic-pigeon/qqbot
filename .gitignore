@@ -8,6 +8,7 @@
 !/README.md
 !/config.toml.example
 !/.env.example
+!/docs/
 !/src/
 !/plugins/
 !/tests/

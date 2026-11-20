@@ -1,14 +1,14 @@
 use std::{sync::LazyLock, time::Duration};
 
 use kovi::{Message, PluginBuilder as plugin};
-use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
+use utils::bot::MessageExt as _;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 const MAX_MARKDOWN_BYTES: usize = 32 * 1024;
 const MARKDOWN_COOLDOWN: Duration = Duration::from_secs(10);
 
-static MARKDOWN_COOLDOWNS: LazyLock<RateLimiter<i64>> =
+static MARKDOWN_COOLDOWNS: LazyLock<RateLimiter<String>> =
     LazyLock::new(|| RateLimiter::new(MARKDOWN_COOLDOWN, 1));
 
 fn markdown_command() -> Command {
@@ -31,7 +31,7 @@ async fn handle_markdown(ctx: CommandContext) -> CommandResult {
             MAX_MARKDOWN_BYTES / 1024
         )));
     }
-    if let Err(hit) = MARKDOWN_COOLDOWNS.try_acquire(ctx.event().user_id) {
+    if let Err(hit) = MARKDOWN_COOLDOWNS.try_acquire(ctx.user_key()) {
         return Err(CommandError::user(format!(
             "请求过于频繁，请在 {} 秒后重试",
             hit.retry_after_secs()

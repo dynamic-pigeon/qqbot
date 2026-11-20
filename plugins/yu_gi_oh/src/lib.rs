@@ -1,8 +1,8 @@
 use std::{sync::LazyLock, time::Duration};
 
 use kovi::{Message, PluginBuilder as plugin};
-use kovi_onebot::MessageRegistrar as _;
 use utils::RateLimiter;
+use utils::bot::MessageExt as _;
 use utils::command::{Command, CommandContext, CommandError, CommandResult, CommandRouter};
 
 mod fetch_card;
@@ -10,7 +10,7 @@ mod fetch_card;
 const MAX_CARD_NAME_BYTES: usize = 128;
 const QUERY_COOLDOWN: Duration = Duration::from_secs(3);
 
-static QUERY_LIMITER: LazyLock<RateLimiter<i64>> =
+static QUERY_LIMITER: LazyLock<RateLimiter<String>> =
     LazyLock::new(|| RateLimiter::new(QUERY_COOLDOWN, 1));
 
 fn card_query_command() -> Command {
@@ -30,7 +30,7 @@ async fn handle_card_query(ctx: CommandContext) -> CommandResult {
     if card_name.len() > MAX_CARD_NAME_BYTES {
         return Err(CommandError::user("卡片名称过长"));
     }
-    if QUERY_LIMITER.try_acquire(ctx.event().user_id).is_err() {
+    if QUERY_LIMITER.try_acquire(ctx.user_key()).is_err() {
         return Err(CommandError::user("查询过于频繁，请稍后重试"));
     }
 

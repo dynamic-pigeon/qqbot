@@ -53,7 +53,7 @@ fn png_like(tag: u8) -> Vec<u8> {
 /// 模拟下载管线：bytes 先落成 blobs 目录旁的临时文件再走正式入库。
 async fn add_images(
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     name: &str,
     images: Vec<Vec<u8>>,
 ) -> Result<AddResult, StoreError> {
@@ -72,12 +72,12 @@ async fn add_images(
     store.add_images(group_id, name, staged).await
 }
 
-async fn must_add(store: &Store, group_id: i64, name: &str, images: Vec<Vec<u8>>) {
+async fn must_add(store: &Store, group_id: &str, name: &str, images: Vec<Vec<u8>>) {
     add_images(store, group_id, name, images).await.unwrap();
 }
 
 /// 解析（完整哈希或前缀）后读回 blob 内容。
-async fn read_resolved(store: &Store, group_id: i64, hash: &str) -> Vec<u8> {
+async fn read_resolved(store: &Store, group_id: &str, hash: &str) -> Vec<u8> {
     let hash = store.resolve_group_hash(group_id, hash).await.unwrap();
     store.read_blob(group_id, &hash).await.unwrap()
 }
@@ -85,7 +85,7 @@ async fn read_resolved(store: &Store, group_id: i64, hash: &str) -> Vec<u8> {
 #[tokio::test]
 async fn add_dedup_and_delete() {
     let (store, dir) = temp_store();
-    let group = 1;
+    let group = "1";
     let a = png_like(1);
     let b = png_like(2);
 
@@ -139,7 +139,7 @@ async fn add_dedup_and_delete() {
 #[tokio::test]
 async fn alias_and_wipe() {
     let (store, _dir) = temp_store();
-    let group = 2;
+    let group = "2";
     must_add(&store, group, "猫", vec![png_like(1)]).await;
     must_add(&store, group, "狗", vec![png_like(3)]).await;
     let canonical = store.set_alias(group, "喵", "猫", false).await.unwrap();
@@ -201,7 +201,7 @@ async fn alias_and_wipe() {
 #[tokio::test]
 async fn merge_moves_and_aliases() {
     let (store, _dir) = temp_store();
-    let group = 3;
+    let group = "3";
     let shared = png_like(1);
     must_add(&store, group, "猫", vec![shared.clone(), png_like(2)]).await;
     must_add(&store, group, "狗", vec![shared, png_like(3)]).await;
@@ -236,7 +236,7 @@ async fn merge_moves_and_aliases() {
 #[tokio::test]
 async fn merge_aligns_draw_counts() {
     let (store, _dir) = temp_store();
-    let group = 4;
+    let group = "4";
     let shared = png_like(1);
     let only_cat = png_like(2);
     let only_dog = png_like(3);
@@ -261,7 +261,7 @@ async fn merge_aligns_draw_counts() {
 #[tokio::test]
 async fn overview_resolves_alias() {
     let (store, _dir) = temp_store();
-    let group = 9;
+    let group = "9";
     must_add(&store, group, "猫", vec![png_like(1), png_like(2)]).await;
     store.set_alias(group, "喵", "猫", false).await.unwrap();
 
@@ -284,7 +284,7 @@ async fn overview_resolves_alias() {
 #[tokio::test]
 async fn wipe_ignores_repointing() {
     let (store, _dir) = temp_store();
-    let group = 10;
+    let group = "10";
     must_add(&store, group, "猫", vec![png_like(1)]).await;
     must_add(&store, group, "狗", vec![png_like(2)]).await;
     // 登记待确认之后、执行之前，「别名 猫 狗 合并」把「猫」改成「狗」的别名。
@@ -314,13 +314,13 @@ async fn rejects_over_quota() {
         crate::config::DEFAULT_BACKUP_RETAINED_DAYS,
     )
     .unwrap();
-    must_add(&store, 7, "小", vec![png_like(3)]).await;
-    let err = add_images(&store, 7, "小", vec![png_like(4)])
+    must_add(&store, "7", "小", vec![png_like(3)]).await;
+    let err = add_images(&store, "7", "小", vec![png_like(4)])
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::QuotaExceeded { .. }));
 
-    let err = add_images(&store, 8, "小", vec![png_like(3), png_like(4)])
+    let err = add_images(&store, "8", "小", vec![png_like(3), png_like(4)])
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::QuotaExceeded { .. }));
@@ -360,7 +360,7 @@ fn small_blob_parallel_lane() {
 #[tokio::test]
 async fn fingerprints_skip_undecodable() {
     let (store, dir) = temp_store();
-    let group = 11;
+    let group = "11";
     must_add(
         &store,
         group,
@@ -389,7 +389,7 @@ async fn fingerprints_skip_undecodable() {
 #[tokio::test]
 async fn hash_prefix_loads_and_rejects() {
     let (store, _dir) = temp_store();
-    let group = 21;
+    let group = "21";
     let a = png_like(1);
     let b = png_like(2);
     must_add(&store, group, "猫", vec![a.clone(), b.clone()]).await;
@@ -428,7 +428,7 @@ async fn hash_prefix_loads_and_rejects() {
     assert!(store.read_blob(group, "zz").await.is_err());
 }
 
-async fn set_draw_count(store: &Store, group_id: i64, library: &str, hash: &str, count: i64) {
+async fn set_draw_count(store: &Store, group_id: &str, library: &str, hash: &str, count: i64) {
     store
         .with_group(group_id, |pool| async move {
             sqlx::query("UPDATE images SET draw_count = ? WHERE library = ? AND hash = ?")
@@ -445,7 +445,7 @@ async fn set_draw_count(store: &Store, group_id: i64, library: &str, hash: &str,
 
 async fn draw_counts(
     store: &Store,
-    group_id: i64,
+    group_id: &str,
     name: &str,
 ) -> Result<Vec<(String, i64)>, StoreError> {
     store
@@ -471,7 +471,7 @@ async fn draw_counts(
 #[tokio::test]
 async fn new_images_enter_at_mean_ceiling() {
     let (store, _dir) = temp_store();
-    let group = 31;
+    let group = "31";
     let a = png_like(1);
     let b = png_like(2);
     let c = png_like(3);
@@ -561,7 +561,7 @@ fn photo_like_jpeg(seed: u32, keep_percent: Option<u32>) -> Vec<u8> {
     buf
 }
 
-fn group_db(dir: &std::path::Path, group: i64) -> PathBuf {
+fn group_db(dir: &std::path::Path, group: &str) -> PathBuf {
     dir.join(group.to_string()).join("index.db")
 }
 
@@ -612,7 +612,7 @@ async fn db_exec(db: &std::path::Path, statements: &[&'static str]) {
     pool.close().await;
 }
 
-async fn table_count(dir: &std::path::Path, group: i64, table: &str) -> i64 {
+async fn table_count(dir: &std::path::Path, group: &str, table: &str) -> i64 {
     // 表名映射成字面量再交给 db_i64。
     let sql: &'static str = match table {
         "crop_pairs" => "SELECT COUNT(*) FROM crop_pairs",
@@ -625,7 +625,7 @@ async fn table_count(dir: &std::path::Path, group: i64, table: &str) -> i64 {
 #[tokio::test]
 async fn crop_scan_repeats_from_cache() {
     let (store, dir) = temp_store();
-    let group = 61;
+    let group = "61";
     let whole = photo_like_jpeg(3, None);
     let part = photo_like_jpeg(3, Some(40));
     must_add(&store, group, "猫", vec![whole.clone(), part.clone()]).await;
@@ -706,7 +706,7 @@ async fn crop_scan_repeats_from_cache() {
 #[tokio::test]
 async fn crop_scan_marks_new_pairs_on_incremental() {
     let (store, _dir) = temp_store();
-    let group = 64;
+    let group = "64";
     let whole = photo_like_jpeg(3, None);
     let part = photo_like_jpeg(3, Some(40));
     must_add(&store, group, "猫", vec![whole.clone(), part.clone()]).await;
@@ -736,7 +736,7 @@ async fn crop_scan_marks_new_pairs_on_incremental() {
 #[tokio::test]
 async fn reclaimed_blob_recomputes() {
     let (store, dir) = temp_store();
-    let group = 63;
+    let group = "63";
     let whole = photo_like_jpeg(3, None);
     let part = photo_like_jpeg(3, Some(40));
     must_add(&store, group, "猫", vec![whole.clone(), part.clone()]).await;
@@ -765,7 +765,7 @@ async fn reclaimed_blob_recomputes() {
 #[tokio::test]
 async fn crop_cache_wiped_on_marker() {
     let (store, dir) = temp_store();
-    let group = 62;
+    let group = "62";
     let whole = photo_like_jpeg(3, None);
     let part = photo_like_jpeg(3, Some(40));
     must_add(&store, group, "猫", vec![whole, part]).await;
@@ -795,7 +795,7 @@ async fn crop_cache_wiped_on_marker() {
 #[tokio::test]
 async fn sifts_cover_and_persist() {
     let (store, dir) = temp_store();
-    let group = 17;
+    let group = "17";
     must_add(&store, group, "猫", vec![blocky_png(3), blocky_png(7)]).await;
     must_add(&store, group, "猫", vec![png_like(9)]).await;
 
@@ -830,7 +830,7 @@ const SCHEMA_META_TABLE: &str =
 #[tokio::test]
 async fn narrow_sift_table_rebuilt() {
     let (store, dir) = temp_store();
-    let group = 87;
+    let group = "87";
     let db = group_db(&dir, group);
     db_exec(&db, &[NARROW_SIFT_TABLE]).await;
 
@@ -847,7 +847,7 @@ async fn narrow_sift_table_rebuilt() {
 #[tokio::test]
 async fn newer_sift_schema_rejected() {
     let (store, dir) = temp_store();
-    let db = group_db(&dir, 88);
+    let db = group_db(&dir, "88");
     db_exec(
         &db,
         &[
@@ -857,13 +857,13 @@ async fn newer_sift_schema_rejected() {
     )
     .await;
 
-    assert!(store.stats(88).await.is_err(), "新版本库不应被旧代码打开");
+    assert!(store.stats("88").await.is_err(), "新版本库不应被旧代码打开");
 }
 
 #[tokio::test]
 async fn narrow_fingerprint_table_rebuilt() {
     let (store, dir) = temp_store();
-    let group = 77;
+    let group = "77";
     let db = group_db(&dir, group);
     db_exec(&db, &[NARROW_PERCEPTUAL_TABLE]).await;
 
@@ -891,7 +891,7 @@ async fn narrow_fingerprint_table_rebuilt() {
 #[tokio::test]
 async fn newer_fingerprint_schema_rejected() {
     let (store, dir) = temp_store();
-    let db = group_db(&dir, 78);
+    let db = group_db(&dir, "78");
     db_exec(
         &db,
         &[
@@ -901,7 +901,7 @@ async fn newer_fingerprint_schema_rejected() {
     )
     .await;
 
-    assert!(store.stats(78).await.is_err(), "新版本库不应被旧代码打开");
+    assert!(store.stats("78").await.is_err(), "新版本库不应被旧代码打开");
 }
 
 /// 备份目录下唯一的日期目录;没有则 panic。
@@ -917,7 +917,7 @@ fn only_date_dir(backups: &PathBuf) -> PathBuf {
 #[tokio::test]
 async fn deleted_blob_survives_window() {
     let (store, dir) = temp_store();
-    let group = 41;
+    let group = "41";
     let a = png_like(1);
     let b = png_like(2);
     must_add(&store, group, "猫", vec![a.clone(), b.clone()]).await;
@@ -959,7 +959,7 @@ async fn deleted_blob_survives_window() {
 #[tokio::test]
 async fn orphans_reclaimed_immediately() {
     let (store, dir) = temp_store();
-    let group = 45;
+    let group = "45";
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let hash = sha256_hex(&a);
@@ -974,7 +974,7 @@ async fn orphans_reclaimed_immediately() {
 #[tokio::test]
 async fn readd_reuses_retained_blob() {
     let (store, _dir) = temp_store();
-    let group = 46;
+    let group = "46";
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let day = 20_000;
@@ -1008,7 +1008,7 @@ async fn readd_reuses_retained_blob() {
 #[tokio::test]
 async fn same_day_backup_skipped() {
     let (store, dir) = temp_store();
-    must_add(&store, 43, "猫", vec![png_like(1)]).await;
+    must_add(&store, "43", "猫", vec![png_like(1)]).await;
     let backups = dir.join("backups");
 
     store.backup_daily_at(20_000).await;
@@ -1037,7 +1037,7 @@ async fn same_day_backup_skipped() {
 #[tokio::test]
 async fn backup_rolls_seven_days() {
     let (store, dir) = temp_store();
-    must_add(&store, 44, "猫", vec![png_like(1)]).await;
+    must_add(&store, "44", "猫", vec![png_like(1)]).await;
     let backups = dir.join("backups");
     // 人工放进去的目录不属于滚动管理,不得误删。
     std::fs::create_dir_all(backups.join("manual-copy")).unwrap();
@@ -1065,7 +1065,7 @@ async fn custom_retained_days_shortens_both_expiries() {
         TempDir(std::env::temp_dir().join(format!("image_lib_retain_{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::open_with_quota(dir.to_path_buf(), u64::MAX, 2).unwrap();
-    let group = 50;
+    let group = "50";
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
 
@@ -1092,7 +1092,7 @@ async fn custom_retained_days_shortens_both_expiries() {
 #[tokio::test]
 async fn wiped_files_kept_till_expiry() {
     let (store, dir) = temp_store();
-    let group = 47;
+    let group = "47";
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let day = 20_000;
@@ -1114,7 +1114,7 @@ async fn wiped_files_kept_till_expiry() {
 #[tokio::test]
 async fn backup_skips_broken_group() {
     let (store, dir) = temp_store();
-    must_add(&store, 48, "猫", vec![png_like(1)]).await;
+    must_add(&store, "48", "猫", vec![png_like(1)]).await;
     // 群 49 的 index.db 是坏文件,备份应跳过它而不拖垮整份备份。
     let broken = dir.join("49");
     std::fs::create_dir_all(&broken).unwrap();
@@ -1129,7 +1129,7 @@ async fn backup_skips_broken_group() {
 #[tokio::test]
 async fn snapshot_carries_prev_refs() {
     let (store, dir) = temp_store();
-    let group = 50;
+    let group = "50";
     must_add(&store, group, "猫", vec![png_like(1)]).await;
     store.backup_daily_at(20_000).await;
     must_add(&store, group, "猫", vec![png_like(2)]).await;
@@ -1156,7 +1156,7 @@ async fn snapshot_carries_prev_refs() {
 #[tokio::test]
 async fn backup_gap_keeps_lockstep() {
     let (store, dir) = temp_store();
-    let group = 51;
+    let group = "51";
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let hash = sha256_hex(&a);
