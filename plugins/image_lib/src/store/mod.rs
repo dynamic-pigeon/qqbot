@@ -144,8 +144,8 @@ pub struct Store {
     /// 备份保留天数，目录滚动与对账保护期必须用同一个值。
     retained_days: usize,
     /// 群锁和连接池都在 async 路径上取，用 tokio Mutex 以免卡住 runtime。
-    locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
-    pools: Mutex<HashMap<i64, SqlitePool>>,
+    locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pools: Mutex<HashMap<String, SqlitePool>>,
 }
 
 impl Store {
@@ -174,32 +174,32 @@ impl Store {
         self.max_group_bytes
     }
 
-    async fn group_lock(&self, group_id: i64) -> Arc<Mutex<()>> {
+    async fn group_lock(&self, group_id: &str) -> Arc<Mutex<()>> {
         self.locks
             .lock()
             .await
-            .entry(group_id)
+            .entry(group_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    fn group_dir(&self, group_id: i64) -> PathBuf {
-        self.root.join(group_id.to_string())
+    fn group_dir(&self, group_id: &str) -> PathBuf {
+        self.root.join(group_id)
     }
 
-    pub(crate) fn blobs_dir(&self, group_id: i64) -> PathBuf {
+    pub(crate) fn blobs_dir(&self, group_id: &str) -> PathBuf {
         self.group_dir(group_id).join("blobs")
     }
 
-    fn db_path(&self, group_id: i64) -> PathBuf {
+    fn db_path(&self, group_id: &str) -> PathBuf {
         self.group_dir(group_id).join("index.db")
     }
 
-    pub(crate) fn blob_path(&self, group_id: i64, hash: &str) -> Result<PathBuf> {
+    pub(crate) fn blob_path(&self, group_id: &str, hash: &str) -> Result<PathBuf> {
         blob_file(&self.blobs_dir(group_id), hash)
     }
 
-    async fn with_group<T, F, Fut>(&self, group_id: i64, f: F) -> Result<T, StoreError>
+    async fn with_group<T, F, Fut>(&self, group_id: &str, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(SqlitePool) -> Fut,
         Fut: Future<Output = Result<T, StoreError>>,
@@ -210,8 +210,8 @@ impl Store {
         f(pool).await
     }
 
-    async fn ensure_pool(&self, group_id: i64) -> Result<SqlitePool, StoreError> {
-        if let Some(pool) = self.pools.lock().await.get(&group_id).cloned() {
+    async fn ensure_pool(&self, group_id: &str) -> Result<SqlitePool, StoreError> {
+        if let Some(pool) = self.pools.lock().await.get(group_id).cloned() {
             return Ok(pool);
         }
 
@@ -234,13 +234,16 @@ impl Store {
             .await?;
         init_schema(&pool).await?;
         utils::restrict_mode_0600(&db_path).context("收紧图库数据库权限失败")?;
-        self.pools.lock().await.insert(group_id, pool.clone());
+        self.pools
+            .lock()
+            .await
+            .insert(group_id.to_owned(), pool.clone());
         Ok(pool)
     }
 
     pub async fn add_images(
         &self,
-        group_id: i64,
+        group_id: &str,
         name: &str,
         images: Vec<StagedImage>,
     ) -> Result<AddResult, StoreError> {
@@ -312,7 +315,7 @@ impl Store {
 
     /// 按哈希从本群所有库删图。只删索引行，不动文件：被删出索引的 blob
     /// 成为孤儿，由每日对账在备份保护期之外统一回收，误删的保护期内可恢复。
-    pub async fn delete_hash(&self, group_id: i64, hash: &str) -> Result<Vec<String>, StoreError> {
+    pub async fn delete_hash(&self, group_id: &str, hash: &str) -> Result<Vec<String>, StoreError> {
         self.with_group(group_id, |pool| async move {
             let mut libraries = delete_image_rows(&pool, hash).await?;
             if libraries.is_empty() {
@@ -337,7 +340,7 @@ impl Store {
     /// 清空整库前的确认信息。bytes 口径与「图库」列表一致（SUM(size)，共享图在多个库各计一次）。
     pub async fn library_overview(
         &self,
-        group_id: i64,
+        group_id: &str,
         name: &str,
     ) -> Result<LibraryOverview, StoreError> {
         self.with_group(group_id, |pool| async move {
@@ -360,7 +363,7 @@ impl Store {
     /// 让确认清掉提示里没展示的那个库。
     pub async fn wipe_canonical_library(
         &self,
-        group_id: i64,
+        group_id: &str,
         canonical: &str,
     ) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
@@ -384,7 +387,7 @@ impl Store {
         Ok(canonical.to_owned())
     }
 
-    pub async fn pick_random(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
+    pub async fn pick_random(&self, group_id: &str, name: &str) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
             let library = resolve_library(&pool, name).await?;
             let items = library_draw_items(&pool, &library).await?;
@@ -399,7 +402,7 @@ impl Store {
 
     pub async fn set_alias(
         &self,
-        group_id: i64,
+        group_id: &str,
         alias: &str,
         target: &str,
         merge: bool,
@@ -475,7 +478,7 @@ impl Store {
         .await
     }
 
-    pub async fn remove_alias(&self, group_id: i64, alias: &str) -> Result<(), StoreError> {
+    pub async fn remove_alias(&self, group_id: &str, alias: &str) -> Result<(), StoreError> {
         self.with_group(group_id, |pool| async move {
             if delete_alias(&pool, alias).await? == 0 {
                 return Err(StoreError::AliasMissing(alias.to_owned()));
@@ -485,7 +488,7 @@ impl Store {
         .await
     }
 
-    pub async fn stats(&self, group_id: i64) -> Result<GroupStats, StoreError> {
+    pub async fn stats(&self, group_id: &str) -> Result<GroupStats, StoreError> {
         self.with_group(group_id, |pool| async move {
             let rows = library_size_rows(&pool).await?;
             let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -515,7 +518,7 @@ impl Store {
     /// 本群已入库哈希：完整 64 位或能唯一确定一张图的前缀。
     pub async fn resolve_group_hash(
         &self,
-        group_id: i64,
+        group_id: &str,
         prefix: &str,
     ) -> Result<String, StoreError> {
         let prefix = prefix.to_ascii_lowercase();
@@ -537,14 +540,14 @@ impl Store {
     /// 解析前缀后从本群所有库删掉该图。
     pub async fn delete_by_hash_prefix(
         &self,
-        group_id: i64,
+        group_id: &str,
         prefix: &str,
     ) -> Result<Vec<String>, StoreError> {
         let hash = self.resolve_group_hash(group_id, prefix).await?;
         self.delete_hash(group_id, &hash).await
     }
 
-    pub async fn resolve_name(&self, group_id: i64, name: &str) -> Result<String, StoreError> {
+    pub async fn resolve_name(&self, group_id: &str, name: &str) -> Result<String, StoreError> {
         self.with_group(group_id, |pool| async move {
             let library = resolve_library(&pool, name).await?;
             if !library_exists(&pool, &library).await? {
@@ -555,7 +558,7 @@ impl Store {
         .await
     }
 
-    pub async fn read_blob(&self, group_id: i64, hash: &str) -> Result<Vec<u8>> {
+    pub async fn read_blob(&self, group_id: &str, hash: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(group_id, hash)?;
         kovi::tokio::fs::read(&path)
             .await
@@ -584,13 +587,14 @@ impl Store {
             }
         };
         for group_id in groups {
-            if let Err(error) = self.reconcile_group(group_id, today).await {
+            if let Err(error) = self.reconcile_group(&group_id, today).await {
                 tracing::error!("图库对账失败 group_id={group_id}: {error}");
             }
         }
     }
 
-    async fn list_group_ids(&self) -> Result<Vec<i64>> {
+    /// 群身份键目录名：OneBot 栈是群号十进制串，官方栈是 group_openid。
+    async fn list_group_ids(&self) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut entries = kovi::tokio::fs::read_dir(&self.root).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -600,8 +604,9 @@ impl Store {
             if !file_type.is_dir() {
                 continue;
             }
-            if let Ok(id) = entry.file_name().to_string_lossy().parse::<i64>() {
-                ids.push(id);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.is_empty() && name != "backups" {
+                ids.push(name);
             }
         }
         Ok(ids)
@@ -609,7 +614,7 @@ impl Store {
 
     /// 对账是 blob 文件唯一的物理删除点：删除命令只清索引行，孤儿文件
     /// 在这里按备份保护期决定去留——备份还指向的保留，其余回收。
-    async fn reconcile_group(&self, group_id: i64, today: i64) -> Result<(), StoreError> {
+    async fn reconcile_group(&self, group_id: &str, today: i64) -> Result<(), StoreError> {
         let blobs = self.blobs_dir(group_id);
         self.with_group(group_id, |pool| async move {
             purge_expired_backup_refs(&pool, self.retained_days as i64, today).await?;

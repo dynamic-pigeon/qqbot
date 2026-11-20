@@ -22,7 +22,7 @@ impl Store {
     /// 并行进行，首查重全库重算期间同群的抽图/加图不会被卡住。
     pub async fn fingerprints_for_library(
         &self,
-        group_id: i64,
+        group_id: &str,
         name: &str,
     ) -> Result<(String, Vec<HashedImage>), StoreError> {
         let blobs = self.blobs_dir(group_id);
@@ -80,7 +80,7 @@ impl Store {
     /// 计划才走到这里，规范名直传，避免两段锁之间别名被并发改指。
     async fn siftables_for_canonical(
         &self,
-        group_id: i64,
+        group_id: &str,
         library: &str,
     ) -> Result<Vec<SiftableImage>, StoreError> {
         let blobs = self.blobs_dir(group_id);
@@ -151,7 +151,7 @@ impl Store {
     /// 对账物理回收时收缩、换阈值/算法版本时整体作废。
     pub async fn crop_scan_prepare(
         &self,
-        group_id: i64,
+        group_id: &str,
         name: &str,
     ) -> Result<(String, CropPlan), StoreError> {
         let (library, members, covered, cached) = self
@@ -199,7 +199,7 @@ impl Store {
     /// 发一份新增。
     pub async fn crop_scan_run(
         &self,
-        group_id: i64,
+        group_id: &str,
         plan: CropPlan,
     ) -> Result<Vec<SimilarGroup>, StoreError> {
         let (library, members, covered) = match plan {

@@ -7,7 +7,9 @@ fn help_command() -> Command {
         .usage("/help [命令路径]")
         .sync_handler(|ctx| {
             let path = ctx.args().iter().map(String::as_str).collect::<Vec<_>>();
-            ctx.reply(CommandCatalog::render_help(&path));
+            let help = CommandCatalog::render_help(&path);
+            // 官方栈按 markdown 发送（无权限时驱动回退纯文本），OneBot 栈即纯文本。
+            ctx.reply_markdown(&help);
             Ok(())
         })
 }

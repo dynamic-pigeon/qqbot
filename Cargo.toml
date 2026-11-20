@@ -7,6 +7,8 @@ license = "MIT"
 
 [features]
 default = []
+# 官方机器人驱动：开启后 main 装配 OfficialDriver，凭据在 kovi.conf.toml 的 [official] 段。
+official = ["dep:kovi-official", "utils/official"]
 # 全局分配器二选一（互斥，同时开启会编译报错）。
 # musl 默认分配器几乎不归还内存，词云/截图等大分配后 RSS 会一直停在高水位；
 # jemalloc 碎片控制好，mimalloc 构建更轻、归还同样积极。
@@ -21,6 +23,7 @@ image-send-file = ["image_lib/send-file"]
 bilibili = { version = "0.1.0", path = "plugins/bilibili" }
 help_msg = { version = "0.1.0", path = "plugins/help_msg" }
 image_lib = { version = "0.1.0", path = "plugins/image_lib" }
+kovi-official = { version = "0.1.0", path = "plugins/kovi-official", optional = true }
 kovi.workspace = true
 kovi-onebot.workspace = true
 kovi-plugin-cmd = { version = "0.4.0", features = ["onebot"] }
@@ -53,6 +56,7 @@ members = [
     "plugins/bilibili",
     "plugins/wordle",
     "plugins/image_lib",
+    "plugins/kovi-official",
 ]
 
 [workspace.dependencies]
@@ -97,6 +101,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 jieba-rs = "0.11"
 md-5 = "0.11"
 rand = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt"] }
 wordcloud = { git = "https://github.com/dynamic-pigeon/wordcloud-rs", rev = "df7e18812e33ceed79af0bb60f4211dee85f682b" }

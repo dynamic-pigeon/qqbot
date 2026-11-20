@@ -1,7 +1,8 @@
 use std::{future::Future, pin::Pin, str::FromStr, sync::Arc};
 
 use kovi::{Message, RuntimeBot};
-use kovi_onebot::{MsgEvent, RepliableEvent};
+
+use crate::bot::BotMsgEvent;
 
 pub type CommandResult = Result<(), CommandError>;
 pub(crate) type CommandFuture = Pin<Box<dyn Future<Output = CommandResult> + Send>>;
@@ -151,24 +152,38 @@ pub(crate) fn render_command_error(error: &CommandError, usage: &str) -> String 
     }
 }
 
-/// 用户是否在 bot 管理员名单内。
-pub(crate) fn user_is_bot_admin(bot: &RuntimeBot, user_id: i64) -> bool {
-    bot.get_all_admin()
-        .unwrap_or_default()
-        .iter()
-        .any(|id| id.try_as_i64() == Some(user_id))
+/// 用户是否在 bot 管理员名单内。名单按字符串比较：
+/// OneBot 栈是 QQ 号十进制串，官方栈是 openid。
+pub(crate) fn user_is_bot_admin(bot: &RuntimeBot, user_key: &str) -> bool {
+    let admins = match bot.get_all_admin() {
+        Ok(admins) => admins,
+        Err(e) => {
+            tracing::warn!("读取管理员名单失败: {e}");
+            return false;
+        }
+    };
+    let matched = admins.iter().any(|id| id.to_string() == user_key);
+    if !matched {
+        // 排查期置 info：把两侧原值打出来，形态差异一眼可见；稳定后降级。
+        tracing::info!(
+            user = user_key,
+            admins = ?admins.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "管理员校验未命中"
+        );
+    }
+    matched
 }
 
 #[derive(Clone)]
 pub struct CommandContext {
-    event: Arc<MsgEvent>,
+    event: Arc<dyn BotMsgEvent>,
     bot: Arc<RuntimeBot>,
     arguments: CommandArguments,
 }
 
 impl CommandContext {
     pub(crate) fn new(
-        event: Arc<MsgEvent>,
+        event: Arc<dyn BotMsgEvent>,
         bot: Arc<RuntimeBot>,
         arguments: CommandArguments,
     ) -> Self {
@@ -179,8 +194,8 @@ impl CommandContext {
         }
     }
 
-    pub fn event(&self) -> &MsgEvent {
-        &self.event
+    pub fn event(&self) -> &dyn BotMsgEvent {
+        self.event.as_ref()
     }
 
     pub fn bot(&self) -> &Arc<RuntimeBot> {
@@ -214,30 +229,31 @@ impl CommandContext {
         self.arguments.trimmed_rest()
     }
 
-    pub fn reply<T>(&self, message: T)
-    where
-        Message: From<T>,
-    {
-        let message = Message::from(message);
-        RepliableEvent::reply::<Message>(self.event.as_ref(), message);
+    pub fn reply<I: Into<Message>>(&self, message: I) {
+        self.event.reply(message.into());
     }
 
-    pub fn reply_and_quote<T>(&self, message: T)
-    where
-        Message: From<T>,
-    {
-        let message = Message::from(message);
-        RepliableEvent::reply_and_quote::<Message>(self.event.as_ref(), message);
+    pub fn reply_and_quote<I: Into<Message>>(&self, message: I) {
+        self.event.reply_and_quote(message.into());
     }
 
-    pub fn group_id(&self) -> Result<i64, CommandError> {
+    pub fn reply_markdown(&self, content: &str) {
+        self.event.reply_markdown(content);
+    }
+
+    /// 群身份键：官方栈是 group_openid，OneBot 栈是群号十进制串。
+    pub fn group_key(&self) -> Result<String, CommandError> {
         self.event
-            .group_id
-            .ok_or_else(|| CommandError::internal(anyhow::anyhow!("群命令事件缺少 group_id")))
+            .group_key()
+            .ok_or_else(|| CommandError::internal(anyhow::anyhow!("群命令事件缺少群身份")))
+    }
+
+    pub fn user_key(&self) -> String {
+        self.event.user_key()
     }
 
     pub fn is_admin(&self) -> bool {
-        user_is_bot_admin(&self.bot, self.event.user_id)
+        user_is_bot_admin(&self.bot, &self.event.user_key())
     }
 
     pub fn require_admin(&self) -> Result<(), CommandError> {

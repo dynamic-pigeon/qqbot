@@ -11,10 +11,13 @@ chromium = ["dep:chromiumoxide"]
 screenshot = ["chromium"]
 # Markdown → HTML → PNG；在 screenshot 之上再加上解析、消毒和 KaTeX 资源。
 markdown = ["screenshot", "dep:pulldown-cmark", "dep:askama", "dep:ammonia"]
+# 官方机器人栈：事件与发送门面切到 kovi-official（openid 字符串身份）。
+official = ["dep:kovi-official"]
 
 [dependencies]
 kovi.workspace = true
 kovi-onebot.workspace = true
+kovi-official = { path = "../kovi-official", optional = true }
 base64.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true

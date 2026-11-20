@@ -7,7 +7,7 @@ use kovi::{
     Message, PluginBuilder as plugin,
     serde_json::{self, Value},
 };
-use kovi_onebot::{EventRegistrar as _, MessageRegistrar as _, event::GroupMsgEvent};
+use utils::bot::{self, BotMsgEvent, MessageExt as _};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, CommandRouter, MessageScope, Permission,
 };
@@ -51,7 +51,7 @@ async fn main() {
         .install()
         .expect("注册 Bilibili 命令失败");
 
-    plugin::on_group_msg(parse_bv);
+    bot::on_group_msg(parse_bv);
     living::init();
     dynamics::init();
 }
@@ -127,10 +127,10 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
         return Err(CommandError::user("该 uid 没有直播间或者 bot 网络错误"));
     }
 
-    let group = ctx.group_id()?;
+    let group = ctx.group_key()?;
     config::CONFIG
         .modify(|config| {
-            config::upsert_subscribe_group(&mut config.subscribe, uid, group);
+            config::upsert_subscribe_group(&mut config.subscribe, uid, &group);
         })
         .map_err(CommandError::internal)?;
     ctx.reply(format!("已为本群订阅 uid={uid}"));
@@ -140,9 +140,9 @@ async fn live_add(ctx: CommandContext) -> CommandResult {
 fn live_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.group_id()?;
+    let group = ctx.group_key()?;
     config::CONFIG
-        .modify(|config| config::remove_subscribe_group(&mut config.subscribe, uid, group))
+        .modify(|config| config::remove_subscribe_group(&mut config.subscribe, uid, &group))
         .map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的订阅"));
     Ok(())
@@ -150,16 +150,16 @@ fn live_remove(ctx: CommandContext) -> CommandResult {
 
 async fn live_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group = ctx.group_id()?;
+    let group = ctx.group_key()?;
     let uids = config::CONFIG
         .get()
         .subscribe
         .iter()
-        .filter(|subscription| subscription.groups.contains(&group))
+        .filter(|subscription| subscription.groups.iter().any(|item| item == &group))
         .map(|subscription| subscription.uid)
         .collect::<Vec<_>>();
     if uids.is_empty() {
-        ctx.reply("本群尚未订阅任何直播间");
+        ctx.reply_markdown("本群尚未订阅任何直播间");
         return Ok(());
     }
 
@@ -170,15 +170,15 @@ async fn live_list(ctx: CommandContext) -> CommandResult {
     for (uid, name) in names {
         write!(&mut output, "\n{name} ({uid})").unwrap();
     }
-    ctx.reply(output);
+    ctx.reply_markdown(&output);
     Ok(())
 }
 
 fn dynamic_add(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.group_id()?;
-    let added = dynamics::add_subscribe(uid, group).map_err(CommandError::internal)?;
+    let group = ctx.group_key()?;
+    let added = dynamics::add_subscribe(uid, &group).map_err(CommandError::internal)?;
     ctx.reply(if added {
         format!("已为本群订阅动态 uid={uid}")
     } else {
@@ -190,16 +190,16 @@ fn dynamic_add(ctx: CommandContext) -> CommandResult {
 fn dynamic_remove(ctx: CommandContext) -> CommandResult {
     let uid = ctx.parse_arg::<u64>(0, "uid")?;
     ctx.ensure_no_extra_args(1)?;
-    let group = ctx.group_id()?;
-    dynamics::remove_subscribe(uid, group).map_err(CommandError::internal)?;
+    let group = ctx.group_key()?;
+    dynamics::remove_subscribe(uid, &group).map_err(CommandError::internal)?;
     ctx.reply(format!("已取消本群对 uid={uid} 的动态订阅"));
     Ok(())
 }
 
 async fn dynamic_list(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group = ctx.group_id()?;
-    let uids = dynamics::list_subscribes(group);
+    let group = ctx.group_key()?;
+    let uids = dynamics::list_subscribes(&group);
     if uids.is_empty() {
         ctx.reply("本群尚未订阅任何动态");
         return Ok(());
@@ -213,7 +213,7 @@ async fn dynamic_list(ctx: CommandContext) -> CommandResult {
         let name = names.get(&uid).cloned().unwrap_or_default();
         write!(&mut output, "\n{name} ({uid})").unwrap();
     }
-    ctx.reply(output);
+    ctx.reply_markdown(&output);
     Ok(())
 }
 
@@ -240,7 +240,7 @@ async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
     let count = parse_dynamic_fetch_count(ctx.arg(1))?;
     ctx.ensure_no_extra_args(2)?;
 
-    let group = ctx.group_id()?;
+    let group = ctx.group_key()?;
     let items = dynamics::fetch_recent(uid, count)
         .await
         .map_err(CommandError::internal)?;
@@ -252,7 +252,7 @@ async fn dynamic_fetch(ctx: CommandContext) -> CommandResult {
     let mut pushed = 0;
     for item in &items {
         let author = dynamics::author_of(item);
-        if let Err(error) = dynamics::push_dynamic(ctx.bot(), group, &author, item).await {
+        if let Err(error) = dynamics::push_dynamic(ctx.bot(), &group, &author, item).await {
             tracing::warn!("渲染失败 uid={uid}: {error}");
         } else {
             pushed += 1;
@@ -276,8 +276,11 @@ fn format_count(n: i64) -> String {
     format!("{w}w")
 }
 
-async fn parse_bv(event: Arc<GroupMsgEvent>) {
-    for msg in event.message.iter() {
+async fn parse_bv(event: Arc<dyn BotMsgEvent>) {
+    let Some(group) = event.group_key() else {
+        return;
+    };
+    for msg in event.message().iter() {
         let bv_info = match msg.kind.as_str() {
             "json" => {
                 let Some(obj) = msg
@@ -298,13 +301,13 @@ async fn parse_bv(event: Arc<GroupMsgEvent>) {
                     continue;
                 };
 
-                parse_url(url, event.group_id).await
+                parse_url(url, &group).await
             }
             "text" => {
                 let Some(text) = msg.data.get("text").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                parse_url(text, event.group_id).await
+                parse_url(text, &group).await
             }
             _ => continue,
         };

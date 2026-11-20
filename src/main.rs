@@ -1,5 +1,7 @@
 use kovi::tokio;
-use kovi_onebot::{OneBotDriver, load_local_conf};
+
+#[cfg(not(feature = "official"))]
+use kovi_onebot::OneBotDriver;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 // musl 系统分配器对词云、截图这类周期性大分配几乎不归还内存，
@@ -171,8 +173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配置损坏时在插件启动前失败，避免跑到第一次下图才 panic。
     utils::config::preload();
 
-    let driver_config = load_local_conf()?;
-    let driver = OneBotDriver::new(driver_config);
+    // official feature 下装配官方驱动，凭据在 kovi.conf.toml 的 [official] 段；
+    // 默认装配 OneBot 驱动，两者读同一个 kovi.conf.toml。
+    #[cfg(feature = "official")]
+    let driver = kovi_official::OfficialDriver::new(kovi_official::load_local_conf()?);
+    #[cfg(not(feature = "official"))]
+    let driver = OneBotDriver::new(kovi_onebot::load_local_conf()?);
 
     // 应用已安装 tracing subscriber，关掉 Kovi 的全局 logger，避免重复注册。
     let kovi_config = kovi::load_local_conf()?;

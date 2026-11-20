@@ -4,7 +4,7 @@ use std::time::Duration;
 use image::{ExtendedColorType, ImageEncoder, RgbImage, codecs::jpeg::JpegEncoder};
 use kovi::serde_json::{Value, json};
 use kovi::{Message, RuntimeBot};
-use kovi_onebot::{MessageRegistrar as _, OneBotMessage, OnebotTrait};
+use utils::bot::{MessageExt as _, send_group_message, send_private_message};
 use utils::retry::retry_async_with_backoff;
 
 use crate::similar::decode_limited;
@@ -37,12 +37,12 @@ impl OutgoingImage {
     /// 文件不在（刚被回收或盘坏）返回 None，调用方按图缺失处理。
     pub(crate) async fn from_blob(
         store: &crate::store::Store,
-        group_id: i64,
+        group: &str,
         hash: &str,
     ) -> Option<Self> {
         #[cfg(feature = "send-file")]
         {
-            let path = store.blob_path(group_id, hash).ok()?;
+            let path = store.blob_path(group, hash).ok()?;
             let size = kovi::tokio::fs::metadata(&path).await.ok()?.len() as usize;
             let absolute = std::path::absolute(&path).unwrap_or(path);
             Some(Self {
@@ -52,7 +52,7 @@ impl OutgoingImage {
         }
         #[cfg(not(feature = "send-file"))]
         {
-            let bytes = store.read_blob(group_id, hash).await.ok()?;
+            let bytes = store.read_blob(group, hash).await.ok()?;
             Some(Self::from_bytes(bytes))
         }
     }
@@ -122,33 +122,39 @@ fn encode_jpeg(image: &RgbImage) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
-pub(crate) fn forward_node(name: &str, uin: i64, message: &Message) -> Value {
-    let content = OneBotMessage::from(message.clone());
+pub(crate) fn forward_node(name: &str, actor_key: &str, message: &Message) -> Value {
     json!({
         "type": "node",
         "data": {
             "name": name,
             "nickname": name,
-            "uin": uin,
-            "user_id": uin,
-            "content": content,
+            "uin": actor_key,
+            "user_id": actor_key,
+            "content": utils::bot::message_segments_json(message),
         }
     })
 }
 
 pub(crate) async fn send_group_wait(
     bot: &RuntimeBot,
-    group_id: i64,
+    group: &str,
     message: &Message,
 ) -> Result<(), SendFail> {
-    send_wait(|| bot.send_group_msg_return(group_id, message.clone())).await
+    send_wait(|| send_group_message(bot, group, message.clone())).await
 }
 
+/// 合并转发只在 OneBot 栈可用；官方栈无此能力，返回失败由调用方降级逐图。
 pub(crate) async fn send_group_forward_wait(
     bot: &RuntimeBot,
-    group_id: i64,
+    group: &str,
     nodes: &[Value],
 ) -> Result<(), SendFail> {
+    if utils::bot::is_official() {
+        return Err(SendFail::Api("官方 API 无合并转发".to_owned()));
+    }
+    let group_id: i64 = group
+        .parse()
+        .map_err(|_| SendFail::Api(format!("群号非法: {group}")))?;
     let params = json!({
         "group_id": group_id,
         "messages": nodes,
@@ -169,28 +175,33 @@ async fn send_api_wait(
     action: &'static str,
     params: &Value,
 ) -> Result<(), SendFail> {
-    send_wait(|| {
-        let request = bot.send_api_return(action, params.clone());
-        async move { request.await.map(|_| 0) }
+    send_wait(|| async {
+        bot.send_api_return(action, params.clone())
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "status={} retcode={} message={:?} data={}",
+                    error.status, error.retcode, error.message, error.data
+                )
+            })
     })
     .await
 }
 
 async fn send_private_wait(
     bot: &RuntimeBot,
-    user_id: i64,
+    user_key: &str,
     message: &Message,
 ) -> Result<(), SendFail> {
-    // send_private_msg_return 把 T 原样 JSON 化；Message 的字段名是 kind，OneBot 要 type。
-    let payload = OneBotMessage::from(message.clone());
-    send_wait(|| bot.send_private_msg_return(user_id, payload.clone())).await
+    send_wait(|| send_private_message(bot, user_key, message.clone())).await
 }
 
 /// 明确的 OneBot 失败才走 utils 的退避重试；超时当作成功结束，避免重复发图。
 async fn send_wait<F, Fut>(mut send: F) -> Result<(), SendFail>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<i32, kovi::bot::ApiReturn>> + Send,
+    Fut: std::future::Future<Output = Result<(), String>> + Send,
 {
     enum Outcome {
         Sent,
@@ -202,12 +213,9 @@ where
             let fut = send();
             async move {
                 match kovi::tokio::time::timeout(SEND_TIMEOUT, fut).await {
-                    Ok(Ok(_)) => Ok(Outcome::Sent),
+                    Ok(Ok(())) => Ok(Outcome::Sent),
                     Err(_) => Ok(Outcome::Timeout),
-                    Ok(Err(error)) => Err(format!(
-                        "status={} retcode={} message={:?} data={}",
-                        error.status, error.retcode, error.message, error.data
-                    )),
+                    Ok(Err(detail)) => Err(detail),
                 }
             }
         },
@@ -226,7 +234,7 @@ where
 pub(crate) async fn report_send_fail(
     bot: &RuntimeBot,
     store: &crate::store::Store,
-    group_id: i64,
+    group: &str,
     header: String,
     hashes: &[String],
     error: &SendFail,
@@ -241,11 +249,7 @@ pub(crate) async fn report_send_fail(
         SendFail::Api(detail) => detail.as_str(),
     };
     tracing::warn!("图库发图失败 {detail} {text}");
-    let Some(admin_id) = bot
-        .get_main_admin()
-        .ok()
-        .and_then(|admin| admin.try_as_i64())
-    else {
+    let Some(admin_key) = bot.get_main_admin().ok().map(|admin| admin.to_string()) else {
         tracing::warn!("无法解析主管理员");
         return;
     };
@@ -254,7 +258,7 @@ pub(crate) async fn report_send_fail(
         let mut parts = Vec::new();
         for hash in hashes {
             // 切开降级只在失败报告时才需要字节，此时再读盘
-            let Some(bytes) = store.read_blob(group_id, hash).await.ok() else {
+            let Some(bytes) = store.read_blob(group, hash).await.ok() else {
                 continue;
             };
             if let Some([first, second]) = split_image(&bytes) {
@@ -264,7 +268,7 @@ pub(crate) async fn report_send_fail(
         }
         if !parts.is_empty() {
             let message = image_message(Some(&text), &parts);
-            match send_private_wait(bot, admin_id, &message).await {
+            match send_private_wait(bot, &admin_key, &message).await {
                 Ok(()) => return,
                 Err(error) => {
                     tracing::warn!("图库失败切开私聊主管理员失败: {error:?}");
@@ -273,7 +277,7 @@ pub(crate) async fn report_send_fail(
         }
     }
 
-    if let Err(error) = send_wait(|| bot.send_private_msg_return(admin_id, text.clone())).await {
+    if let Err(error) = send_private_wait(bot, &admin_key, &Message::from(text)).await {
         tracing::warn!("图库失败哈希私聊主管理员失败: {error:?}");
     }
 }
@@ -288,10 +292,10 @@ mod tests {
     #[test]
     fn forward_node_uses_onebot_type_not_kind() {
         let message = image_message(Some("重复 1/2 · 约 90%"), &[]);
-        let node = forward_node("重复 1/2 · 约 90%", 10000, &message);
+        let node = forward_node("重复 1/2 · 约 90%", "10000", &message);
         assert_eq!(node["type"], "node");
         assert_eq!(node["data"]["name"], "重复 1/2 · 约 90%");
-        assert_eq!(node["data"]["uin"], 10000);
+        assert_eq!(node["data"]["uin"], "10000");
         assert_eq!(node["data"]["content"][0]["type"], "text");
         assert!(node["data"]["content"][0].get("kind").is_none());
     }

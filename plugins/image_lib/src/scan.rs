@@ -26,8 +26,8 @@ const MAX_BYTES_PER_MESSAGE: usize = 15 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ScanKey {
-    pub group_id: i64,
-    pub user_id: i64,
+    pub group_id: String,
+    pub user_id: String,
     pub library: String,
 }
 
@@ -275,8 +275,8 @@ mod tests {
 
     fn key() -> ScanKey {
         ScanKey {
-            group_id: 1,
-            user_id: 2,
+            group_id: "1".to_owned(),
+            user_id: "2".to_owned(),
             library: "猫".into(),
         }
     }
@@ -299,8 +299,8 @@ mod tests {
         assert!(
             sessions
                 .advance(&ScanKey {
-                    group_id: 1,
-                    user_id: 9,
+                    group_id: "1".to_owned(),
+                    user_id: "9".to_owned(),
                     library: "猫".into(),
                 })
                 .is_none()

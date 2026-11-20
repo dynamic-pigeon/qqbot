@@ -8,7 +8,7 @@ use anyhow::Result;
 use askama::Template;
 use kovi::chrono::{Datelike as _, Days, NaiveDate};
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot, chrono};
-use kovi_onebot::{MessageRegistrar as _, OnebotTrait};
+use utils::bot::{MessageExt as _, send_group_message};
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
 };
@@ -63,9 +63,9 @@ pub(crate) fn weekly_report_command(path: Arc<PathBuf>) -> Command {
 
 fn report_enable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     CONFIG
-        .modify(|config| config.enable_weekly_report(group_id))
+        .modify(|config| config.enable_weekly_report(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("定时周报已启用");
     Ok(())
@@ -73,9 +73,9 @@ fn report_enable(ctx: CommandContext) -> CommandResult {
 
 fn report_disable(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
+    let group = ctx.group_key()?;
     CONFIG
-        .modify(|config| config.disable_weekly_report(group_id))
+        .modify(|config| config.disable_weekly_report(&group))
         .map_err(CommandError::internal)?;
     ctx.reply("定时周报已停用");
     Ok(())
@@ -83,8 +83,8 @@ fn report_disable(ctx: CommandContext) -> CommandResult {
 
 fn report_status(ctx: CommandContext) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    ctx.reply(if CONFIG.get().weekly_report_enabled(group_id) {
+    let group = ctx.group_key()?;
+    ctx.reply(if CONFIG.get().weekly_report_enabled(&group) {
         "定时周报已启用"
     } else {
         "定时周报未启用"
@@ -94,11 +94,11 @@ fn report_status(ctx: CommandContext) -> CommandResult {
 
 async fn view_report(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     ctx.ensure_no_extra_args(0)?;
-    let group_id = ctx.group_id()?;
-    super::acquire_rank_cooldown(group_id)?;
+    let group = ctx.group_key()?;
+    super::acquire_rank_cooldown(&group)?;
 
     let window = last_week_window(chrono::Local::now().date_naive());
-    let rows = crate::db::msg_count_with_active_days(group_id, window.start, window.end)
+    let rows = crate::db::msg_count_with_active_days(&group, window.start, window.end)
         .await
         .map_err(CommandError::internal)?;
     if rows.is_empty() {
@@ -111,14 +111,26 @@ async fn view_report(ctx: CommandContext, path: Arc<PathBuf>) -> CommandResult {
     let bot = Arc::clone(ctx.bot());
     ctx.reply("⏳ 正在生成上周周报...");
     kovi::spawn(async move {
-        match make_report_image(&bot, &path, group_id, &window, rows).await {
-            Ok(image) => bot.send_group_msg(
-                group_id,
-                Message::new().add_image(&utils::base64_image(&image)),
-            ),
+        match make_report_image(&bot, &path, &group, &window, rows).await {
+            Ok(image) => {
+                if let Err(e) = send_group_message(
+                    &bot,
+                    &group,
+                    Message::new().add_image(&utils::base64_image(&image)),
+                )
+                .await
+                {
+                    tracing::error!("发送周报失败: {e}");
+                }
+            }
             Err(e) => {
-                tracing::error!("生成周报失败: {e}, group_id: {group_id}");
-                bot.send_group_msg(group_id, "周报生成失败，请稍后再试");
+                tracing::error!("生成周报失败: {e}, group: {group}");
+                if let Err(e) =
+                    send_group_message(&bot, &group, Message::from("周报生成失败，请稍后再试"))
+                        .await
+                {
+                    tracing::error!("发送周报失败提示失败: {e}");
+                }
             }
         }
     });
@@ -138,8 +150,8 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
             // 直接超时失败；同一 tick 内单任务顺序生成，每群都能出，代价是到群时间被拉平。
             kovi::spawn(async move {
                 let config = CONFIG.get();
-                for &group_id in &config.weekly_report_group {
-                    send_weekly_report(&bot, group_id, &path).await;
+                for group in &config.weekly_report_group {
+                    send_weekly_report(&bot, group, &path).await;
                 }
             });
         }
@@ -148,30 +160,36 @@ pub(crate) fn init(bot: Arc<RuntimeBot>, path: Arc<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn send_weekly_report(bot: &RuntimeBot, group_id: i64, path: &Path) {
+async fn send_weekly_report(bot: &RuntimeBot, group: &str, path: &Path) {
     let window = last_week_window(chrono::Local::now().date_naive());
-    let rows = match crate::db::msg_count_with_active_days(group_id, window.start, window.end).await
-    {
-        Ok(rows) => rows,
+    let rows = match crate::db::msg_count_with_active_days(group, window.start, window.end).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => {
+            tracing::info!("群 {group} 上周无发言数据，跳过周报推送");
+            return;
+        }
         Err(e) => {
-            crate::notify_admin(bot, format!("生成周报失败: {e}, group_id: {group_id}")).await;
+            utils::bot::notify_admin(bot, format!("生成周报失败: {e}, group: {group}")).await;
             return;
         }
     };
-    if rows.is_empty() {
-        tracing::info!("群 {group_id} 上周无发言数据，跳过周报推送");
-        return;
-    }
 
-    match make_report_image(bot, path, group_id, &window, rows).await {
-        Ok(image) => bot.send_group_msg(
-            group_id,
-            Message::new()
-                .add_text("📊 上周群活跃周报")
-                .add_image(&utils::base64_image(&image)),
-        ),
+    match make_report_image(bot, path, group, &window, rows).await {
+        Ok(image) => {
+            if let Err(e) = send_group_message(
+                bot,
+                group,
+                Message::new()
+                    .add_text("📊 上周群活跃周报")
+                    .add_image(&utils::base64_image(&image)),
+            )
+            .await
+            {
+                tracing::error!("发送周报失败: {e}");
+            }
+        }
         Err(e) => {
-            crate::notify_admin(bot, format!("生成周报失败: {e}, group_id: {group_id}")).await;
+            utils::bot::notify_admin(bot, format!("生成周报失败: {e}, group: {group}")).await;
         }
     }
 }
@@ -179,11 +197,11 @@ async fn send_weekly_report(bot: &RuntimeBot, group_id: i64, path: &Path) {
 async fn make_report_image(
     bot: &RuntimeBot,
     path: &Path,
-    group_id: i64,
+    group: &str,
     window: &ReportWindow,
-    rows: Vec<(i64, u32, u32)>,
+    rows: Vec<(String, u32, u32)>,
 ) -> Result<Vec<u8>> {
-    let html = gen_weekly_report_html(bot, path, group_id, window, &rows).await?;
+    let html = gen_weekly_report_html(bot, path, group, window, &rows).await?;
     // 按卡片元素截取，图片不带视口边距。
     utils::screenshot(
         &html,
@@ -231,16 +249,16 @@ fn week_date_label(monday: NaiveDate) -> String {
 async fn gen_weekly_report_html(
     bot: &RuntimeBot,
     path: &Path,
-    group_id: i64,
+    group: &str,
     window: &ReportWindow,
-    rows: &[(i64, u32, u32)],
+    rows: &[(String, u32, u32)],
 ) -> Result<String> {
     let total: u32 = rows.iter().map(|(_, count, _)| count).sum();
     let full_week_users = rows.iter().filter(|(_, _, days)| *days >= 7).count();
     let top_limit = crate::config::static_config().weekly_report_top();
 
     let night = crate::db::msg_count_top_at_local_hours(
-        group_id,
+        group,
         window.start,
         window.end,
         &NIGHT_HOURS,
@@ -248,7 +266,7 @@ async fn gen_weekly_report_html(
     )
     .await?;
     let early = crate::db::msg_count_top_at_local_hours(
-        group_id,
+        group,
         window.start,
         window.end,
         &EARLY_HOURS,
@@ -257,24 +275,31 @@ async fn gen_weekly_report_html(
     .await?;
 
     // 榜单与两位「王者」的去重用户集合，各拉一次群成员信息与头像。
-    let mut user_ids: Vec<i64> = rows.iter().take(top_limit).map(|row| row.0).collect();
+    let mut user_keys: Vec<String> = rows
+        .iter()
+        .take(top_limit)
+        .map(|row| row.0.clone())
+        .collect();
     for king in [&night, &early] {
-        if let Some((user_id, _)) = king
-            && !user_ids.contains(user_id)
+        if let Some((user_key, _)) = king
+            && !user_keys.contains(user_key)
         {
-            user_ids.push(*user_id);
+            user_keys.push(user_key.clone());
         }
     }
 
-    let infos: HashMap<i64, UserInfo> =
-        kovi::futures_util::future::join_all(user_ids.into_iter().map(|user_id| async move {
-            let info = user_info::get_user_info(bot, group_id, user_id)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!("获取用户 {user_id} 信息失败: {e}");
-                    user_info::fallback_user_info(user_id)
-                });
-            (user_id, info)
+    let infos: HashMap<String, UserInfo> =
+        kovi::futures_util::future::join_all(user_keys.into_iter().map(|user_key| {
+            let group = group.to_owned();
+            async move {
+                let info = user_info::get_user_info(bot, &group, &user_key)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("获取用户 {user_key} 信息失败: {e}");
+                        user_info::fallback_user_info(&user_key)
+                    });
+                (user_key, info)
+            }
         }))
         .await
         .into_iter()
@@ -284,8 +309,9 @@ async fn gen_weekly_report_html(
         .iter()
         .take(top_limit)
         .enumerate()
-        .map(|(i, &(user_id, count, days))| {
-            let info = &infos[&user_id];
+        .map(|(i, row)| {
+            let (user_id, count, days) = (&row.0, row.1, row.2);
+            let info = &infos[user_id.as_str()];
             WeeklyItem {
                 rank: i + 1,
                 avatar_src: super::avatar_src(info),
@@ -297,9 +323,9 @@ async fn gen_weekly_report_html(
         })
         .collect();
 
-    let king = |top: Option<(i64, u32)>| {
+    let king = |top: Option<(String, u32)>| {
         top.map(|(user_id, count)| {
-            let info = &infos[&user_id];
+            let info = &infos[user_id.as_str()];
             King {
                 avatar_src: super::avatar_src(info),
                 nickname: info.nickname.clone(),
@@ -310,10 +336,10 @@ async fn gen_weekly_report_html(
     let night_owl = king(night);
     let early_bird = king(early);
 
-    let daily = crate::db::msg_count_by_local_date(group_id, window.start, window.end).await?;
+    let daily = crate::db::msg_count_by_local_date(group, window.start, window.end).await?;
     let daily_map: HashMap<String, u32> = daily.into_iter().collect();
 
-    let hot_words = collect_hot_words(path, group_id, window).await?;
+    let hot_words = collect_hot_words(path, group, window).await?;
 
     let template = WeeklyReportTemplate {
         date: week_date_label(window.monday),
@@ -333,11 +359,11 @@ async fn gen_weekly_report_html(
 
 async fn collect_hot_words(
     path: &Path,
-    group_id: i64,
+    group: &str,
     window: &ReportWindow,
 ) -> Result<Vec<HotWord>> {
     let text = crate::db::select_text_from_time_range(
-        group_id,
+        group,
         window.start,
         window.end,
         crate::db::MAX_TEXT_INPUT_BYTES,

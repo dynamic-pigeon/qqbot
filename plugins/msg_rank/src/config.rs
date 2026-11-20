@@ -88,17 +88,42 @@ pub(crate) static CONFIG: JsonStore<Config> = JsonStore::new();
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 pub struct Config {
     /// 采集消息的群。发言排行和词云都读这份记录。
-    #[serde(default, alias = "notify_group")]
-    pub record_group: Vec<i64>,
+    /// 群身份键：官方栈为 group_openid，OneBot 栈为群号十进制串。
+    #[serde(default, alias = "notify_group", deserialize_with = "de_group_list")]
+    pub record_group: Vec<String>,
     /// 定时推送词云的群。空列表就是不开；缺字段时按空列表读。
-    #[serde(default)]
-    pub wordcloud_group: Vec<i64>,
+    #[serde(default, deserialize_with = "de_group_list")]
+    pub wordcloud_group: Vec<String>,
     /// 词云背景色，支持 #RRGGBB 和常见颜色名。
     #[serde(default = "default_wordcloud_background")]
     pub wordcloud_background: String,
     /// 定时推送周报的群。空列表就是不开；缺字段时按空列表读。
-    #[serde(default)]
-    pub weekly_report_group: Vec<i64>,
+    #[serde(default, deserialize_with = "de_group_list")]
+    pub weekly_report_group: Vec<String>,
+}
+
+/// 旧配置里的群是数字（OneBot 群号），新身份是字符串（openid），
+/// 数字统一读成十进制串。
+fn de_group_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum GroupId {
+        Number(i64),
+        Text(String),
+    }
+
+    let raw = Vec::<GroupId>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|id| match id {
+            GroupId::Number(number) => number.to_string(),
+            GroupId::Text(text) => text,
+        })
+        .collect())
 }
 
 fn default_wordcloud_background() -> String {
@@ -117,52 +142,52 @@ impl Default for Config {
 }
 
 impl Config {
-    pub(crate) fn wordcloud_enabled(&self, group_id: i64) -> bool {
-        self.wordcloud_group.contains(&group_id)
+    pub(crate) fn wordcloud_enabled(&self, group: &str) -> bool {
+        self.wordcloud_group.iter().any(|id| id == group)
     }
 
-    pub(crate) fn recording_enabled(&self, group_id: i64) -> bool {
-        self.record_group.contains(&group_id)
+    pub(crate) fn recording_enabled(&self, group: &str) -> bool {
+        self.record_group.iter().any(|id| id == group)
     }
 
-    pub(crate) fn enable_recording(&mut self, group_id: i64) {
-        if !self.record_group.contains(&group_id) {
-            self.record_group.push(group_id);
+    pub(crate) fn enable_recording(&mut self, group: &str) {
+        if !self.record_group.iter().any(|id| id == group) {
+            self.record_group.push(group.to_owned());
         }
     }
 
-    pub(crate) fn disable_recording(&mut self, group_id: i64) {
-        self.record_group.retain(|&id| id != group_id);
+    pub(crate) fn disable_recording(&mut self, group: &str) {
+        self.record_group.retain(|id| id != group);
     }
 
     /// 开始采集，并打开定时词云。
-    pub(crate) fn enable_wordcloud(&mut self, group_id: i64) {
-        self.enable_recording(group_id);
-        if !self.wordcloud_group.contains(&group_id) {
-            self.wordcloud_group.push(group_id);
+    pub(crate) fn enable_wordcloud(&mut self, group: &str) {
+        self.enable_recording(group);
+        if !self.wordcloud_group.iter().any(|id| id == group) {
+            self.wordcloud_group.push(group.to_owned());
         }
     }
 
     /// 只关掉定时词云，采集继续。
-    pub(crate) fn disable_wordcloud(&mut self, group_id: i64) {
-        self.wordcloud_group.retain(|&id| id != group_id);
+    pub(crate) fn disable_wordcloud(&mut self, group: &str) {
+        self.wordcloud_group.retain(|id| id != group);
     }
 
-    pub(crate) fn weekly_report_enabled(&self, group_id: i64) -> bool {
-        self.weekly_report_group.contains(&group_id)
+    pub(crate) fn weekly_report_enabled(&self, group: &str) -> bool {
+        self.weekly_report_group.iter().any(|id| id == group)
     }
 
     /// 开启周报推送，并开始采集。
-    pub(crate) fn enable_weekly_report(&mut self, group_id: i64) {
-        self.enable_recording(group_id);
-        if !self.weekly_report_group.contains(&group_id) {
-            self.weekly_report_group.push(group_id);
+    pub(crate) fn enable_weekly_report(&mut self, group: &str) {
+        self.enable_recording(group);
+        if !self.weekly_report_group.iter().any(|id| id == group) {
+            self.weekly_report_group.push(group.to_owned());
         }
     }
 
     /// 只关掉定时周报，采集继续。
-    pub(crate) fn disable_weekly_report(&mut self, group_id: i64) {
-        self.weekly_report_group.retain(|&id| id != group_id);
+    pub(crate) fn disable_weekly_report(&mut self, group: &str) {
+        self.weekly_report_group.retain(|id| id != group);
     }
 }
 
@@ -196,7 +221,7 @@ mod tests {
     #[test]
     fn notify_group_alias_still_loads() {
         let config: Config = kovi::serde_json::from_str(r#"{"notify_group":[1]}"#).unwrap();
-        assert!(config.recording_enabled(1));
+        assert!(config.recording_enabled("1"));
         let json = kovi::serde_json::to_string(&config).unwrap();
         assert!(json.contains("record_group"));
         assert!(!json.contains("notify_group"));
@@ -206,52 +231,55 @@ mod tests {
     fn empty_wordcloud_group_means_disabled() {
         let config: Config =
             kovi::serde_json::from_str(r#"{"record_group":[1],"wordcloud_group":[]}"#).unwrap();
-        assert!(config.recording_enabled(1));
-        assert!(!config.wordcloud_enabled(1));
+        assert!(config.recording_enabled("1"));
+        assert!(!config.wordcloud_enabled("1"));
     }
 
     #[test]
     fn disable_wordcloud_keeps_recording() {
         let mut config = Config::default();
-        config.enable_wordcloud(1);
-        assert!(config.record_group.contains(&1));
-        assert!(config.wordcloud_enabled(1));
+        config.enable_wordcloud("1");
+        assert!(config.record_group.iter().any(|id| id == "1"));
+        assert!(config.wordcloud_enabled("1"));
 
-        config.disable_wordcloud(1);
-        assert!(config.record_group.contains(&1));
-        assert!(!config.wordcloud_enabled(1));
+        config.disable_wordcloud("1");
+        assert!(config.record_group.iter().any(|id| id == "1"));
+        assert!(!config.wordcloud_enabled("1"));
 
-        config.enable_wordcloud(1);
-        assert!(config.wordcloud_enabled(1));
-        assert_eq!(config.record_group.iter().filter(|&&id| id == 1).count(), 1);
+        config.enable_wordcloud("1");
+        assert!(config.wordcloud_enabled("1"));
+        assert_eq!(
+            config.record_group.iter().filter(|id| *id == "1").count(),
+            1
+        );
     }
 
     #[test]
     fn enable_recording_does_not_turn_on_wordcloud() {
         let mut config = Config::default();
-        config.enable_recording(1);
-        assert!(config.recording_enabled(1));
-        assert!(!config.wordcloud_enabled(1));
+        config.enable_recording("1");
+        assert!(config.recording_enabled("1"));
+        assert!(!config.wordcloud_enabled("1"));
 
-        config.enable_wordcloud(1);
-        assert!(config.wordcloud_enabled(1));
-        assert!(config.recording_enabled(1));
+        config.enable_wordcloud("1");
+        assert!(config.wordcloud_enabled("1"));
+        assert!(config.recording_enabled("1"));
     }
 
     #[test]
     fn enable_recording_does_not_change_wordcloud_group() {
         let mut config = Config {
-            record_group: vec![1],
-            wordcloud_group: vec![1],
+            record_group: vec!["1".to_owned()],
+            wordcloud_group: vec!["1".to_owned()],
             wordcloud_background: super::default_wordcloud_background(),
             weekly_report_group: vec![],
         };
-        config.enable_recording(2);
-        assert!(config.recording_enabled(1));
-        assert!(config.recording_enabled(2));
-        assert!(config.wordcloud_enabled(1));
-        assert!(!config.wordcloud_enabled(2));
-        assert_eq!(config.wordcloud_group, vec![1]);
+        config.enable_recording("2");
+        assert!(config.recording_enabled("1"));
+        assert!(config.recording_enabled("2"));
+        assert!(config.wordcloud_enabled("1"));
+        assert!(!config.wordcloud_enabled("2"));
+        assert_eq!(config.wordcloud_group, vec!["1".to_owned()]);
     }
 
     #[test]
@@ -263,20 +291,20 @@ mod tests {
     #[test]
     fn weekly_report_enable_also_records_and_disable_keeps_recording() {
         let mut config = Config::default();
-        config.enable_weekly_report(1);
-        assert!(config.weekly_report_enabled(1));
-        assert!(config.recording_enabled(1));
+        config.enable_weekly_report("1");
+        assert!(config.weekly_report_enabled("1"));
+        assert!(config.recording_enabled("1"));
 
-        config.disable_weekly_report(1);
-        assert!(!config.weekly_report_enabled(1));
-        assert!(config.recording_enabled(1));
+        config.disable_weekly_report("1");
+        assert!(!config.weekly_report_enabled("1"));
+        assert!(config.recording_enabled("1"));
 
-        config.enable_weekly_report(1);
+        config.enable_weekly_report("1");
         assert_eq!(
             config
                 .weekly_report_group
                 .iter()
-                .filter(|&&id| id == 1)
+                .filter(|id| *id == "1")
                 .count(),
             1
         );
@@ -285,8 +313,8 @@ mod tests {
     #[test]
     fn enable_recording_does_not_enable_weekly_report() {
         let mut config = Config::default();
-        config.enable_recording(1);
-        assert!(config.recording_enabled(1));
-        assert!(!config.weekly_report_enabled(1));
+        config.enable_recording("1");
+        assert!(config.recording_enabled("1"));
+        assert!(!config.weekly_report_enabled("1"));
     }
 }

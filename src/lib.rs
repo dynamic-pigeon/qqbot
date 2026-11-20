@@ -1,9 +1,12 @@
 use kovi::Bot;
 use kovi::config::kovi_conf::KoviConf;
-use kovi_onebot::OneBotDriver;
+use kovi::driver::Driver;
 
-/// 挂载全部插件，行为与生产入口一致。
-pub fn build_bot(kovi_config: KoviConf, driver: OneBotDriver) -> Bot {
+/// 挂载全部插件，行为与生产入口一致。驱动由调用方装配（onebot / official）。
+pub fn build_bot<D>(kovi_config: KoviConf, driver: D) -> Bot
+where
+    D: Driver + 'static,
+{
     let mut bot = Bot::build(kovi_config, driver);
     let plugin_set = kovi::plugins!(
         kovi_plugin_cmd,

@@ -1,6 +1,6 @@
 # QQ Bot
 
-基于 Kovi 和 OneBot 的 Rust QQ 机器人。群内 `/help` 看命令列表，`/help <命令>` 看用法。
+基于 Kovi 的 Rust QQ 机器人，OneBot 与 QQ 官方机器人双栈（`official` feature 切换）。群内 `/help` 看命令列表，`/help <命令>` 看用法。
 
 | 插件 | 作用 | 入口 |
 |---|---|---|
@@ -34,6 +34,12 @@ cargo run --release --features mimalloc
 
 ```bash
 cargo run --release --features jemalloc,image-send-file
+```
+
+官方机器人走 `official` feature，凭据放 `kovi.conf.toml` 的 `[official]` 段（`app_id` / `app_secret` / `sandbox`），迁移方案见 [docs/official-bot.md](docs/official-bot.md)。
+
+```bash
+cargo run --release --features official
 ```
 
 `image_lib` 的裁剪检测动态链接系统 OpenCV，目标机要有相同 minor 版本的运行库。动态链接 OpenCV 后使用 glibc 目标；交叉部署用 cargo-zigbuild，按目标机的 glibc 版本钉版编译。

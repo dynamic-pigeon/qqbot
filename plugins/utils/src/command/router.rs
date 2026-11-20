@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use kovi::{Message, PluginBuilder as plugin, RuntimeBot};
-use kovi_onebot::{EventRegistrar as _, MsgEvent};
+
+use crate::bot::{self, BotMsgEvent};
 
 use super::model::{CommandArguments, CommandHandler};
 use super::{
@@ -51,7 +52,7 @@ impl CommandRouter {
         // kovi 把 on_msg 记在当前插件的 listen 上，禁用插件会 clear。
         // 分发必须跟命令所属插件同生共死，不能挂到第一个 install 的插件上。
         let bot = self.bot;
-        plugin::on_msg(move |event| {
+        bot::on_msg(move |event: Arc<dyn BotMsgEvent>| {
             let tree = Arc::clone(&tree);
             let bot = Arc::clone(&bot);
             async move {
@@ -62,27 +63,32 @@ impl CommandRouter {
     }
 }
 
-async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<MsgEvent>) {
-    let Some(text) = extract_command_text(&event.message) else {
+async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<dyn BotMsgEvent>) {
+    let Some(text) = extract_command_text(event.message()) else {
         return;
     };
     let resolved = match tree.resolve(&text) {
         ResolveOutcome::Ignored => return,
         ResolveOutcome::Error(error) => {
             if let Err(access_error) =
-                check_event_access(&event, &bot, error.scope(), error.permission())
+                check_event_access(event.as_ref(), &bot, error.scope(), error.permission())
             {
-                reply_access_error(&event, access_error);
+                reply_access_error(event.as_ref(), access_error);
                 return;
             }
-            event.reply(error.to_string());
+            event.reply(Message::from(error.to_string()));
             return;
         }
         ResolveOutcome::Matched(resolved) => resolved,
     };
 
-    if let Err(error) = check_event_access(&event, &bot, resolved.scope(), resolved.permission()) {
-        reply_access_error(&event, error);
+    if let Err(error) = check_event_access(
+        event.as_ref(),
+        &bot,
+        resolved.scope(),
+        resolved.permission(),
+    ) {
+        reply_access_error(event.as_ref(), error);
         return;
     }
 
@@ -107,13 +113,13 @@ async fn dispatch_msg(tree: Arc<CommandTree>, bot: Arc<RuntimeBot>, event: Arc<M
         if let CommandError::Internal(internal) = &error {
             tracing::error!(
                 command = %path.join(" "),
-                user_id = event.user_id,
-                group_id = event.group_id,
+                user = %event.user_key(),
+                group = ?event.group_key(),
                 error = ?internal,
                 "命令执行失败"
             );
         }
-        event.reply(render_command_error(&error, &usage));
+        event.reply(Message::from(render_command_error(&error, &usage)));
     }
 }
 
@@ -134,21 +140,20 @@ pub(crate) fn extract_command_text(message: &Message) -> Option<String> {
 }
 
 fn check_event_access(
-    event: &MsgEvent,
+    event: &dyn BotMsgEvent,
     bot: &RuntimeBot,
     scope: super::MessageScope,
     permission: Permission,
 ) -> Result<(), AccessError> {
-    // 群临时会话的私聊消息同样携带 group_id，只有 message_type 能可靠区分来源。
-    let source = if event.message_type == "group" {
+    let source = if event.is_group() {
         MessageSource::Group
     } else {
         MessageSource::Private
     };
-    let is_admin = permission == Permission::Everyone || user_is_bot_admin(bot, event.user_id);
+    let is_admin = permission == Permission::Everyone || user_is_bot_admin(bot, &event.user_key());
     check_access(scope, permission, source, is_admin)
 }
 
-fn reply_access_error(event: &MsgEvent, error: AccessError) {
-    event.reply(error.to_string());
+fn reply_access_error(event: &dyn BotMsgEvent, error: AccessError) {
+    event.reply(Message::from(error.to_string()));
 }
