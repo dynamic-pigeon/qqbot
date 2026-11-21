@@ -1,5 +1,3 @@
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,191 +24,183 @@ pub(super) fn fallback_user_info(user_key: &str) -> UserInfo {
     }
 }
 
-// ── 盘上缓存 ───────────────────────────────────────────────────────────────
+// ── 成员资料缓存（L2，msg.db 的 MEMBER_PROFILE 表）───────────────────────
 //
 // 内存缓存重启即空；官方栈成员信息只能来自事件流、头像 URL 又有时效，
-// 重启后没再发言的成员昵称会退化成 openid 串。昵称与头像落盘兜底：
-// `avatars/<group>/<user>.json` 存昵称与落盘时间，`avatars/<group>/<user>`
-// 存头像字节。
+// 重启后没再发言的成员昵称会退化成 openid 串。昵称与头像进 SQLite：
+// 采集器路径发言即写（头像 URL 不变不重下载字节），渲染路径查不到
+// 成员时整行兜底读。
 
-/// 盘缓存根目录，插件初始化时设置；未设置（单测环境）时禁用。
-static DISK_ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// 资料保留窗口；榜上成员必然活跃，窗口内被刷新过的行不会被清扫。
+const PROFILE_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
-/// 落盘时间超过该窗的条目视为不活跃，清扫删除。榜上成员必然活跃：
-/// 每次成功拉取都会刷新 .json 的落盘时间，不会被误清。
-const DISK_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+/// 资料刷新窗口：窗口内到达的消息不触发任何库写与下载。
+const PROFILE_REFRESH_SECS: i64 = 24 * 60 * 60;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProfileRecord {
-    nickname: String,
-    saved_at: u64,
-}
-
-fn epoch_now() -> u64 {
+fn epoch_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
 }
 
-/// 设置盘缓存目录并启动每日清扫（interval 首个 tick 立即触发，启动即扫一遍）。
-pub(crate) fn init(data_dir: &Path) {
-    if DISK_ROOT.set(data_dir.join("avatars")).is_err() {
-        return;
-    }
-    let Some(root) = DISK_ROOT.get() else {
+/// 采集器路径的资料维护：库内资料仍在刷新窗口内就不动；过期或首见才
+/// 重新下载头像整行写入。下载失败时至少把昵称行写起来（同样计入窗口，
+/// 下个窗口再试头像），避免每条消息都重试下载。
+pub(crate) async fn observe(
+    group: &str,
+    user: &str,
+    nickname: &str,
+    card: Option<&str>,
+    avatar_url: Option<&str>,
+) {
+    let Ok(pool) = crate::db::get_pool() else {
         return;
     };
-    let _ = std::fs::create_dir_all(root);
-    let sweep_root = root.clone();
-    kovi::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
-        loop {
-            ticker.tick().await;
-            sweep_expired(&sweep_root);
-        }
-    });
-}
-
-/// 拉取成功后落盘：.json 每次都重写（落盘时间是清扫的活跃凭据），
-/// 头像字节只在缺失或长度变化时重写，避免逐小时无效写放大。
-async fn persist_profile(root: &Path, group: &str, user: &str, nickname: &str, avatar: &[u8]) {
-    let dir = root.join(group);
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        tracing::warn!("创建头像缓存目录失败: {e}");
+    if profile_is_fresh(pool, group, user).await {
         return;
     }
-    let record = ProfileRecord {
-        nickname: nickname.to_owned(),
-        saved_at: epoch_now(),
+    let shown = match card {
+        Some(card) if !card.is_empty() => card.to_owned(),
+        _ => nickname.to_owned(),
     };
-    if let Ok(bytes) = kovi::serde_json::to_vec(&record)
-        && let Err(e) = write_atomic(&dir.join(format!("{user}.json")), &bytes).await
-    {
-        tracing::warn!("写入昵称缓存失败 user={user}: {e}");
-    }
-    if avatar.is_empty() {
-        return;
-    }
-    let bin = dir.join(user);
-    let unchanged = tokio::fs::metadata(&bin)
-        .await
-        .map(|meta| meta.len() as usize == avatar.len())
-        .unwrap_or(false);
-    if !unchanged
-        && let Err(e) = write_atomic(&bin, avatar).await
-    {
-        tracing::warn!("写入头像缓存失败 user={user}: {e}");
-    }
-}
 
-/// 只取盘上的头像字节，头像下载失败时兜底。
-async fn disk_avatar(group: &str, user: &str) -> bytes::Bytes {
-    let Some(root) = DISK_ROOT.get() else {
-        return bytes::Bytes::new();
+    let avatar = match avatar_url {
+        Some(url) => match fetch_avatar_with_retry(url).await {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!("头像下载失败 user={user}: {e:#}");
+                None
+            }
+        },
+        None => None,
     };
-    tokio::fs::read(root.join(group).join(user))
-        .await
-        .map(bytes::Bytes::from)
-        .unwrap_or_default()
+    let result = match avatar.as_ref() {
+        Some(bytes) => upsert_profile(pool, group, user, &shown, Some(bytes)).await,
+        None => touch_profile(pool, group, user, &shown).await,
+    };
+    if let Err(e) = result {
+        tracing::warn!("成员资料落库失败 user={user}: {e:#}");
+    }
 }
 
-/// 成员信息查不到时从盘上恢复（昵称 + 头像，容忍过期内容）。
-async fn load_cached(group: &str, user: &str) -> Option<UserInfo> {
-    let root = DISK_ROOT.get()?;
-    load_profile(root, group, user).await
+/// 库内资料是否仍在刷新窗口内。官方栈头像 URL 每条消息都变（带签名
+/// 的时效链接），不能当变更依据，统一用时间窗淘汰。
+async fn profile_is_fresh(pool: &sqlx::SqlitePool, group: &str, user: &str) -> bool {
+    sqlx::query_as::<_, (i64,)>(
+        "SELECT saved_at FROM MEMBER_PROFILE WHERE group_id = ? AND user_id = ?",
+    )
+    .bind(group)
+    .bind(user)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .is_some_and(|(saved_at,)| saved_at >= epoch_now() - PROFILE_REFRESH_SECS)
 }
 
-async fn load_profile(root: &Path, group: &str, user: &str) -> Option<UserInfo> {
-    let dir = root.join(group);
-    let bytes = tokio::fs::read(dir.join(format!("{user}.json"))).await.ok()?;
-    let record: ProfileRecord = kovi::serde_json::from_slice(&bytes).ok()?;
-    let avatar = tokio::fs::read(dir.join(user)).await.unwrap_or_default();
+/// 整行写入。avatar 为 None 时保留库内旧字节（COALESCE）。
+async fn upsert_profile(
+    pool: &sqlx::SqlitePool,
+    group: &str,
+    user: &str,
+    nickname: &str,
+    avatar: Option<&[u8]>,
+) -> Result<()> {
+    sqlx::query(
+        "
+INSERT INTO MEMBER_PROFILE (group_id, user_id, nickname, avatar, saved_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT (group_id, user_id) DO UPDATE SET
+    nickname = excluded.nickname,
+    avatar = COALESCE(excluded.avatar, MEMBER_PROFILE.avatar),
+    saved_at = excluded.saved_at
+",
+    )
+    .bind(group)
+    .bind(user)
+    .bind(nickname)
+    .bind(avatar)
+    .bind(epoch_now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 只刷新昵称与活跃时间，不动头像列（下载失败时的降级写；
+/// 首见即失败也把昵称行建起来，头像留给下个窗口补）。
+async fn touch_profile(
+    pool: &sqlx::SqlitePool,
+    group: &str,
+    user: &str,
+    nickname: &str,
+) -> Result<()> {
+    sqlx::query(
+        "
+INSERT INTO MEMBER_PROFILE (group_id, user_id, nickname, avatar, saved_at)
+VALUES (?, ?, ?, NULL, ?)
+ON CONFLICT (group_id, user_id) DO UPDATE SET
+    nickname = excluded.nickname,
+    saved_at = excluded.saved_at
+",
+    )
+    .bind(group)
+    .bind(user)
+    .bind(nickname)
+    .bind(epoch_now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 成员信息查不到时整行恢复（昵称 + 头像，容忍过期内容）。
+async fn load_profile(pool: &sqlx::SqlitePool, group: &str, user: &str) -> Option<UserInfo> {
+    let (nickname, avatar): (String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT nickname, avatar FROM MEMBER_PROFILE WHERE group_id = ? AND user_id = ?",
+    )
+    .bind(group)
+    .bind(user)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
     Some(UserInfo {
         user_key: user.to_owned(),
-        nickname: record.nickname,
-        avatar: avatar.into(),
+        nickname,
+        avatar: avatar.map(bytes::Bytes::from).unwrap_or_default(),
         fetched_at: Instant::now(),
     })
 }
 
-/// 先写临时文件再原子改名，避免清扫或崩溃读到半截文件。
-async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "cache".to_owned());
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    tokio::fs::write(&tmp, bytes).await?;
-    tokio::fs::rename(&tmp, path).await
+/// 只取库内的头像字节，头像下载失败时兜底。
+async fn db_avatar(group: &str, user: &str) -> bytes::Bytes {
+    let Ok(pool) = crate::db::get_pool() else {
+        return bytes::Bytes::new();
+    };
+    sqlx::query_as::<_, (Option<Vec<u8>>,)>(
+        "SELECT avatar FROM MEMBER_PROFILE WHERE group_id = ? AND user_id = ?",
+    )
+    .bind(group)
+    .bind(user)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|(avatar,)| avatar)
+    .map(bytes::Bytes::from)
+    .unwrap_or_default()
 }
 
-/// 清扫：删除落盘时间超窗的 .json 及其头像、没有存活 .json 的孤儿头像、
-/// 一天前的 .tmp 残片；收尾移除空群目录。
-fn sweep_expired(root: &Path) {
-    let cutoff = epoch_now().saturating_sub(DISK_RETENTION_SECS);
-    let Ok(groups) = std::fs::read_dir(root) else {
-        return;
-    };
-    let mut removed = 0usize;
-    for group in groups.flatten() {
-        let group_path = group.path();
-        let Ok(entries) = std::fs::read_dir(&group_path) else {
-            continue;
-        };
-        let mut kept: Vec<std::ffi::OsString> = Vec::new();
-        let mut strays: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            if let Some(user) = name.strip_suffix(".json") {
-                let fresh = std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| kovi::serde_json::from_slice::<ProfileRecord>(&bytes).ok())
-                    .is_some_and(|record| record.saved_at >= cutoff);
-                if fresh {
-                    kept.push(user.to_owned().into());
-                } else {
-                    removed += std::fs::remove_file(&path).is_ok() as usize;
-                }
-            } else if name.ends_with(".tmp") {
-                let stale = entry
-                    .metadata()
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| {
-                        modified
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .ok()
-                    })
-                    .is_some_and(|since| since.as_secs() + 24 * 60 * 60 < epoch_now());
-                if stale {
-                    removed += std::fs::remove_file(&path).is_ok() as usize;
-                }
-            } else {
-                strays.push(path);
-            }
-        }
-        for avatar in strays {
-            let is_kept = avatar
-                .file_name()
-                .is_some_and(|name| kept.iter().any(|k| k.as_os_str() == name));
-            if !is_kept {
-                removed += std::fs::remove_file(&avatar).is_ok() as usize;
-            }
-        }
-        if std::fs::read_dir(&group_path)
-            .map(|mut rest| rest.next().is_none())
-            .unwrap_or(false)
-        {
-            let _ = std::fs::remove_dir(&group_path);
-        }
+/// 清扫落盘时间超窗的资料行，挂在 db.rs 的每日 cleanup tick。
+pub(crate) async fn delete_expired_profiles(pool: &sqlx::SqlitePool) -> Result<()> {
+    let cutoff = epoch_now() - PROFILE_RETENTION_SECS;
+    let result = sqlx::query("DELETE FROM MEMBER_PROFILE WHERE saved_at < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() > 0 {
+        tracing::info!("成员资料清扫: 删除 {} 行", result.rows_affected());
     }
-    if removed > 0 {
-        tracing::info!("头像缓存清扫: 删除 {removed} 个条目");
-    }
+    Ok(())
 }
 
 // 按字节限容：头像（最大 2MB）是条目体积的大头，只按条数限制时缓存可能涨到 GB 级。
@@ -290,21 +280,24 @@ async fn fetch_user_info(bot: &RuntimeBot, group_key: &str, user_key: &str) -> R
     let profile = match fetch_member_with_retry(bot, group_key, user_key).await {
         Ok(profile) => profile,
         Err(e) => {
-            // 成员信息不可用（官方栈重启后该成员未再发言）：盘上缓存兜底。
-            if let Some(cached) = load_cached(group_key, user_key).await {
-                tracing::warn!("成员信息不可用，使用盘上缓存 user={user_key}: {e}");
+            // 成员信息不可用（官方栈重启后该成员未再发言）：库内资料兜底。
+            if let Ok(pool) = crate::db::get_pool()
+                && let Some(cached) = load_profile(pool, group_key, user_key).await
+            {
+                tracing::warn!("成员信息不可用，使用库内资料 user={user_key}: {e:#}");
                 return Ok(cached);
             }
             return Err(e);
         }
     };
 
-    let avatar = match profile.avatar.as_deref() {
+    let avatar_url = profile.avatar.clone();
+    let avatar = match avatar_url.as_deref() {
         Some(url) => match fetch_avatar_with_retry(url).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!("获取头像失败，user={}: {}", user_key, e);
-                disk_avatar(group_key, user_key).await
+                tracing::warn!("获取头像失败，user={}: {e:#}", user_key);
+                db_avatar(group_key, user_key).await
             }
         },
         None => bytes::Bytes::new(),
@@ -314,8 +307,11 @@ async fn fetch_user_info(bot: &RuntimeBot, group_key: &str, user_key: &str) -> R
         Some(card) if !card.is_empty() => card.to_owned(),
         _ => profile.nickname,
     };
-    if let Some(root) = DISK_ROOT.get() {
-        persist_profile(root, group_key, user_key, &nickname, &avatar).await;
+    if let Ok(pool) = crate::db::get_pool()
+        && let Err(e) =
+            upsert_profile(pool, group_key, user_key, &nickname, Some(avatar.as_ref())).await
+    {
+        tracing::warn!("成员资料落库失败 user={user_key}: {e:#}");
     }
     Ok(UserInfo {
         user_key: user_key.to_owned(),
@@ -381,73 +377,92 @@ async fn fetch_avatar_with_retry(avatar_url: &str) -> Result<bytes::Bytes> {
 mod tests {
     use super::*;
 
-    fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "msg-rank-avatar-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    async fn test_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::ensure_member_profile_table(&pool).await.unwrap();
+        pool
     }
 
     #[tokio::test]
-    async fn 落盘昵称与头像后可整条恢复() {
-        let root = temp_root("roundtrip");
-        persist_profile(&root, "G", "U", "昵称", b"avatar-bytes").await;
-        let info = load_profile(&root, "G", "U").await.unwrap();
+    async fn 落库昵称与头像后可整条恢复() {
+        let pool = test_pool().await;
+        upsert_profile(&pool, "G", "U", "昵称", Some(b"avatar-bytes"))
+            .await
+            .unwrap();
+        let info = load_profile(&pool, "G", "U").await.unwrap();
         assert_eq!(info.nickname, "昵称");
         assert_eq!(&*info.avatar, b"avatar-bytes");
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
-    async fn 头像等长不重写变长重写() {
-        let root = temp_root("dedup");
-        persist_profile(&root, "G", "U", "n", b"aaaa").await;
-        persist_profile(&root, "G", "U", "n", b"bbbb").await;
-        assert_eq!(std::fs::read(root.join("G/U")).unwrap(), b"aaaa");
-        persist_profile(&root, "G", "U", "n", b"cc").await;
-        assert_eq!(std::fs::read(root.join("G/U")).unwrap(), b"cc");
-        std::fs::remove_dir_all(&root).unwrap();
+    async fn 刷新窗口内视为新鲜() {
+        let pool = test_pool().await;
+        assert!(!profile_is_fresh(&pool, "G", "U").await);
+        touch_profile(&pool, "G", "U", "名字").await.unwrap();
+        assert!(profile_is_fresh(&pool, "G", "U").await);
+        // 落库时间挪到窗口之外即过期，采集路径会重新下载整行。
+        sqlx::query(
+            "UPDATE MEMBER_PROFILE SET saved_at = ? WHERE group_id = 'G' AND user_id = 'U'",
+        )
+        .bind(epoch_now() - PROFILE_REFRESH_SECS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!profile_is_fresh(&pool, "G", "U").await);
     }
 
     #[tokio::test]
-    async fn 清扫删除超窗与孤儿保留活跃() {
-        let root = temp_root("sweep");
-        // 活跃条目：新鲜落盘时间 + 头像。
-        persist_profile(&root, "G", "live", "n", b"avatar").await;
-        // 超窗条目：落盘时间在窗口之外。
-        let stale = ProfileRecord {
-            nickname: "n".to_owned(),
-            saved_at: epoch_now() - DISK_RETENTION_SECS - 1,
-        };
-        std::fs::write(root.join("G/old.json"), kovi::serde_json::to_vec(&stale).unwrap()).unwrap();
-        std::fs::write(root.join("G/old"), b"stale-avatar").unwrap();
-        // 孤儿头像：没有对应 .json。
-        std::fs::write(root.join("G/orphan"), b"orphan").unwrap();
-
-        sweep_expired(&root);
-
-        assert!(root.join("G/live.json").is_file());
-        assert_eq!(std::fs::read(root.join("G/live")).unwrap(), b"avatar");
-        assert!(!root.join("G/old.json").exists());
-        assert!(!root.join("G/old").exists());
-        assert!(!root.join("G/orphan").exists());
-        std::fs::remove_dir_all(&root).unwrap();
+    async fn touch保留旧头像() {
+        let pool = test_pool().await;
+        upsert_profile(&pool, "G", "U", "旧名", Some(b"avatar"))
+            .await
+            .unwrap();
+        touch_profile(&pool, "G", "U", "新名").await.unwrap();
+        let info = load_profile(&pool, "G", "U").await.unwrap();
+        assert_eq!(info.nickname, "新名");
+        assert_eq!(&*info.avatar, b"avatar");
     }
 
     #[tokio::test]
-    async fn 无昵称记录时不作整条恢复() {
-        let root = temp_root("miss");
-        assert!(load_profile(&root, "G", "nobody").await.is_none());
-        // 只有头像没有 .json：不算可恢复的条目。
-        std::fs::create_dir_all(root.join("G")).unwrap();
-        std::fs::write(root.join("G/U"), b"x").unwrap();
-        assert!(load_profile(&root, "G", "U").await.is_none());
-        std::fs::remove_dir_all(&root).unwrap();
+    async fn touch新建行不丢昵称() {
+        let pool = test_pool().await;
+        touch_profile(&pool, "G", "U", "名字").await.unwrap();
+        let info = load_profile(&pool, "G", "U").await.unwrap();
+        assert_eq!(info.nickname, "名字");
+        assert!(info.avatar.is_empty());
+    }
+
+    #[tokio::test]
+    async fn 无字节upsert保留旧头像() {
+        let pool = test_pool().await;
+        upsert_profile(&pool, "G", "U", "n", Some(b"old"))
+            .await
+            .unwrap();
+        upsert_profile(&pool, "G", "U", "n2", None).await.unwrap();
+        assert_eq!(
+            &*load_profile(&pool, "G", "U").await.unwrap().avatar,
+            b"old"
+        );
+    }
+
+    #[tokio::test]
+    async fn 清扫删除超窗保留活跃() {
+        let pool = test_pool().await;
+        upsert_profile(&pool, "G", "live", "n", Some(b"a"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO MEMBER_PROFILE (group_id, user_id, nickname, avatar, saved_at)
+             VALUES ('G', 'old', 'n', NULL, ?)",
+        )
+        .bind(epoch_now() - PROFILE_RETENTION_SECS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        delete_expired_profiles(&pool).await.unwrap();
+
+        assert!(load_profile(&pool, "G", "old").await.is_none());
+        assert!(load_profile(&pool, "G", "live").await.is_some());
     }
 }

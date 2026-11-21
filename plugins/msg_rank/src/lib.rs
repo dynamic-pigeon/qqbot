@@ -34,7 +34,6 @@ async fn main() {
 
     db::init_db(&db_path).await.unwrap();
     plugin::drop(|| async move { db::flush_on_shutdown().await });
-    msg_rank::user_info::init(&path);
 
     CommandRouter::new("msg_rank", Arc::clone(&bot))
         .register(record_command())
@@ -116,6 +115,25 @@ async fn add_msg(event: Arc<dyn BotMsgEvent>) {
 
     if !config::CONFIG.get().recording_enabled(&group) {
         return;
+    }
+
+    // 发言即落盘昵称与头像（首见或 URL 变化才下载字节），不占消息采集路径。
+    {
+        let group = group.clone();
+        let user = user.clone();
+        let nickname = event.nickname().to_owned();
+        let card = event.card().map(str::to_owned);
+        let avatar_url = event.avatar_url();
+        kovi::spawn(async move {
+            msg_rank::user_info::observe(
+                &group,
+                &user,
+                &nickname,
+                card.as_deref(),
+                avatar_url.as_deref(),
+            )
+            .await;
+        });
     }
 
     let text = truncate_utf8(get_text(event.message()).await, MAX_STORED_MESSAGE_BYTES);

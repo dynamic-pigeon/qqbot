@@ -34,14 +34,35 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
         message_id,
     );
 
-    let text = strip_mentions(payload["content"].as_str().unwrap_or_default());
-    tracing::info!(
-        group = group_openid,
-        user = member_openid,
-        text = %text.chars().take(50).collect::<String>(),
-        "收到群消息事件"
-    );
-    let segments = build_segments(&text, &payload["attachments"]);
+    let raw_text = strip_mentions(payload["content"].as_str().unwrap_or_default());
+    // 引用回复时顶层 content 只剩空格，用户真正输入的正文与随信图片都
+    // 落在 msg_elements 里；被引用消息（message_type 102/103）是别人的
+    // 内容，不并入正文。
+    if payload["msg_elements"]
+        .as_array()
+        .is_some_and(|list| !list.is_empty())
+    {
+        tracing::debug!("携带 msg_elements 的群消息，原始载荷: {payload}");
+    }
+    let (text, element_attachments) = if raw_text.is_empty() {
+        text_from_msg_elements(&payload["msg_elements"])
+    } else {
+        (raw_text, Vec::new())
+    };
+    let mut attachments: Vec<&Value> = payload["attachments"]
+        .as_array()
+        .map(|list| list.iter().collect())
+        .unwrap_or_default();
+    attachments.extend(element_attachments);
+    let mut segments = Vec::new();
+    if let Some(reply) = reply_segment(payload) {
+        segments.push(reply);
+    }
+    let built = build_segments(&text, &attachments);
+    if built.is_empty() && segments.is_empty() {
+        tracing::debug!("群消息无可解析内容，原始载荷: {payload}");
+    }
+    segments.extend(built);
 
     Some(json!({
         "time": timestamp_to_epoch(payload["timestamp"].as_str()),
@@ -52,6 +73,45 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
         "avatar": avatar,
         "message_id": message_id,
         "message": segments,
+    }))
+}
+
+/// 引用回复转 reply 段：被引用消息（msg_elements 里 message_type=103 的
+/// 元素）的文本与图片直链内联在段数据里——平台没有按 id 回查消息的
+/// API，下游（图库回复取图）直接读段数据；id 取 message_scene.ext 的
+/// ref_msg_idx。
+fn reply_segment(payload: &Value) -> Option<Value> {
+    let quoted = payload["msg_elements"]
+        .as_array()?
+        .iter()
+        .find(|element| element["message_type"].as_i64() == Some(103))?;
+    let images: Vec<&str> = quoted["attachments"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|attachment| {
+                    attachment["content_type"]
+                        .as_str()
+                        .is_some_and(|mime| mime.starts_with("image/"))
+                })
+                .filter_map(|attachment| attachment["url"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let id = payload["message_scene"]["ext"].as_array().and_then(|ext| {
+        ext.iter().find_map(|entry| {
+            entry
+                .as_str()
+                .and_then(|kv| kv.strip_prefix("ref_msg_idx="))
+        })
+    });
+    Some(json!({
+        "type": "reply",
+        "data": {
+            "id": id,
+            "text": quoted["content"].as_str().unwrap_or_default(),
+            "images": images,
+        }
     }))
 }
 
@@ -69,13 +129,21 @@ fn translate_private(ctx: &Context, payload: &Value) -> Option<Value> {
         message_id,
     );
 
-    let text = payload["content"].as_str().unwrap_or_default().to_owned();
-    tracing::info!(
-        user = user_openid,
-        text = %text.chars().take(50).collect::<String>(),
-        "收到单聊消息事件"
-    );
-    let segments = build_segments(&text, &payload["attachments"]);
+    let raw_text = payload["content"].as_str().unwrap_or_default().to_owned();
+    let (text, element_attachments) = if raw_text.trim().is_empty() {
+        text_from_msg_elements(&payload["msg_elements"])
+    } else {
+        (raw_text, Vec::new())
+    };
+    let mut attachments: Vec<&Value> = payload["attachments"]
+        .as_array()
+        .map(|list| list.iter().collect())
+        .unwrap_or_default();
+    attachments.extend(element_attachments);
+    let segments = build_segments(&text, &attachments);
+    if segments.is_empty() {
+        tracing::debug!("单聊消息无可解析内容，原始载荷: {payload}");
+    }
 
     Some(json!({
         "time": timestamp_to_epoch(payload["timestamp"].as_str()),
@@ -87,12 +155,33 @@ fn translate_private(ctx: &Context, payload: &Value) -> Option<Value> {
     }))
 }
 
-fn build_segments(text: &str, attachments: &Value) -> Vec<Value> {
+/// 从 msg_elements 提取用户输入的正文与随信附件。message_type：
+/// 0=普通文本，102=聊天记录，103=引用消息；只取 0——102/103 是被引用
+/// 的他人内容，并入会污染消息统计与图库。
+fn text_from_msg_elements(elements: &Value) -> (String, Vec<&Value>) {
+    let mut parts: Vec<String> = Vec::new();
+    let mut attachments: Vec<&Value> = Vec::new();
+    for element in elements.as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        if element["message_type"].as_i64() != Some(0) {
+            continue;
+        }
+        let text = strip_mentions(element["content"].as_str().unwrap_or_default());
+        if !text.is_empty() {
+            parts.push(text);
+        }
+        if let Some(list) = element["attachments"].as_array() {
+            attachments.extend(list.iter());
+        }
+    }
+    (parts.join(" "), attachments)
+}
+
+fn build_segments(text: &str, attachments: &[&Value]) -> Vec<Value> {
     let mut segments = Vec::new();
     if !text.is_empty() {
         segments.push(json!({ "type": "text", "data": { "text": text } }));
     }
-    for attachment in attachments.as_array().unwrap_or(&Vec::new()) {
+    for attachment in attachments {
         let is_image = attachment["content_type"]
             .as_str()
             .is_some_and(|mime| mime.starts_with("image/"));
@@ -219,5 +308,73 @@ mod tests {
         assert_eq!(strip_mentions("a <@abc> b"), "a b");
         assert_eq!(strip_mentions("<@!abc>"), "");
         assert_eq!(strip_mentions("无标记 < 保持"), "无标记 < 保持");
+    }
+
+    #[test]
+    fn 引用回复生成reply段并保留正文() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "MSG-R1",
+            "group_openid": "GROUP-ABC",
+            "content": " 666",
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+            "message_scene": { "ext": ["ref_msg_idx=REFIDX_QUOTED", "msg_idx=REFIDX_SELF"] },
+            "msg_elements": [
+                {
+                    "message_type": 103,
+                    "content": "6",
+                    "attachments": [
+                        {
+                            "content_type": "image/jpeg",
+                            "url": "https://multimedia.nt.qq.com.cn/download?a=1",
+                        },
+                        {
+                            "content_type": "image/jpeg",
+                            "url": "https://multimedia.nt.qq.com.cn/download?a=2",
+                        },
+                    ],
+                },
+            ],
+        });
+        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
+        // 引用独立成段：被引文本、图片直链、ref_msg_idx 全部内联。
+        let reply = &event["message"][0];
+        assert_eq!(reply["type"], "reply");
+        assert_eq!(reply["data"]["id"], "REFIDX_QUOTED");
+        assert_eq!(reply["data"]["text"], "6");
+        assert_eq!(reply["data"]["images"].as_array().unwrap().len(), 2);
+        // 用户正文照常成段，被引图片不进正文图片段。
+        assert_eq!(event["message"][1]["type"], "text");
+        assert_eq!(event["message"][1]["data"]["text"], "666");
+        assert_eq!(event["message"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn 纯引用不打字只有reply段() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "MSG-R2",
+            "group_openid": "GROUP-ABC",
+            "content": " ",
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+            "message_scene": { "ext": ["ref_msg_idx=REFIDX_Q"] },
+            "msg_elements": [
+                {
+                    "message_type": 103,
+                    "content": "原消息",
+                    "attachments": [
+                        { "content_type": "image/png", "url": "https://media.example/q.png" },
+                    ],
+                },
+            ],
+        });
+        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
+        let segments = event["message"].as_array().unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0]["type"], "reply");
+        assert_eq!(
+            segments[0]["data"]["images"][0],
+            "https://media.example/q.png"
+        );
     }
 }

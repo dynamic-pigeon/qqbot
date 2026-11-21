@@ -122,7 +122,7 @@ plugins/kovi-official/               # 新 workspace 成员：官方 API 驱动
 |---|---|---|
 | 1 | 个人开发者能否开「接收所有消息」 | 不过则 msg_rank 采集、BV 监听死 |
 | 2 | `GROUP_MESSAGE_CREATE` 是否全量下发非 @ 消息 | 2026-11-20 沙箱实测通过：不 @ 直接发 `/help` 事件到达 |
-| 3 | 引用消息 `msg_elements` 能否取被引用消息的图 | image_lib 添加/删除交互 |
+| 3 | 引用消息 `msg_elements` 能否取被引用消息的图 | 2026-11-21 正式环境实测通过：被引消息在 `msg_elements` 的 `message_type=103` 元素（文本+图片直链+宽高），驱动转 reply 段（id=ref_msg_idx、text、images 内联），image_lib 回复取图直接读段数据；用户正文在顶层 `content`（文档所述「正文在 msg_elements」与实测不符） |
 | 4 | 图文卡片 msg_type 8 能否承载多图 | 查重展示首选替代 |
 | 5 | markdown msg_type 2 发送权限 | §7（机制已落地，无权限自动回退纯文本） |
 | 6 | `avatar` 字段覆盖率与 URL 时效 | 头像策略：首见即落盘，定时清扫未活跃缓存（URL 时效被本地缓存解耦） |

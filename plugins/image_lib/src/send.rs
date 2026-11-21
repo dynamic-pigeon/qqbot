@@ -328,11 +328,11 @@ mod tests {
         .unwrap();
         let bytes = b"\x89PNGfile-form".to_vec();
         let hash = utils::sha256_hex(&bytes);
-        let blobs = store.blobs_dir(1);
+        let blobs = store.blobs_dir("1");
         std::fs::create_dir_all(&blobs).unwrap();
         std::fs::write(blobs.join(&hash), &bytes).unwrap();
 
-        let image = OutgoingImage::from_blob(&store, 1, &hash).await.unwrap();
+        let image = OutgoingImage::from_blob(&store, "1", &hash).await.unwrap();
         assert_eq!(image.size(), bytes.len());
         let message = image_message(None, &[image]);
         let file = message
@@ -347,7 +347,7 @@ mod tests {
 
         // blob 已不在盘上时按图缺失处理
         std::fs::remove_file(blobs.join(&hash)).unwrap();
-        assert!(OutgoingImage::from_blob(&store, 1, &hash).await.is_none());
+        assert!(OutgoingImage::from_blob(&store, "1", &hash).await.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,7 +3,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
 use kovi::{Message, Segment, serde_json::Value};
 
 pub const MAX_ADD_IMAGES: usize = 25;
@@ -33,7 +32,8 @@ impl From<FetchError> for utils::command::CommandError {
 
 pub enum AddImageSource {
     Current,
-    Reply(i32),
+    /// reply 段：官方栈内联携带被引图片直链，OneBot 栈按段内 id 回查。
+    Reply(Segment),
     Missing,
 }
 
@@ -41,34 +41,11 @@ pub enum AddImageSource {
 pub fn resolve_add_source(message: &Message) -> AddImageSource {
     if message.iter().any(|segment| segment.kind == "image") {
         AddImageSource::Current
-    } else if let Some(reply_id) = extract_reply_id(message) {
-        AddImageSource::Reply(reply_id)
+    } else if let Some(reply) = message.iter().find(|segment| segment.kind == "reply") {
+        AddImageSource::Reply(reply.clone())
     } else {
         AddImageSource::Missing
     }
-}
-
-pub fn extract_reply_id(message: &Message) -> Option<i32> {
-    for segment in message.iter() {
-        if segment.kind != "reply" {
-            continue;
-        }
-        let id = segment.data.get("id")?;
-        if let Some(n) = id.as_i64() {
-            return i32::try_from(n).ok();
-        }
-        if let Some(s) = id.as_str() {
-            return s.parse().ok();
-        }
-    }
-    None
-}
-
-pub fn parse_message_segments(data: &Value) -> Result<Vec<Segment>> {
-    let message = data
-        .get("message")
-        .ok_or_else(|| anyhow!("get_msg 返回缺少 message"))?;
-    kovi::serde_json::from_value(message.clone()).context("解析引用消息段失败")
 }
 
 pub fn image_segments<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> Vec<&'a Segment> {
@@ -293,14 +270,14 @@ fn is_supported_image(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use kovi::{Message, serde_json::json};
-    use kovi_onebot::MessageRegistrar as _;
+    use utils::bot::MessageExt as _;
 
     use super::*;
 
     #[test]
     fn prefers_current_message_images_over_reply() {
         let with_image = Message::new()
-            .add_reply(1)
+            .add_reply("1")
             .add_image("https://gchat.qpic.cn/a.jpg")
             .add_text("添加 猫");
         assert!(matches!(
@@ -308,10 +285,10 @@ mod tests {
             AddImageSource::Current
         ));
 
-        let reply_only = Message::new().add_reply(1).add_text("添加 猫");
+        let reply_only = Message::new().add_reply("1").add_text("添加 猫");
         assert!(matches!(
             resolve_add_source(&reply_only),
-            AddImageSource::Reply(1)
+            AddImageSource::Reply(_)
         ));
 
         let neither = Message::new().add_text("添加 猫");
@@ -319,33 +296,6 @@ mod tests {
             resolve_add_source(&neither),
             AddImageSource::Missing
         ));
-    }
-
-    #[test]
-    fn extracts_reply_id_from_string_or_number() {
-        let from_str = Message::new().add_reply(42).add_text("删除");
-        assert_eq!(extract_reply_id(&from_str), Some(42));
-
-        let mut numeric = Message::new();
-        numeric.push(Segment {
-            kind: "reply".to_owned(),
-            data: json!({ "id": 99 }),
-        });
-        assert_eq!(extract_reply_id(&numeric), Some(99));
-        assert_eq!(extract_reply_id(&Message::new().add_text("删除")), None);
-    }
-
-    #[test]
-    fn parses_get_msg_image_segments() {
-        let data = json!({
-            "message": [
-                { "type": "text", "data": { "text": "hi" } },
-                { "type": "image", "data": { "url": "https://gchat.qpic.cn/a.jpg" } },
-                { "type": "image", "data": { "file": "https://multimedia.nt.qq.com.cn/x" } }
-            ]
-        });
-        let segments = parse_message_segments(&data).unwrap();
-        assert_eq!(image_segments(&segments).len(), 2);
     }
 
     #[test]
