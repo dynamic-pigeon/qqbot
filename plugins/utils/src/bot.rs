@@ -11,15 +11,23 @@ use std::sync::Arc;
 use kovi::Message;
 use kovi::RuntimeBot;
 
-/// 当前是否为官方栈。
-#[cfg(feature = "official")]
-pub fn is_official() -> bool {
-    true
+/// 机器人驱动栈。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stack {
+    Official,
+    OneBot,
 }
 
-#[cfg(not(feature = "official"))]
-pub fn is_official() -> bool {
-    false
+/// 当前装配的驱动栈。
+pub fn stack() -> Stack {
+    #[cfg(feature = "official")]
+    {
+        Stack::Official
+    }
+    #[cfg(not(feature = "official"))]
+    {
+        Stack::OneBot
+    }
 }
 
 // ── 消息构建 ──────────────────────────────────────────────────────────────

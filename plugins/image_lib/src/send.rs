@@ -149,7 +149,7 @@ pub(crate) async fn send_group_forward_wait(
     group: &str,
     nodes: &[Value],
 ) -> Result<(), SendFail> {
-    if utils::bot::is_official() {
+    if utils::bot::stack() == utils::bot::Stack::Official {
         return Err(SendFail::Api("官方 API 无合并转发".to_owned()));
     }
     let group_id: i64 = group

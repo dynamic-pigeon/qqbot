@@ -60,7 +60,6 @@ members = [
 ]
 
 [workspace.dependencies]
-help_msg = { path = "plugins/help_msg" }
 kovi = "0.13.5"
 kovi-onebot = "0.13.2"
 serde = { version = "1.0", features = ["derive"] }

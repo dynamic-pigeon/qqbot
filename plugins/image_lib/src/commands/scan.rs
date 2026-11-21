@@ -533,7 +533,7 @@ async fn reply_scan_page(
             })
             .collect();
         if let Err(error) = send_group_forward_wait(ctx.bot(), &group_id, &nodes).await {
-            if utils::bot::is_official() {
+            if utils::bot::stack() == utils::bot::Stack::Official {
                 // 官方栈没有合并转发：逐条发文字 + 图，消息形态不同但结果完整。
                 for packet in chunk {
                     let images = packet.images.iter().map(|image| &image.image);
