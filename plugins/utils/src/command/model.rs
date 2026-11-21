@@ -162,16 +162,7 @@ pub(crate) fn user_is_bot_admin(bot: &RuntimeBot, user_key: &str) -> bool {
             return false;
         }
     };
-    let matched = admins.iter().any(|id| id.to_string() == user_key);
-    if !matched {
-        // 排查期置 info：把两侧原值打出来，形态差异一眼可见；稳定后降级。
-        tracing::info!(
-            user = user_key,
-            admins = ?admins.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-            "管理员校验未命中"
-        );
-    }
-    matched
+    admins.iter().any(|id| id.to_string() == user_key)
 }
 
 #[derive(Clone)]

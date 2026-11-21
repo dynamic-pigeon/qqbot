@@ -40,14 +40,16 @@ pub async fn run(
     let mut ready_signal = Some(ready);
     loop {
         let outcome = connection(&ctx, &events, ready_signal.take()).await;
-        tracing::warn!(
-            "官方网关断开: {}，{} 秒后重连",
-            outcome.error,
-            backoff.as_secs()
-        );
         if outcome.was_ready {
+            // 例行断开（平台约一小时一轮换），立即重连。
+            tracing::debug!("官方网关例行断开: {}", outcome.error);
             backoff = Duration::from_secs(1);
         } else {
+            tracing::warn!(
+                "官方网关连接失败: {}，{} 秒后重连",
+                outcome.error,
+                backoff.as_secs()
+            );
             kovi::tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(60));
         }
@@ -241,7 +243,7 @@ async fn dispatch_frame(
                     *was_ready = true;
                 }
                 "RESUMED" => {
-                    tracing::info!("官方网关会话已恢复");
+                    tracing::debug!("官方网关会话已恢复");
                     *was_ready = true;
                 }
                 "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" | "C2C_MESSAGE_CREATE" => {
@@ -317,7 +319,7 @@ async fn resolve_endpoint(ctx: &Arc<Context>) -> String {
     match endpoint {
         Some(url) => url,
         None => {
-            tracing::warn!("接入点探测失败，使用默认地址");
+            tracing::debug!("接入点探测失败，使用默认地址");
             ctx.config.fallback_ws_url().to_owned()
         }
     }

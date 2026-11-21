@@ -30,6 +30,8 @@ pub trait MessageExt: Sized {
     fn add_image(self, file: &str) -> Self;
     /// @ 人：官方栈 id 是 openid，OneBot 栈是 QQ 号十进制串。
     fn add_at(self, id: &str) -> Self;
+    /// 引用回复：id 形态由栈决定（官方 ref_msg_idx 串 / OneBot 消息 id）。
+    fn add_reply(self, id: &str) -> Self;
     fn push_image(&mut self, file: &str);
 }
 
@@ -51,6 +53,14 @@ impl MessageExt for Message {
         self.push(kovi::message::Segment {
             kind: "at".to_owned(),
             data: kovi::serde_json::json!({ "qq": id }),
+        });
+        self
+    }
+
+    fn add_reply(mut self, id: &str) -> Self {
+        self.push(kovi::message::Segment {
+            kind: "reply".to_owned(),
+            data: kovi::serde_json::json!({ "id": id }),
         });
         self
     }
@@ -112,6 +122,10 @@ pub trait BotMsgEvent: Send + Sync {
     /// 群身份键；私聊为 None。
     fn group_key(&self) -> Option<String>;
     fn nickname(&self) -> &str;
+    /// 群名片；无名片或未知为 None。
+    fn card(&self) -> Option<&str>;
+    /// 头像 URL：官方栈来自事件（带时效，取用要及时），OneBot 栈按 QQ 号拼 qlogo。
+    fn avatar_url(&self) -> Option<String>;
     fn message(&self) -> &Message;
     /// 合并后的纯文本；纯图片消息为 None。
     fn text(&self) -> Option<&str>;
@@ -142,6 +156,17 @@ macro_rules! impl_bot_msg_event_for_onebot {
 
             fn nickname(&self) -> &str {
                 self.sender.nickname.as_deref().unwrap_or_default()
+            }
+
+            fn card(&self) -> Option<&str> {
+                self.sender.card.as_deref()
+            }
+
+            fn avatar_url(&self) -> Option<String> {
+                Some(format!(
+                    "https://q4.qlogo.cn/headimg_dl?dst_uin={}",
+                    self.user_id
+                ))
             }
 
             fn message(&self) -> &Message {
@@ -198,6 +223,14 @@ impl BotMsgEvent for kovi_official::event::MsgEvent {
 
     fn nickname(&self) -> &str {
         &self.nickname
+    }
+
+    fn card(&self) -> Option<&str> {
+        self.card.as_deref()
+    }
+
+    fn avatar_url(&self) -> Option<String> {
+        self.avatar.clone()
     }
 
     fn message(&self) -> &Message {
@@ -385,6 +418,75 @@ async fn send_official(
             ..
         }) => Err(message),
         Err(other) => Err(format!("retcode {}", other.retcode)),
+    }
+}
+
+// ── 引用消息 ──────────────────────────────────────────────────────────────
+
+/// 取 reply 段所引用消息里的图片段。官方栈的 reply 段由驱动内联携带
+/// 被引图片直链（平台没有按 id 回查消息的 API）；OneBot 栈按段内 id
+/// 调 get_msg 回查。
+pub async fn quoted_image_segments(
+    bot: &RuntimeBot,
+    reply: &kovi::message::Segment,
+) -> Result<Vec<kovi::message::Segment>, String> {
+    #[cfg(feature = "official")]
+    {
+        let _ = bot;
+        let images = reply
+            .data
+            .get("images")
+            .and_then(kovi::serde_json::Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|url| url.as_str())
+                    .map(|url| kovi::message::Segment {
+                        kind: "image".to_owned(),
+                        data: kovi::serde_json::json!({ "file": url, "url": url }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if images.is_empty() {
+            return Err("引用消息里没有图片".to_owned());
+        }
+        Ok(images)
+    }
+    #[cfg(not(feature = "official"))]
+    {
+        use kovi_onebot::OnebotTrait as _;
+        let id = reply
+            .data
+            .get("id")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<i64>().ok()))
+            })
+            .ok_or_else(|| "引用消息缺少 id".to_owned())?;
+        let id = i32::try_from(id).map_err(|_| "引用消息 id 非法".to_owned())?;
+        let response = bot.get_msg(id).await.map_err(|e| {
+            e.message
+                .unwrap_or_else(|| format!("retcode {}", e.retcode))
+        })?;
+        if response.status != "ok" {
+            return Err("无法读取引用的消息".to_owned());
+        }
+        let message = response
+            .data
+            .get("message")
+            .cloned()
+            .ok_or_else(|| "get_msg 返回缺少 message".to_owned())?;
+        let segments: Vec<kovi::message::Segment> = kovi::serde_json::from_value(message)
+            .map_err(|e| format!("解析引用消息段失败: {e}"))?;
+        let images: Vec<_> = segments
+            .into_iter()
+            .filter(|segment| segment.kind == "image")
+            .collect();
+        if images.is_empty() {
+            return Err("引用消息里没有图片".to_owned());
+        }
+        Ok(images)
     }
 }
 

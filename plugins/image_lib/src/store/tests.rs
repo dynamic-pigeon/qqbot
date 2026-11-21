@@ -562,7 +562,7 @@ fn photo_like_jpeg(seed: u32, keep_percent: Option<u32>) -> Vec<u8> {
 }
 
 fn group_db(dir: &std::path::Path, group: &str) -> PathBuf {
-    dir.join(group.to_string()).join("index.db")
+    dir.join(group).join("index.db")
 }
 
 async fn sqlite_pool(db: &std::path::Path, writable: bool) -> sqlx::SqlitePool {
@@ -924,13 +924,10 @@ async fn deleted_blob_survives_window() {
 
     let day = 20_725;
     store.backup_daily_at(day).await;
-    let group_backup = dir
-        .join("backups")
-        .join(date_string(day))
-        .join(group.to_string());
+    let group_backup = dir.join("backups").join(date_string(day)).join(group);
     assert!(group_backup.join("index.db").is_file());
     let hash = sha256_hex(&a);
-    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    let live_blob = dir.join(group).join("blobs").join(&hash);
 
     // 删除只清索引行,文件留在原位等对账回收。
     store.delete_hash(group, &hash).await.unwrap();
@@ -963,7 +960,7 @@ async fn orphans_reclaimed_immediately() {
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let hash = sha256_hex(&a);
-    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    let live_blob = dir.join(group).join("blobs").join(&hash);
 
     // 从没被任何备份指向过的图,删除后没有保护期。
     store.delete_hash(group, &hash).await.unwrap();
@@ -1072,7 +1069,7 @@ async fn custom_retained_days_shortens_both_expiries() {
     let day = 20_000;
     store.backup_daily_at(day).await;
     let hash = sha256_hex(&a);
-    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    let live_blob = dir.join(group).join("blobs").join(&hash);
 
     store.delete_hash(group, &hash).await.unwrap();
     store.reconcile_all_at(day + 1).await;
@@ -1098,7 +1095,7 @@ async fn wiped_files_kept_till_expiry() {
     let day = 20_000;
     store.backup_daily_at(day).await;
     let hash = sha256_hex(&a);
-    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    let live_blob = dir.join(group).join("blobs").join(&hash);
 
     store.wipe_canonical_library(group, "猫").await.unwrap();
     assert!(live_blob.is_file(), "清库不得物理删除文件");
@@ -1141,7 +1138,7 @@ async fn snapshot_carries_prev_refs() {
     let snap = dir
         .join("backups")
         .join(date_string(20_001))
-        .join(group.to_string())
+        .join(group)
         .join("index.db");
     let pool = sqlite_pool(&snap, false).await;
     let row = sqlx::query("SELECT COUNT(*) AS n, MAX(last_backup_day) AS d FROM backup_refs")
@@ -1160,7 +1157,7 @@ async fn backup_gap_keeps_lockstep() {
     let a = png_like(1);
     must_add(&store, group, "猫", vec![a.clone()]).await;
     let hash = sha256_hex(&a);
-    let live_blob = dir.join(group.to_string()).join("blobs").join(&hash);
+    let live_blob = dir.join(group).join("blobs").join(&hash);
     // 真实顺序:备份过,然后删除,随后停机。
     store.backup_daily_at(20_000).await;
     store.delete_hash(group, &hash).await.unwrap();

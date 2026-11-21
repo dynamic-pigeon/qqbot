@@ -155,8 +155,7 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
                     .map_err(|e| ActionError::platform(e.to_string()))?;
                 ctx.limiter.acquire(&conversation).await;
                 let passive = ctx.inbound.take_reply_slot(&conversation);
-                post_message(ctx, &scope, &send_body("", Some(&media), passive.as_ref()))
-                    .await?;
+                post_message(ctx, &scope, &send_body("", Some(&media), passive.as_ref())).await?;
             }
             (id, fallback)
         }
@@ -183,8 +182,7 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
                     .map_err(|e| ActionError::platform(e.to_string()))?;
                 ctx.limiter.acquire(&conversation).await;
                 let passive = ctx.inbound.take_reply_slot(&conversation);
-                post_message(ctx, &scope, &send_body("", Some(&media), passive.as_ref()))
-                    .await?;
+                post_message(ctx, &scope, &send_body("", Some(&media), passive.as_ref())).await?;
             }
             (sent, false)
         }

@@ -164,6 +164,12 @@ fn init_buffer() {
                     if let Err(e) = delete_expired_messages().await {
                         tracing::error!("清理过期消息失败: {e}");
                     }
+                    if let Ok(pool) = get_pool()
+                        && let Err(e) =
+                            crate::msg_rank::user_info::delete_expired_profiles(pool).await
+                    {
+                        tracing::error!("清理过期成员资料失败: {e}");
+                    }
                 }
                 _ = &mut shutdown_rx => {
                     while let Ok(record) = rx.try_recv() {
@@ -517,6 +523,27 @@ ON MSG (timestamp);
         .execute(pool)
         .await?;
 
+    ensure_member_profile_table(pool).await?;
+    Ok(())
+}
+
+/// 成员资料缓存表：昵称 + 头像 URL + 头像字节 + 落库时间。
+/// 建表语句独立成函数供 user_info 的内存库单测复用。
+pub(crate) async fn ensure_member_profile_table(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "
+CREATE TABLE IF NOT EXISTS MEMBER_PROFILE (
+    group_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    nickname TEXT NOT NULL,
+    avatar BLOB,
+    saved_at INTEGER NOT NULL,
+    PRIMARY KEY (group_id, user_id)
+);
+",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -609,7 +636,7 @@ SELECT group_id, user_id, msg, timestamp FROM MSG;
 }
 
 #[inline(always)]
-fn get_pool() -> Result<&'static SqlitePool> {
+pub(crate) fn get_pool() -> Result<&'static SqlitePool> {
     SQLITE_POOL
         .get()
         .ok_or_else(|| anyhow::anyhow!("数据库未初始化"))

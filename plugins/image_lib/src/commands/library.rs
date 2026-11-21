@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use kovi::Segment;
-use kovi_onebot::OnebotTrait;
 use utils::command::{
     Command, CommandContext, CommandError, CommandResult, MessageScope, Permission,
 };
@@ -9,8 +8,8 @@ use utils::{RateLimiter, sha256_hex};
 
 use crate::confirm::WipeConfirmations;
 use crate::fetch::{
-    AddImageSource, FetchError, MAX_ADD_IMAGES, load_image_bytes, parse_message_segments,
-    resolve_add_source, select_images, stage_image,
+    AddImageSource, FetchError, MAX_ADD_IMAGES, load_image_bytes, resolve_add_source,
+    select_images, stage_image,
 };
 use crate::name::parse_library_name;
 use crate::send::{OutgoingImage, image_message, report_send_fail, send_group_wait};
@@ -424,29 +423,22 @@ async fn collect_image_segments(
             let images = select_images(message.iter(), max, single)?;
             Ok(images.into_iter().cloned().collect())
         }
-        AddImageSource::Reply(reply_id) => replied_image_segments(ctx, reply_id, max, single).await,
+        AddImageSource::Reply(reply) => replied_image_segments(ctx, &reply, max, single).await,
         AddImageSource::Missing => Err(CommandError::user(missing_hint)),
     }
 }
 
 async fn replied_image_segments(
     ctx: &CommandContext,
-    reply_id: i32,
+    reply: &Segment,
     max: usize,
     single: bool,
 ) -> Result<Vec<Segment>, CommandError> {
-    let response = ctx
-        .bot()
-        .get_msg(reply_id)
+    let images = utils::bot::quoted_image_segments(ctx.bot(), reply)
         .await
         .map_err(|_| FetchError::MessageUnavailable)?;
-    if response.status != "ok" {
-        return Err(FetchError::MessageUnavailable.into());
-    }
-    let segments =
-        parse_message_segments(&response.data).map_err(|_| FetchError::MessageUnavailable)?;
-    let images = select_images(&segments, max, single)?;
-    Ok(images.into_iter().cloned().collect())
+    let selected = select_images(&images, max, single)?;
+    Ok(selected.into_iter().cloned().collect())
 }
 
 async fn load_replied_bytes(segments: &[Segment]) -> Result<Vec<Vec<u8>>, CommandError> {

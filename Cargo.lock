@@ -1600,7 +1600,6 @@ dependencies = [
  "async-channel",
  "image",
  "kovi",
- "kovi-onebot",
  "opencv",
  "rand 0.10.3",
  "reqwest",

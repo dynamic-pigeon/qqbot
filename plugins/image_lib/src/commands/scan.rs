@@ -497,7 +497,7 @@ async fn read_group_images(
 ) -> (Vec<PackedImage>, bool) {
     let mut images = Vec::new();
     for hash in hashes {
-        if let Some(image) = OutgoingImage::from_blob(store, &group_id, hash).await {
+        if let Some(image) = OutgoingImage::from_blob(store, group_id, hash).await {
             images.push(PackedImage {
                 hash: hash.clone(),
                 image,

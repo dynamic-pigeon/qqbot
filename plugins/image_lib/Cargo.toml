@@ -13,7 +13,6 @@ async-channel.workspace = true
 anyhow.workspace = true
 image = { workspace = true, features = ["bmp", "gif", "webp"] }
 kovi.workspace = true
-kovi-onebot.workspace = true
 opencv.workspace = true
 rand.workspace = true
 reqwest.workspace = true
