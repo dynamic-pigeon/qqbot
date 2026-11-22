@@ -44,7 +44,7 @@ impl MediaScope {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MediaSource {
     Url(String),
     Bytes {
@@ -97,6 +97,9 @@ where
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 const LONG_TTL_FALLBACK: Duration = Duration::from_secs(60 * 60);
 
+/// 上传类请求的超时（官方 SDK 同款 120 秒），覆盖 client 默认 30 秒。
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct MediaStore {
     inner: std::sync::Mutex<HashMap<String, (String, Instant)>>,
 }
@@ -132,6 +135,7 @@ pub(crate) fn sniff_content_type(data: &[u8]) -> (&'static str, &'static str) {
 
 /// 嵌图引用：URL + 像素宽高。markdown 图片语法必须带宽高，
 /// 否则渲染成 `[img]` 纯文本。
+#[derive(Clone)]
 pub(crate) struct MaterialRef {
     pub url: String,
     pub width: u32,
@@ -289,6 +293,7 @@ pub(crate) async fn material_url(
     // 2. 预签名 PUT 直传（不能带 Authorization 头，COS 只认预签名）
     let put = http
         .put(&parsed.presigned_url)
+        .timeout(UPLOAD_TIMEOUT)
         .header("Content-Type", content_type)
         .body(data.clone())
         .send()
@@ -385,7 +390,8 @@ impl MediaStore {
             return Ok(cached);
         }
 
-        let mut body = json!({ "file_type": 1 });
+        // srv_send_msg=false：只取 file_info 由发送接口发出，直发会占主动消息频次。
+        let mut body = json!({ "file_type": 1, "srv_send_msg": false });
         match &source {
             MediaSource::Url(url) => {
                 body["url"] = json!(url);
@@ -400,6 +406,7 @@ impl MediaStore {
         let authorization = token.authorization().await?;
         let response = http
             .post(format!("{}{}", api_base, scope.upload_path()))
+            .timeout(UPLOAD_TIMEOUT)
             .header("Authorization", authorization)
             .json(&body)
             .send()

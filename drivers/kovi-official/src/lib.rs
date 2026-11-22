@@ -36,6 +36,7 @@ pub(crate) struct Context {
     pub(crate) media: media::MediaStore,
     pub(crate) limiter: rate_limit::SendRateLimiter,
     pub(crate) inbound: passive::RecentInbound,
+    pub(crate) seen: inbound::SeenMessages,
     pub(crate) session: std::sync::Mutex<Option<gateway::Session>>,
 }
 
@@ -51,7 +52,11 @@ impl Context {
     }
 
     fn build(config: OfficialDriverConfig) -> Self {
-        let http = reqwest::Client::new();
+        // 官方 SDK 口径：REST 默认 30 秒超时，上传类请求单独放宽（media.rs）。
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("固定配置的 reqwest client 必然合法");
         let token = token::TokenManager::new(
             http.clone(),
             config.app_id.clone(),
@@ -66,6 +71,7 @@ impl Context {
             // 官方频控：单会话每分钟 20 条（群与单聊同标准）。
             limiter: rate_limit::SendRateLimiter::new(Duration::from_secs(60), 20),
             inbound: passive::RecentInbound::new(),
+            seen: inbound::SeenMessages::new(),
             session: std::sync::Mutex::new(None),
         }
     }

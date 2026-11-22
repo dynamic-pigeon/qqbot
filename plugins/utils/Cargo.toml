@@ -17,7 +17,7 @@ official = ["dep:kovi-official"]
 [dependencies]
 kovi.workspace = true
 kovi-onebot.workspace = true
-kovi-official = { path = "../kovi-official", optional = true }
+kovi-official = { path = "../../drivers/kovi-official", optional = true }
 base64.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true

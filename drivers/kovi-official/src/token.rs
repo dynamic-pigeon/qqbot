@@ -1,7 +1,8 @@
 //! access_token 的获取与刷新。
 //!
 //! 官方接口：`POST https://api.bot.qq.com/app/getAppAccessToken`，
-//! 请求体 `{ appId, clientSecret }`，返回 `{ access_token, expires_in }`（默认 7200 秒）。
+//! 请求体 `{ appId, clientSecret }`，返回 `{ access_token, expires_in }`
+//! （文档标称 7200 秒，实测约 9 分钟）。
 //! 所有 REST / WS 鉴权统一用 `Authorization: QQBot {token}`。
 
 use std::time::Duration;
@@ -78,6 +79,8 @@ impl TokenManager {
         let response = self
             .http
             .post(TOKEN_ENDPOINT)
+            // 官方 SDK 对 token 请求单独设 10 秒超时。
+            .timeout(Duration::from_secs(10))
             .json(&body)
             .send()
             .await
@@ -113,6 +116,11 @@ impl TokenManager {
             expire_at,
         });
         Ok(format!("QQBot {}", parsed.access_token))
+    }
+
+    /// 丢弃缓存票据，下次鉴权重新获取（WS 关闭码 4004、op 9 不可恢复时）。
+    pub(crate) async fn invalidate(&self) {
+        *self.state.lock().await = None;
     }
 }
 

@@ -87,49 +87,13 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
 
     let passive = pick_passive(&ctx.inbound, &conversation, params["reply_to"].as_str());
 
-    let (sent_message_id, markdown_fallback) = match markdown_content_of(&plan) {
-        Some(content) => {
-            // 文本与图片合成一条 markdown：公网 URL 直接嵌，本地图先经素材
-            // 接口拿 qqbot-media:// 引用；嵌入失败的图转独立图片消息补发。
-            let mut embeds: Vec<crate::media::MaterialRef> = Vec::new();
-            let mut standalone: Vec<MediaSource> = Vec::new();
-            for source in &plan.images {
-                match source {
-                    MediaSource::Url(url) => match remote_dimensions(ctx, url).await {
-                        Some((width, height)) => embeds.push(crate::media::MaterialRef {
-                            url: url.clone(),
-                            width,
-                            height,
-                        }),
-                        None => {
-                            tracing::warn!("远程图尺寸嗅探失败，改独立图片消息: {url}");
-                            standalone.push(source.clone());
-                        }
-                    },
-                    local => {
-                        match crate::media::material_url(
-                            &ctx.http,
-                            &ctx.token,
-                            ctx.config.api_base(),
-                            &ctx.media,
-                            local,
-                        )
-                        .await
-                        {
-                            Ok(reference) => embeds.push(reference),
-                            Err(e) => {
-                                tracing::warn!("markdown 嵌图失败，改独立图片消息: {e}");
-                                standalone.push(local.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            let markdown = compose_markdown(&content, &embeds);
+    let (sent_message_id, markdown_fallback) = match compose_markdown_plan(ctx, &plan).await {
+        Some(composed) => {
+            let mut standalone = composed.standalone;
             let (id, fallback) = match post_message(
                 ctx,
                 &scope,
-                &markdown_body(&markdown, passive.as_ref()),
+                &markdown_body(&composed.markdown, passive.as_ref()),
             )
             .await
             {
@@ -138,14 +102,21 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
                     tracing::warn!("markdown 发送被拒，回退纯文本: {markdown_error}");
                     // 整条被拒时嵌入的图也没送达，一并转独立图片消息。
                     standalone.extend(
-                        embeds
+                        composed
+                            .embeds
                             .iter()
                             .map(|image| MediaSource::Url(image.url.clone())),
                     );
-                    let id =
-                        post_message(ctx, &scope, &send_body(&content, None, passive.as_ref()))
-                            .await
-                            .map_err(|_| markdown_error)?;
+                    // 相同 (msg_id, msg_seq) 会被平台判重，回退发送重新取槽位。
+                    let fallback_passive =
+                        pick_passive(&ctx.inbound, &conversation, params["reply_to"].as_str());
+                    let id = post_message(
+                        ctx,
+                        &scope,
+                        &send_body(&composed.text, None, fallback_passive.as_ref()),
+                    )
+                    .await
+                    .map_err(|_| markdown_error)?;
                     (id, true)
                 }
             };
@@ -161,7 +132,10 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
         }
         // 纯图片消息：第一张带被动引用，其余逐张消耗槽位补发。
         None => {
-            let mut images = plan.images.into_iter();
+            let mut images = plan.parts.into_iter().filter_map(|part| match part {
+                PlanPart::Image(source) => Some(source),
+                PlanPart::Text(_) => None,
+            });
             let primary_media = match images.next() {
                 Some(source) => Some(
                     upload_media(ctx, &scope, source)
@@ -173,7 +147,7 @@ async fn official_send(ctx: &Context, params: &Value) -> Result<Value, ActionErr
             let sent = post_message(
                 ctx,
                 &scope,
-                &send_body(&plan.text, primary_media.as_deref(), passive.as_ref()),
+                &send_body("", primary_media.as_deref(), passive.as_ref()),
             )
             .await?;
             for source in images {
@@ -211,55 +185,48 @@ fn pick_passive(
     }
 }
 
-#[derive(Debug)]
-struct SendPlan {
-    text: String,
-    images: Vec<MediaSource>,
-    markdown: Option<String>,
+#[derive(Debug, PartialEq)]
+enum PlanPart {
+    Text(String),
+    Image(MediaSource),
 }
 
-/// 文本一律 markdown：显式 markdown 段优先，其次文本段；纯图消息返回 None。
-fn markdown_content_of(plan: &SendPlan) -> Option<String> {
-    plan.markdown
-        .clone()
-        .or_else(|| (!plan.text.is_empty()).then(|| plan.text.clone()))
+#[derive(Debug)]
+struct SendPlan {
+    parts: Vec<PlanPart>,
 }
 
 fn parse_segments(message: &Value) -> Result<SendPlan, ActionError> {
     let segments = message
         .as_array()
         .ok_or_else(|| ActionError::param("message 不是消息段数组"))?;
-    let mut plan = SendPlan {
-        text: String::new(),
-        images: Vec::new(),
-        markdown: None,
-    };
+    let mut plan = SendPlan { parts: Vec::new() };
 
     for segment in segments {
         let kind = segment["type"].as_str().unwrap_or_default();
         match kind {
             "text" => {
                 if let Some(text) = segment["data"]["text"].as_str() {
-                    plan.text.push_str(text);
+                    plan.parts.push(PlanPart::Text(text.to_owned()));
                 }
             }
             "markdown" => {
                 let content = segment["data"]["content"]
                     .as_str()
                     .ok_or_else(|| ActionError::param("markdown 段缺少 content"))?;
-                plan.markdown = Some(content.to_owned());
+                plan.parts.push(PlanPart::Text(content.to_owned()));
             }
             "image" => {
                 let file = segment["data"]["file"]
                     .as_str()
                     .ok_or_else(|| ActionError::param("image 段缺少 file"))?;
-                plan.images.push(image_source(file)?);
+                plan.parts.push(PlanPart::Image(image_source(file)?));
             }
             "at" => {
                 let openid = segment["data"]["qq"]
                     .as_str()
                     .ok_or_else(|| ActionError::param("at 段缺少 openid"))?;
-                plan.text.push_str(&format!(" <@{openid}>"));
+                plan.parts.push(PlanPart::Text(format!(" <@{openid}>")));
             }
             // 引用由 reply_to 参数承载，事件层的 reply_and_quote 不产生该段；
             // 容忍外部构造的消息里出现。
@@ -268,6 +235,103 @@ fn parse_segments(message: &Value) -> Result<SendPlan, ActionError> {
         }
     }
     Ok(plan)
+}
+
+/// 文本与图片按消息段原顺序合成一条 markdown：公网 URL 直接嵌，本地图先
+/// 经素材接口拿 qqbot-media:// 引用；嵌入失败的图转独立图片消息补发。
+/// 无文本段（纯图）返回 None，走 msg_type=7。
+struct ComposedMarkdown {
+    markdown: String,
+    /// 回退纯文本用的正文（全部文本段拼接）。
+    text: String,
+    embeds: Vec<crate::media::MaterialRef>,
+    standalone: Vec<MediaSource>,
+}
+
+async fn compose_markdown_plan(ctx: &Context, plan: &SendPlan) -> Option<ComposedMarkdown> {
+    let has_text = plan
+        .parts
+        .iter()
+        .any(|part| matches!(part, PlanPart::Text(text) if !text.trim().is_empty()));
+    if !has_text {
+        return None;
+    }
+    let mut pieces: Vec<MarkdownPiece> = Vec::new();
+    let mut text = String::new();
+    let mut embeds = Vec::new();
+    let mut standalone = Vec::new();
+    for part in &plan.parts {
+        match part {
+            PlanPart::Text(content) => {
+                text.push_str(content);
+                pieces.push(MarkdownPiece::Text(content.clone()));
+            }
+            PlanPart::Image(source) => match embed_reference(ctx, source).await {
+                Ok(reference) => {
+                    pieces.push(MarkdownPiece::Embed(reference.clone()));
+                    embeds.push(reference);
+                }
+                Err(reason) => {
+                    tracing::warn!("markdown 嵌图失败，改独立图片消息: {reason}");
+                    standalone.push(source.clone());
+                }
+            },
+        }
+    }
+    Some(ComposedMarkdown {
+        markdown: compose_markdown(&pieces),
+        text,
+        embeds,
+        standalone,
+    })
+}
+
+enum MarkdownPiece {
+    Text(String),
+    Embed(crate::media::MaterialRef),
+}
+
+/// 图片语法必须带像素宽高，否则平台渲染成 `[img]` 纯文本。
+fn compose_markdown(pieces: &[MarkdownPiece]) -> String {
+    let mut markdown = String::new();
+    for piece in pieces {
+        match piece {
+            MarkdownPiece::Text(text) => markdown.push_str(text),
+            MarkdownPiece::Embed(image) => {
+                markdown.push_str(&format!(
+                    "\n\n![img #{}px #{}px]({})\n\n",
+                    image.width, image.height, image.url
+                ));
+            }
+        }
+    }
+    markdown.trim().to_owned()
+}
+
+/// 解析一个图片段的 markdown 嵌入引用：URL 嗅探宽高，本地图走素材接口。
+async fn embed_reference(
+    ctx: &Context,
+    source: &MediaSource,
+) -> Result<crate::media::MaterialRef, String> {
+    match source {
+        MediaSource::Url(url) => remote_dimensions(ctx, url)
+            .await
+            .map(|(width, height)| crate::media::MaterialRef {
+                url: url.clone(),
+                width,
+                height,
+            })
+            .ok_or_else(|| format!("远程图尺寸嗅探失败: {url}")),
+        local => crate::media::material_url(
+            &ctx.http,
+            &ctx.token,
+            ctx.config.api_base(),
+            &ctx.media,
+            local,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+    }
 }
 
 fn image_source(file: &str) -> Result<MediaSource, ActionError> {
@@ -286,19 +350,6 @@ fn image_source(file: &str) -> Result<MediaSource, ActionError> {
     } else {
         Err(ActionError::param(format!("不支持的图片 URI: {file}")))
     }
-}
-
-/// 文本与嵌入引用合成 markdown。图片语法必须带像素宽高，
-/// 否则平台渲染成 `[img]` 纯文本。
-fn compose_markdown(content: &str, embeds: &[crate::media::MaterialRef]) -> String {
-    let mut markdown = content.to_owned();
-    for image in embeds {
-        markdown.push_str(&format!(
-            "\n\n![img #{}px #{}px]({})",
-            image.width, image.height, image.url
-        ));
-    }
-    markdown
 }
 
 /// 下载远程图并嗅探尺寸；markdown 嵌图需要宽高，取不到就转独立图片消息。
@@ -334,9 +385,8 @@ fn send_body(content: &str, media: Option<&str>, passive: Option<&(String, u32)>
         Some(file_info) => {
             body["msg_type"] = json!(7);
             body["media"] = json!({ "file_info": file_info });
-            if !content.is_empty() {
-                body["content"] = json!(content);
-            }
+            // send.md：msg_type=7 时 content 需填值，空文本用一个空格。
+            body["content"] = json!(if content.is_empty() { " " } else { content });
         }
         None => {
             body["msg_type"] = json!(0);
@@ -417,17 +467,24 @@ mod tests {
     use kovi::futures_util::FutureExt;
 
     #[test]
-    fn 消息段解析文本图片markdown() {
+    fn 消息段解析保持顺序() {
         let message = json!([
-            { "type": "text", "data": { "text": "榜单：" } },
-            { "type": "markdown", "data": { "content": "**今日榜**" } },
+            { "type": "text", "data": { "text": "标题" } },
             { "type": "image", "data": { "file": "https://cdn.example/wc.png" } },
+            { "type": "markdown", "data": { "content": "**今日榜**" } },
         ]);
         let plan = parse_segments(&message).unwrap();
-        assert_eq!(plan.text, "榜单：");
-        assert_eq!(plan.markdown.as_deref(), Some("**今日榜**"));
-        assert_eq!(plan.images.len(), 1);
-        assert!(matches!(plan.images[0], MediaSource::Url(_)));
+        let mut parts = plan.parts.into_iter();
+        assert_eq!(parts.next().unwrap(), PlanPart::Text("标题".to_owned()));
+        assert!(matches!(
+            parts.next().unwrap(),
+            PlanPart::Image(MediaSource::Url(_))
+        ));
+        assert_eq!(
+            parts.next().unwrap(),
+            PlanPart::Text("**今日榜**".to_owned())
+        );
+        assert!(parts.next().is_none());
     }
 
     #[test]
@@ -437,7 +494,15 @@ mod tests {
             { "type": "at", "data": { "qq": "MEMBER-9" } },
         ]);
         let plan = parse_segments(&message).unwrap();
-        assert_eq!(plan.text, "恭喜 <@MEMBER-9>");
+        let text: String = plan
+            .parts
+            .into_iter()
+            .filter_map(|part| match part {
+                PlanPart::Text(text) => Some(text),
+                PlanPart::Image(_) => None,
+            })
+            .collect();
+        assert_eq!(text, "恭喜 <@MEMBER-9>");
     }
 
     #[test]
@@ -466,49 +531,43 @@ mod tests {
     }
 
     #[test]
-    fn 文本形态决策() {
-        let mut plan = SendPlan {
-            text: String::new(),
-            images: Vec::new(),
-            markdown: None,
-        };
-        // 纯图：None
-        plan.images
-            .push(image_source("https://a.example/x.png").unwrap());
-        assert_eq!(markdown_content_of(&plan), None);
-        // 文 + 图：文本按 markdown
-        plan.text = "今日词云".to_owned();
-        assert_eq!(markdown_content_of(&plan).as_deref(), Some("今日词云"));
-        // 纯文本
-        plan.images.clear();
-        assert_eq!(markdown_content_of(&plan).as_deref(), Some("今日词云"));
-        // 显式 markdown 优先于文本段
-        plan.markdown = Some("**已加粗**".to_owned());
-        assert_eq!(markdown_content_of(&plan).as_deref(), Some("**已加粗**"));
-    }
-
-    #[test]
-    fn markdown嵌图合成带尺寸() {
-        let composed = compose_markdown(
-            "今日词云",
-            &[
-                crate::media::MaterialRef {
-                    url: "qqbot-media://image/v1/TOKEN".to_owned(),
-                    width: 800,
-                    height: 400,
-                },
-                crate::media::MaterialRef {
-                    url: "https://cdn.example/cover.jpg".to_owned(),
-                    width: 320,
-                    height: 208,
-                },
-            ],
-        );
+    fn markdown合成按段序嵌图带尺寸() {
+        use crate::media::MaterialRef;
+        let composed = compose_markdown(&[
+            MarkdownPiece::Text("标题".to_owned()),
+            MarkdownPiece::Embed(MaterialRef {
+                url: "qqbot-media://image/v1/TOKEN".to_owned(),
+                width: 800,
+                height: 400,
+            }),
+            MarkdownPiece::Text("数据行".to_owned()),
+            MarkdownPiece::Embed(MaterialRef {
+                url: "https://cdn.example/cover.jpg".to_owned(),
+                width: 320,
+                height: 208,
+            }),
+        ]);
         assert_eq!(
             composed,
-            "今日词云\n\n![img #800px #400px](qqbot-media://image/v1/TOKEN)\n\n![img #320px #208px](https://cdn.example/cover.jpg)"
+            "标题\n\n![img #800px #400px](qqbot-media://image/v1/TOKEN)\n\n数据行\n\n![img #320px #208px](https://cdn.example/cover.jpg)"
         );
-        assert_eq!(compose_markdown("纯文本", &[]), "纯文本");
+        // 图在段首时裁掉前导空行。
+        let image_first = compose_markdown(&[
+            MarkdownPiece::Embed(MaterialRef {
+                url: "https://cdn.example/a.jpg".to_owned(),
+                width: 100,
+                height: 50,
+            }),
+            MarkdownPiece::Text("卡片信息".to_owned()),
+        ]);
+        assert_eq!(
+            image_first,
+            "![img #100px #50px](https://cdn.example/a.jpg)\n\n卡片信息"
+        );
+        assert_eq!(
+            compose_markdown(&[MarkdownPiece::Text("纯文本".to_owned())]),
+            "纯文本"
+        );
     }
 
     #[test]
@@ -558,6 +617,9 @@ mod tests {
         assert_eq!(media["msg_type"], 7);
         assert_eq!(media["media"]["file_info"], "file-info-x");
         assert_eq!(media["msg_seq"], 2);
+        // send.md 要求 msg_type=7 填 content，纯图空文本落成一个空格。
+        let pure_image = send_body("", Some("file-info-x"), None);
+        assert_eq!(pure_image["content"], " ");
 
         let active = send_body("纯文本", None, None);
         assert_eq!(active["msg_type"], 0);

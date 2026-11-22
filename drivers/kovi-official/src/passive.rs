@@ -1,7 +1,7 @@
 //! 被动回复路由。
 //!
-//! 官方模型：携带 msg_id 的发送是「被动回复」，每条用户消息最多回 5 次
-//! （群主 / 管理员身份 50 次），窗口 60 分钟；不带 msg_id 的是「主动消息」，
+//! 官方模型：携带 msg_id 的发送是「被动回复」，每条用户消息最多回 5 次，
+//! 窗口群 5 分钟、单聊 60 分钟（send.md）；不带 msg_id 的是「主动消息」，
 //! 需平台单独授权（实测默认无权限，HTTP 400 err_code 40034105）。kovi 侧
 //! 的 `reply()` 在 action 层没有携带原消息 id，这里按会话记录最近收到的
 //! 用户消息，发送时挑还有余量的那条作被动回复——没有引用目标的发送
@@ -10,8 +10,18 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const PASSIVE_WINDOW: Duration = Duration::from_secs(60 * 60);
+const GROUP_PASSIVE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const USER_PASSIVE_WINDOW: Duration = Duration::from_secs(60 * 60);
 const MAX_REPLIES_PER_MESSAGE: u32 = 5;
+
+/// 会话键首段即会话类型（`g:` 群 / `u:` 单聊），窗口随之取值。
+fn passive_window(conversation: &str) -> Duration {
+    if conversation.starts_with("g:") {
+        GROUP_PASSIVE_WINDOW
+    } else {
+        USER_PASSIVE_WINDOW
+    }
+}
 
 pub struct RecentInbound {
     inner: std::sync::Mutex<HashMap<String, Vec<InboundMessage>>>,
@@ -60,7 +70,9 @@ impl RecentInbound {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let queue = map.get_mut(conversation)?;
         let now = Instant::now();
-        queue.retain(|message| now.duration_since(message.received_at) < PASSIVE_WINDOW);
+        queue.retain(|message| {
+            now.duration_since(message.received_at) < passive_window(conversation)
+        });
         // 从最新往回找第一条还有回复余量的消息。
         let chosen = queue
             .iter_mut()
@@ -79,7 +91,9 @@ impl RecentInbound {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let queue = map.get_mut(conversation)?;
         let now = Instant::now();
-        queue.retain(|message| now.duration_since(message.received_at) < PASSIVE_WINDOW);
+        queue.retain(|message| {
+            now.duration_since(message.received_at) < passive_window(conversation)
+        });
         let chosen = queue.iter_mut().rev().find(|message| {
             message.official_id == official_message_id && message.replies < MAX_REPLIES_PER_MESSAGE
         })?;

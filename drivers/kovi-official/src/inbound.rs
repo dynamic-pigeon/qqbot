@@ -2,16 +2,53 @@
 //!
 //! 输出喂给 [`crate::event::MsgEvent::de`]；字段约定见 event.rs。
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 
 use crate::Context;
 use crate::passive::{Conversation, conversation_key};
 
 pub fn translate(ctx: &Context, event_type: &str, payload: &Value) -> Option<Value> {
+    let message_id = payload["id"].as_str()?;
+    if !ctx.seen.insert(message_id) {
+        tracing::debug!("重复推送的消息，丢弃: {message_id}");
+        return None;
+    }
     match event_type {
         "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" => translate_group(ctx, payload),
         "C2C_MESSAGE_CREATE" => translate_private(ctx, payload),
         _ => None,
+    }
+}
+
+/// 入站去重：官方会以相同 msg_id 概率性重推同一条消息（event.md），
+/// 短窗内重复直接丢弃，避免命令执行两次、统计重复计数。
+pub(crate) struct SeenMessages {
+    inner: std::sync::Mutex<HashMap<String, Instant>>,
+}
+
+/// 官方 id 全局唯一，窗口只需盖住重推间隔；顺带周期性清理过期项。
+const DEDUP_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+impl SeenMessages {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 首见记录并返回 true；窗口内重复返回 false。
+    pub(crate) fn insert(&self, id: &str) -> bool {
+        let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        map.retain(|_, seen| now.duration_since(*seen) < DEDUP_WINDOW);
+        if map.contains_key(id) {
+            return false;
+        }
+        map.insert(id.to_owned(), now);
+        true
     }
 }
 
@@ -35,9 +72,9 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
     );
 
     let raw_text = strip_mentions(payload["content"].as_str().unwrap_or_default());
-    // 引用回复时顶层 content 只剩空格，用户真正输入的正文与随信图片都
-    // 落在 msg_elements 里；被引用消息（message_type 102/103）是别人的
-    // 内容，不并入正文。
+    // 生产实测：引用回复时用户正文仍在顶层 content（纯引用不打字才剩
+    // 空白）；顶层为空时回退读 msg_elements 的正文元素。被引用消息
+    // （message_type 102/103）是别人的内容，不并入正文。
     if payload["msg_elements"]
         .as_array()
         .is_some_and(|list| !list.is_empty())
@@ -251,6 +288,14 @@ mod tests {
                 },
             ],
         })
+    }
+
+    #[test]
+    fn 重复推送的消息只翻译一次() {
+        let ctx = Context::for_tests();
+        let event = group_event();
+        assert!(translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &event).is_some());
+        assert!(translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &event).is_none());
     }
 
     #[test]
