@@ -431,9 +431,9 @@ async fn send_official(
 
 // ── 引用消息 ──────────────────────────────────────────────────────────────
 
-/// 取 reply 段所引用消息里的图片段。官方栈的 reply 段由驱动内联携带
-/// 被引图片直链（平台没有按 id 回查消息的 API）；OneBot 栈按段内 id
-/// 调 get_msg 回查。
+/// 取 reply 段所引用消息里的图片段。官方栈的 reply 段由驱动按官方形状
+/// 原样携带被引元素（图片在 attachments 里；卡片是 ark_data、没有图）；
+/// OneBot 栈按段内 id 调 get_msg 回查。
 pub async fn quoted_image_segments(
     bot: &RuntimeBot,
     reply: &kovi::message::Segment,
@@ -443,11 +443,21 @@ pub async fn quoted_image_segments(
         let _ = bot;
         let images = reply
             .data
-            .get("images")
+            .get("attachments")
             .and_then(kovi::serde_json::Value::as_array)
             .map(|list| {
                 list.iter()
-                    .filter_map(|url| url.as_str())
+                    .filter(|attachment| {
+                        attachment
+                            .get("content_type")
+                            .and_then(kovi::serde_json::Value::as_str)
+                            .is_some_and(|mime| mime.starts_with("image/"))
+                    })
+                    .filter_map(|attachment| {
+                        attachment
+                            .get("url")
+                            .and_then(kovi::serde_json::Value::as_str)
+                    })
                     .map(|url| kovi::message::Segment {
                         kind: "image".to_owned(),
                         data: kovi::serde_json::json!({ "file": url, "url": url }),

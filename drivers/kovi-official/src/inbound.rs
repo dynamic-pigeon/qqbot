@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use kovi::message::Segment;
 use serde_json::{Value, json};
 
 use crate::Context;
@@ -113,43 +114,26 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
     }))
 }
 
-/// 引用回复转 reply 段：被引用消息（msg_elements 里 message_type=103 的
-/// 元素）的文本与图片直链内联在段数据里——平台没有按 id 回查消息的
-/// API，下游（图库回复取图）直接读段数据；id 取 message_scene.ext 的
-/// ref_msg_idx。
-fn reply_segment(payload: &Value) -> Option<Value> {
-    let quoted = payload["msg_elements"]
-        .as_array()?
-        .iter()
-        .find(|element| element["message_type"].as_i64() == Some(103))?;
-    let images: Vec<&str> = quoted["attachments"]
-        .as_array()
-        .map(|list| {
-            list.iter()
-                .filter(|attachment| {
-                    attachment["content_type"]
-                        .as_str()
-                        .is_some_and(|mime| mime.starts_with("image/"))
-                })
-                .filter_map(|attachment| attachment["url"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    let id = payload["message_scene"]["ext"].as_array().and_then(|ext| {
-        ext.iter().find_map(|entry| {
-            entry
-                .as_str()
-                .and_then(|kv| kv.strip_prefix("ref_msg_idx="))
-        })
-    });
-    Some(json!({
-        "type": "reply",
-        "data": {
-            "id": id,
-            "text": quoted["content"].as_str().unwrap_or_default(),
-            "images": images,
-        }
-    }))
+/// 引用回复转 reply 段：data 是官方 msg_elements 首个元素原样（平台
+/// 契约：引用时它就是被引消息，含 content/attachments/ark_data 与自身
+/// 的 msg_idx 索引），不做字段重解释——卡片是卡片、附件是附件。触发
+/// 判定用官方自己的信号：元素 message_type=103 或 ext 带 ref_msg_idx。
+fn reply_segment(payload: &Value) -> Option<Segment> {
+    let elements = payload["msg_elements"].as_array()?;
+    let quoted = elements.first()?;
+    let is_quote = quoted["message_type"].as_i64() == Some(103)
+        || ext_value(payload["message_scene"]["ext"].as_array(), "ref_msg_idx").is_some();
+    is_quote.then(|| Segment::new("reply", quoted.clone()))
+}
+
+/// message_scene.ext 是 `key=value` 字符串数组，按等号切分并去空白，
+/// 空值跳过。
+fn ext_value<'a>(ext: Option<&'a Vec<Value>>, key: &str) -> Option<&'a str> {
+    ext?.iter().find_map(|entry| {
+        let entry = entry.as_str()?;
+        let equals = entry.find('=')?;
+        (entry[..equals].trim() == key).then_some(entry[equals + 1..].trim())
+    })
 }
 
 fn translate_private(ctx: &Context, payload: &Value) -> Option<Value> {
@@ -213,10 +197,10 @@ fn text_from_msg_elements(elements: &Value) -> (String, Vec<&Value>) {
     (parts.join(" "), attachments)
 }
 
-fn build_segments(text: &str, attachments: &[&Value]) -> Vec<Value> {
+fn build_segments(text: &str, attachments: &[&Value]) -> Vec<Segment> {
     let mut segments = Vec::new();
     if !text.is_empty() {
-        segments.push(json!({ "type": "text", "data": { "text": text } }));
+        segments.push(Segment::new("text", json!({ "text": text })));
     }
     for attachment in attachments {
         let is_image = attachment["content_type"]
@@ -224,7 +208,7 @@ fn build_segments(text: &str, attachments: &[&Value]) -> Vec<Value> {
             .is_some_and(|mime| mime.starts_with("image/"));
         let url = attachment["url"].as_str();
         if let (true, Some(url)) = (is_image, url) {
-            segments.push(json!({ "type": "image", "data": { "file": url, "url": url } }));
+            segments.push(Segment::new("image", json!({ "file": url, "url": url })));
         }
     }
     segments
@@ -298,6 +282,11 @@ mod tests {
         assert!(translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &event).is_none());
     }
 
+    /// 走生产同款反序列化路径取段列表（event.rs 的 from_value 链）。
+    fn segments_of(event: &Value) -> Vec<Segment> {
+        serde_json::from_value(event["message"].clone()).unwrap()
+    }
+
     #[test]
     fn 群事件翻译携带openid身份() {
         let ctx = Context::for_tests();
@@ -309,13 +298,13 @@ mod tests {
         assert_eq!(event["nickname"], "张三");
         assert_eq!(event["card"], "三哥");
         assert_eq!(event["time"], 1_795_147_200_i64);
-        assert_eq!(event["message"][0]["data"]["text"], "/B话榜 日");
+        let segments = segments_of(&event);
+        assert_eq!(segments[0].kind, "text");
+        assert_eq!(segments[0].data["text"], "/B话榜 日");
         // 非图片附件不进消息段。
-        assert_eq!(event["message"].as_array().unwrap().len(), 2);
-        assert_eq!(
-            event["message"][1]["data"]["url"],
-            "https://media.example/a.jpg"
-        );
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].kind, "image");
+        assert_eq!(segments[1].data["url"], "https://media.example/a.jpg");
     }
 
     #[test]
@@ -344,7 +333,9 @@ mod tests {
         let event = translate(&ctx, "C2C_MESSAGE_CREATE", &payload).unwrap();
         assert_eq!(event["user_openid"], "USER-9");
         assert!(event.get("group_openid").is_none());
-        assert_eq!(event["message"][0]["data"]["text"], "你好");
+        let segments = segments_of(&event);
+        assert_eq!(segments[0].kind, "text");
+        assert_eq!(segments[0].data["text"], "你好");
     }
 
     #[test]
@@ -368,6 +359,7 @@ mod tests {
                 {
                     "message_type": 103,
                     "content": "6",
+                    "msg_idx": "REFIDX_QUOTED",
                     "attachments": [
                         {
                             "content_type": "image/jpeg",
@@ -382,16 +374,16 @@ mod tests {
             ],
         });
         let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        // 引用独立成段：被引文本、图片直链、ref_msg_idx 全部内联。
-        let reply = &event["message"][0];
-        assert_eq!(reply["type"], "reply");
-        assert_eq!(reply["data"]["id"], "REFIDX_QUOTED");
-        assert_eq!(reply["data"]["text"], "6");
-        assert_eq!(reply["data"]["images"].as_array().unwrap().len(), 2);
+        // 引用独立成段，data 是官方被引元素原样：字段名与结构不变。
+        let segments = segments_of(&event);
+        assert_eq!(segments[0].kind, "reply");
+        assert_eq!(segments[0].data["msg_idx"], "REFIDX_QUOTED");
+        assert_eq!(segments[0].data["content"], "6");
+        assert_eq!(segments[0].data["attachments"].as_array().unwrap().len(), 2);
         // 用户正文照常成段，被引图片不进正文图片段。
-        assert_eq!(event["message"][1]["type"], "text");
-        assert_eq!(event["message"][1]["data"]["text"], "666");
-        assert_eq!(event["message"].as_array().unwrap().len(), 2);
+        assert_eq!(segments[1].kind, "text");
+        assert_eq!(segments[1].data["text"], "666");
+        assert_eq!(segments.len(), 2);
     }
 
     #[test]
@@ -407,6 +399,7 @@ mod tests {
                 {
                     "message_type": 103,
                     "content": "原消息",
+                    "msg_idx": "REFIDX_Q",
                     "attachments": [
                         { "content_type": "image/png", "url": "https://media.example/q.png" },
                     ],
@@ -414,12 +407,76 @@ mod tests {
             ],
         });
         let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        let segments = event["message"].as_array().unwrap();
+        let segments = segments_of(&event);
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0]["type"], "reply");
+        assert_eq!(segments[0].kind, "reply");
         assert_eq!(
-            segments[0]["data"]["images"][0],
+            segments[0].data["attachments"][0]["url"],
             "https://media.example/q.png"
         );
+    }
+
+    #[test]
+    fn 卡片引用原样携带ark数据() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "MSG-R3",
+            "group_openid": "GROUP-ABC",
+            "content": "看看这个",
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+            "message_scene": { "ext": ["ref_msg_idx=REFIDX_CARD"] },
+            "msg_elements": [
+                {
+                    "ark_data": {
+                        "ark_name": "小程序",
+                        "ark_type": "miniapp",
+                        "fields": {
+                            "preview": "https://qq.ugcimg.cn/v1/PREVIEW",
+                            "source": "哔哩哔哩",
+                            "title": "我的新书要发售啦！"
+                        },
+                        "prompt": "[QQ小程序]我的新书要发售啦！"
+                    },
+                    "content": "[卡片消息] 小程序\n摘要: [QQ小程序]我的新书要发售啦！",
+                    "message_type": 103,
+                    "msg_idx": "REFIDX_CARD",
+                },
+            ],
+        });
+        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
+        let segments = segments_of(&event);
+        assert_eq!(segments[0].kind, "reply");
+        // 卡片是卡片：ark_data 原样透传，不收进图片。
+        assert_eq!(
+            segments[0].data["ark_data"]["fields"]["title"],
+            "我的新书要发售啦！"
+        );
+        assert!(segments[0].data.get("attachments").is_none());
+        // 用户正文照常成段。
+        assert_eq!(segments[1].kind, "text");
+    }
+
+    #[test]
+    fn 元素自带索引ext缺ref也产段() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "MSG-R4",
+            "group_openid": "GROUP-ABC",
+            "content": " ",
+            "message_type": 103,
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+            "msg_elements": [
+                {
+                    "message_type": 103,
+                    "content": "被引的原文",
+                    "msg_idx": "REFIDX_FALLBACK",
+                },
+            ],
+        });
+        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
+        let segments = segments_of(&event);
+        assert_eq!(segments[0].kind, "reply");
+        assert_eq!(segments[0].data["msg_idx"], "REFIDX_FALLBACK");
+        assert_eq!(segments[0].data["content"], "被引的原文");
     }
 }
