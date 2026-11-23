@@ -385,8 +385,11 @@ fn send_body(content: &str, media: Option<&str>, passive: Option<&(String, u32)>
         Some(file_info) => {
             body["msg_type"] = json!(7);
             body["media"] = json!({ "file_info": file_info });
-            // send.md：msg_type=7 时 content 需填值，空文本用一个空格。
-            body["content"] = json!(if content.is_empty() { " " } else { content });
+            // 图文并存才有 content；纯图不带该字段（对齐 qqbot-nodejs
+            // sendMediaMessage，空格占位会被客户端渲染出来）。
+            if !content.is_empty() {
+                body["content"] = json!(content);
+            }
         }
         None => {
             body["msg_type"] = json!(0);
@@ -617,9 +620,9 @@ mod tests {
         assert_eq!(media["msg_type"], 7);
         assert_eq!(media["media"]["file_info"], "file-info-x");
         assert_eq!(media["msg_seq"], 2);
-        // send.md 要求 msg_type=7 填 content，纯图空文本落成一个空格。
+        // 纯图消息不带 content 字段。
         let pure_image = send_body("", Some("file-info-x"), None);
-        assert_eq!(pure_image["content"], " ");
+        assert!(pure_image.get("content").is_none());
 
         let active = send_body("纯文本", None, None);
         assert_eq!(active["msg_type"], 0);

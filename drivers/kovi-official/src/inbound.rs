@@ -72,7 +72,7 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
         message_id,
     );
 
-    let raw_text = strip_mentions(payload["content"].as_str().unwrap_or_default());
+    let raw_text = sanitize_content(payload["content"].as_str().unwrap_or_default());
     // 生产实测：引用回复时用户正文仍在顶层 content（纯引用不打字才剩
     // 空白）；顶层为空时回退读 msg_elements 的正文元素。被引用消息
     // （message_type 102/103）是别人的内容，不并入正文。
@@ -150,7 +150,7 @@ fn translate_private(ctx: &Context, payload: &Value) -> Option<Value> {
         message_id,
     );
 
-    let raw_text = payload["content"].as_str().unwrap_or_default().to_owned();
+    let raw_text = sanitize_content(payload["content"].as_str().unwrap_or_default());
     let (text, element_attachments) = if raw_text.trim().is_empty() {
         text_from_msg_elements(&payload["msg_elements"])
     } else {
@@ -186,7 +186,7 @@ fn text_from_msg_elements(elements: &Value) -> (String, Vec<&Value>) {
         if element["message_type"].as_i64() != Some(0) {
             continue;
         }
-        let text = strip_mentions(element["content"].as_str().unwrap_or_default());
+        let text = sanitize_content(element["content"].as_str().unwrap_or_default());
         if !text.is_empty() {
             parts.push(text);
         }
@@ -233,6 +233,106 @@ fn strip_mentions(content: &str) -> String {
     }
     cleaned.push_str(rest);
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 官方对合并转发消息的文本化固定以此开头，「=== 消息 n ===」之后是
+/// 被转发者的内容，整条不是用户输入。
+const CHAT_RECORD_PREFIX: &str = "[群聊的聊天记录]";
+
+/// 官方顶层 content 是整条消息的文本化产物：@ 提及、表情、合并转发
+/// 都会序列化成标记文本。这里只留用户敲的字——提及与表情、内部标记
+/// 剥除（形态对齐 qqbot-nodejs 的 content-sanitizer 与 text-parsing），
+/// 合并转发摘要整条置空。剥完只剩空白即无正文。
+fn sanitize_content(content: &str) -> String {
+    let text = strip_platform_markers(&strip_mentions(content));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.starts_with(CHAT_RECORD_PREFIX) {
+        return String::new();
+    }
+    text
+}
+
+fn strip_platform_markers(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(['<', '[']) {
+        cleaned.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        match strip_marker(tail) {
+            Some(after) => rest = after,
+            None => {
+                // 手打的 < 或 [，只消费一个字符，后面的真标记照常识别。
+                let ch = tail.chars().next().expect("find 命中处必有字符");
+                cleaned.push(ch);
+                rest = &tail[ch.len_utf8()..];
+            }
+        }
+    }
+    cleaned.push_str(rest);
+    cleaned
+}
+
+/// `tail` 开头是平台标记时返回标记之后的剩余部分。
+fn strip_marker(tail: &str) -> Option<&str> {
+    if tail.starts_with("<faceType=") {
+        return face_tag_len(tail);
+    }
+    if tail.starts_with("[<face,") {
+        return old_face_tag_len(tail);
+    }
+    internal_marker_len(tail)
+}
+
+/// 新版表情标记：`<faceType=6,faceId="0",ext="base64">`。
+fn face_tag_len(tail: &str) -> Option<&str> {
+    let rest = &tail["<faceType=".len()..];
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits == 0 {
+        return None;
+    }
+    let rest = rest[digits..].strip_prefix(",faceId=\"")?;
+    let id_end = rest.find('"')?;
+    let rest = rest[id_end + 1..].strip_prefix(",ext=\"")?;
+    let ext_end = rest.find('"')?;
+    rest[ext_end + 1..].strip_prefix('>')
+}
+
+/// 旧版表情标记：`[<face,id=6/>]` / `[<face,id=6>]`。
+fn old_face_tag_len(tail: &str) -> Option<&str> {
+    let rest = tail.strip_prefix("[<face,id=")?;
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if digits == 0 {
+        return None;
+    }
+    let rest = &rest[digits..];
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let rest = rest.strip_prefix('>')?;
+    rest.strip_prefix(']')
+}
+
+/// 平台内部标记：`[internal:…]` / `[debug:…]` / `[system:…]`，
+/// 关键字大小写不敏感，冒号可省。
+fn internal_marker_len(tail: &str) -> Option<&str> {
+    let rest = tail.strip_prefix('[')?;
+    for keyword in ["internal", "debug", "system"] {
+        // 字节层比较：关键字长度若切在多字节字符中间，必然不是关键字。
+        let head = &rest.as_bytes()[..keyword.len().min(rest.len())];
+        if head.eq_ignore_ascii_case(keyword.as_bytes()) {
+            let after_keyword = &rest[keyword.len()..];
+            let body = after_keyword.strip_prefix(':').unwrap_or(after_keyword);
+            let ws = body
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(body.len());
+            let body = &body[ws..];
+            let end = body.find(']')?;
+            return Some(&body[end + 1..]);
+        }
+    }
+    None
 }
 
 fn timestamp_to_epoch(timestamp: Option<&str>) -> i64 {
@@ -344,6 +444,86 @@ mod tests {
         assert_eq!(strip_mentions("a <@abc> b"), "a b");
         assert_eq!(strip_mentions("<@!abc>"), "");
         assert_eq!(strip_mentions("无标记 < 保持"), "无标记 < 保持");
+    }
+
+    #[test]
+    fn 表情标记剥离() {
+        // 生产实测形态：ext 是 base64 JSON。
+        assert_eq!(
+            sanitize_content(r#"看看<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">"#),
+            "看看"
+        );
+        assert_eq!(
+            sanitize_content(r#"<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 哈哈"#),
+            "哈哈"
+        );
+        // 纯表情剥完为空，消息不再有正文。
+        assert_eq!(
+            sanitize_content(r#"<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">"#),
+            ""
+        );
+        assert_eq!(sanitize_content("[<face,id=6/>]"), "");
+        assert_eq!(sanitize_content("[<face,id=6>]"), "");
+        // 手打的 < / [ / 半截标记原样保留。
+        assert_eq!(sanitize_content("a < b [c] d"), "a < b [c] d");
+        assert_eq!(
+            sanitize_content("<faceType=6 后面没了"),
+            "<faceType=6 后面没了"
+        );
+        assert_eq!(
+            sanitize_content(r#"<faceType=6,faceId="0" 结构不完整"#),
+            r#"<faceType=6,faceId="0" 结构不完整"#
+        );
+    }
+
+    #[test]
+    fn 内部标记剥离() {
+        assert_eq!(sanitize_content("[internal: foo] 文字"), "文字");
+        assert_eq!(sanitize_content("[Debug] x"), "x");
+        assert_eq!(sanitize_content("[system]"), "");
+        // 与 SDK 正则同款前缀语义：internal 之后直到 `]` 都算标记。
+        assert_eq!(sanitize_content("[internalism] x"), "x");
+    }
+
+    #[test]
+    fn 合并转发摘要整条置空() {
+        // 生产实测形态：固定前缀 + 「=== 消息 n ===」展开。
+        assert_eq!(
+            sanitize_content("[群聊的聊天记录] === 消息 1 === [消息内容] 早 [发送者] 张三"),
+            ""
+        );
+        assert_eq!(sanitize_content("[群聊的聊天记录]"), "");
+        assert_eq!(
+            sanitize_content("说到[群聊的聊天记录]这个词"),
+            "说到[群聊的聊天记录]这个词"
+        );
+    }
+
+    #[test]
+    fn 群消息纯表情无正文段() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "MSG-F2",
+            "group_openid": "GROUP-ABC",
+            "content": "<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiW++8gV0ifQ==\">",
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+        });
+        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
+        let segments: Vec<Segment> = serde_json::from_value(event["message"].clone()).unwrap();
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn 单聊正文同样清理() {
+        let ctx = Context::for_tests();
+        let payload = json!({
+            "id": "C2C-F1",
+            "content": "<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiIn0=\">",
+            "author": { "user_openid": "USER-9", "username": "李四" },
+        });
+        let event = translate(&ctx, "C2C_MESSAGE_CREATE", &payload).unwrap();
+        let segments: Vec<Segment> = serde_json::from_value(event["message"].clone()).unwrap();
+        assert!(segments.is_empty());
     }
 
     #[test]

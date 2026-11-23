@@ -2,14 +2,16 @@
 //!
 //! 官方发送图片是两步：先 `POST /v2/groups/{group_openid}/files`（或
 //! `/v2/users/{openid}/files`）拿到 `file_info`，再以 msg_type=7 发送。
-//! 上传支持远程 URL 代下载与二进制直传（file_data 为 base64，5MB 以内）。
-//! file_info 带 ttl，同一张图重复发送时按内容键缓存复用。
+//! 直传（file_data base64）有 10MB 字节上限，更大的本地图走分块：
+//! `upload_prepare` 拿分块预签名 URL，逐块 PUT 到 COS 并确认，complete
+//! 换回同构的 file_info。file_info 带 ttl，按内容键缓存复用。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use md5::Digest as _;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -25,6 +27,20 @@ impl MediaScope {
         match self {
             MediaScope::Group(openid) => format!("/v2/groups/{openid}/files"),
             MediaScope::User(openid) => format!("/v2/users/{openid}/files"),
+        }
+    }
+
+    fn upload_prepare_path(&self) -> String {
+        match self {
+            MediaScope::Group(openid) => format!("/v2/groups/{openid}/upload_prepare"),
+            MediaScope::User(openid) => format!("/v2/users/{openid}/upload_prepare"),
+        }
+    }
+
+    fn upload_part_finish_path(&self) -> String {
+        match self {
+            MediaScope::Group(openid) => format!("/v2/groups/{openid}/upload_part_finish"),
+            MediaScope::User(openid) => format!("/v2/users/{openid}/upload_part_finish"),
         }
     }
 
@@ -75,21 +91,21 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// 官方接口会把数字返回成字符串，ttl 两种形态都收。
-fn de_ttl<'de, D>(deserializer: D) -> Result<u64, D::Error>
+/// 官方接口会把数字返回成字符串，u64 字段两种形态都收。
+fn de_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Ttl {
+    enum U64 {
         Number(u64),
         Text(String),
     }
 
-    match Ttl::deserialize(deserializer)? {
-        Ttl::Number(number) => Ok(number),
-        Ttl::Text(text) => text.parse().map_err(serde::de::Error::custom),
+    match U64::deserialize(deserializer)? {
+        U64::Number(number) => Ok(number),
+        U64::Text(text) => text.parse().map_err(serde::de::Error::custom),
     }
 }
 
@@ -99,6 +115,13 @@ const LONG_TTL_FALLBACK: Duration = Duration::from_secs(60 * 60);
 
 /// 上传类请求的超时（官方 SDK 同款 120 秒），覆盖 client 默认 30 秒。
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 直传的字节上限，达到即改走分块。生产实测 10,809,442 字节被平台拒
+/// （HTTP 400 err_code 40093011），门槛按十进制 10MB 收口。
+const DIRECT_UPLOAD_LIMIT: usize = 10_000_000;
+
+/// upload_prepare 要求的 md5_10m 截断长度（官方 SDK 同款魔数）。
+const MD5_10M_SIZE: usize = 10_002_432;
 
 pub struct MediaStore {
     inner: std::sync::Mutex<HashMap<String, (String, Instant)>>,
@@ -236,24 +259,8 @@ pub(crate) async fn material_url(
 
     let (content_type, extension) = sniff_content_type(&data);
     let file_name = format!("image.{extension}");
-    let md5 = {
-        use md5::Digest as _;
-        let mut hasher = md5::Md5::new();
-        hasher.update(&data);
-        hasher.finalize()
-    };
-    let sha1 = {
-        use sha1::Digest as _;
-        let mut hasher = sha1::Sha1::new();
-        hasher.update(&data);
-        hasher.finalize()
-    };
-    let to_hex = |digest: &[u8]| {
-        digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
+    let md5 = md5_hex(&data);
+    let sha1 = sha1_hex(&data);
 
     let authorization = token.authorization().await?;
     // 1. 申请上传
@@ -264,8 +271,8 @@ pub(crate) async fn material_url(
             "file_name": file_name,
             "file_size": data.len(),
             "content_type": content_type,
-            "md5": to_hex(&md5),
-            "sha1": to_hex(&sha1),
+            "md5": md5.clone(),
+            "sha1": sha1,
         }))
         .send()
         .await
@@ -315,7 +322,7 @@ pub(crate) async fn material_url(
         .header("Authorization", authorization)
         .json(&serde_json::json!({
             "upload_id": parsed.upload_id,
-            "md5": to_hex(&md5),
+            "md5": md5,
         }))
         .send()
         .await
@@ -390,58 +397,20 @@ impl MediaStore {
             return Ok(cached);
         }
 
-        // srv_send_msg=false：只取 file_info 由发送接口发出，直发会占主动消息频次。
-        let mut body = json!({ "file_type": 1, "srv_send_msg": false });
-        match &source {
-            MediaSource::Url(url) => {
-                body["url"] = json!(url);
+        let (file_info, ttl) = match &source {
+            MediaSource::Bytes { data, filename } if data.len() >= DIRECT_UPLOAD_LIMIT => {
+                upload_chunked(http, token, api_base, scope, data, filename).await?
             }
-            MediaSource::Bytes { data, filename } => {
-                body["file_data"] = json!(BASE64.encode(data));
-                body["file_name"] = json!(filename);
-            }
-            MediaSource::FilePath(_) => unreachable!("上一段已把本地路径展开为字节"),
-        }
+            _ => upload_direct(http, token, api_base, scope, &source).await?,
+        };
 
-        let authorization = token.authorization().await?;
-        let response = http
-            .post(format!("{}{}", api_base, scope.upload_path()))
-            .timeout(UPLOAD_TIMEOUT)
-            .header("Authorization", authorization)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| MediaError {
-                message: e.to_string(),
-            })?;
-
-        let status = response.status();
-        let text = response.text().await.map_err(|e| MediaError {
-            message: e.to_string(),
-        })?;
-        if !status.is_success() {
-            return Err(MediaError {
-                message: format!("HTTP {status}: {text}"),
-            });
-        }
-
-        #[derive(Deserialize)]
-        struct UploadResponse {
-            file_info: String,
-            #[serde(default, deserialize_with = "de_ttl")]
-            ttl: u64,
-        }
-        let parsed: UploadResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-            message: format!("响应解析失败（{text}）: {e}"),
-        })?;
-
-        let lifetime = if parsed.ttl == 0 {
+        let lifetime = if ttl == 0 {
             LONG_TTL_FALLBACK
         } else {
-            Duration::from_secs(parsed.ttl).saturating_sub(EXPIRY_MARGIN)
+            Duration::from_secs(ttl).saturating_sub(EXPIRY_MARGIN)
         };
-        self.store(&cache_key, &parsed.file_info, lifetime);
-        Ok(parsed.file_info)
+        self.store(&cache_key, &file_info, lifetime);
+        Ok(file_info)
     }
 
     fn lookup(&self, key: &str) -> Option<String> {
@@ -464,5 +433,272 @@ impl MediaStore {
             key.to_owned(),
             (file_info.to_owned(), Instant::now() + lifetime),
         );
+    }
+}
+
+/// 带 Authorization 的上传类 POST，非 2xx 时把状态与响应体并入错误。
+async fn post_authorized(
+    http: &reqwest::Client,
+    authorization: &str,
+    url: String,
+    body: &serde_json::Value,
+) -> Result<String, MediaError> {
+    let response = http
+        .post(url)
+        .timeout(UPLOAD_TIMEOUT)
+        .header("Authorization", authorization)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| MediaError {
+            message: e.to_string(),
+        })?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| MediaError {
+        message: e.to_string(),
+    })?;
+    if !status.is_success() {
+        return Err(MediaError {
+            message: format!("HTTP {status}: {text}"),
+        });
+    }
+    Ok(text)
+}
+
+#[derive(Deserialize)]
+struct UploadResponse {
+    file_info: String,
+    #[serde(default, deserialize_with = "de_u64")]
+    ttl: u64,
+}
+
+/// 直传：远程 URL 由平台代下载，本地图走 base64 file_data。
+async fn upload_direct(
+    http: &reqwest::Client,
+    token: &crate::token::TokenManager,
+    api_base: &str,
+    scope: &MediaScope,
+    source: &MediaSource,
+) -> Result<(String, u64), MediaError> {
+    // srv_send_msg=false：只取 file_info 由发送接口发出，直发会占主动消息频次。
+    let mut body = json!({ "file_type": 1, "srv_send_msg": false });
+    match source {
+        MediaSource::Url(url) => {
+            body["url"] = json!(url);
+        }
+        MediaSource::Bytes { data, filename } => {
+            body["file_data"] = json!(BASE64.encode(data));
+            body["file_name"] = json!(filename);
+        }
+        MediaSource::FilePath(_) => unreachable!("本地路径在 upload 入口已展开为字节"),
+    }
+
+    let authorization = token.authorization().await?;
+    let text = post_authorized(
+        http,
+        &authorization,
+        format!("{}{}", api_base, scope.upload_path()),
+        &body,
+    )
+    .await?;
+    let parsed: UploadResponse = serde_json::from_str(&text).map_err(|e| MediaError {
+        message: format!("响应解析失败（{text}）: {e}"),
+    })?;
+    Ok((parsed.file_info, parsed.ttl))
+}
+
+#[derive(Deserialize)]
+struct UploadPart {
+    #[serde(deserialize_with = "de_u64")]
+    index: u64,
+    presigned_url: String,
+}
+
+#[derive(Deserialize)]
+struct PrepareResponse {
+    upload_id: String,
+    #[serde(deserialize_with = "de_u64")]
+    block_size: u64,
+    parts: Vec<UploadPart>,
+}
+
+/// 分块上传（对齐官方 SDK 的三段流程）：
+/// `upload_prepare` 提交三个哈希换分块预签名 URL；逐块 PUT 到 COS 后
+/// `upload_part_finish` 确认；`complete`（同直传的 /files 路径）换回
+/// 与直传同构的 file_info，发送侧无感。
+async fn upload_chunked(
+    http: &reqwest::Client,
+    token: &crate::token::TokenManager,
+    api_base: &str,
+    scope: &MediaScope,
+    data: &[u8],
+    filename: &str,
+) -> Result<(String, u64), MediaError> {
+    let (md5, sha1, md5_10m) = prepare_hashes(data);
+    let authorization = token.authorization().await?;
+
+    let body = json!({
+        "file_type": 1,
+        "file_name": filename,
+        "file_size": data.len(),
+        "md5": md5,
+        "sha1": sha1,
+        "md5_10m": md5_10m,
+    });
+    let text = post_authorized(
+        http,
+        &authorization,
+        format!("{}{}", api_base, scope.upload_prepare_path()),
+        &body,
+    )
+    .await?;
+    let parsed: PrepareResponse = serde_json::from_str(&text).map_err(|e| MediaError {
+        message: format!("prepare 响应解析失败（{text}）: {e}"),
+    })?;
+    tracing::info!(
+        "分块上传开始 size={} block_size={} parts={}",
+        data.len(),
+        parsed.block_size,
+        parsed.parts.len()
+    );
+
+    for part in &parsed.parts {
+        let offset = ((part.index - 1) * parsed.block_size) as usize;
+        let end = (offset + parsed.block_size as usize).min(data.len());
+        if offset > end || end > data.len() {
+            return Err(MediaError {
+                message: format!(
+                    "分块 {} 区间非法: offset={offset} end={end} size={}",
+                    part.index,
+                    data.len()
+                ),
+            });
+        }
+        let bytes = &data[offset..end];
+        put_part_with_retry(http, &part.presigned_url, bytes).await?;
+
+        let finish = json!({
+            "upload_id": parsed.upload_id,
+            "part_index": part.index,
+            "block_size": end - offset,
+            "md5": md5_hex(bytes),
+        });
+        post_authorized(
+            http,
+            &authorization,
+            format!("{}{}", api_base, scope.upload_part_finish_path()),
+            &finish,
+        )
+        .await
+        .map_err(|e| MediaError {
+            message: format!("upload_part_finish 失败（第 {} 块）: {e}", part.index),
+        })?;
+    }
+
+    let complete = json!({ "upload_id": parsed.upload_id });
+    let text = post_authorized(
+        http,
+        &authorization,
+        format!("{}{}", api_base, scope.upload_path()),
+        &complete,
+    )
+    .await?;
+    let parsed: UploadResponse = serde_json::from_str(&text).map_err(|e| MediaError {
+        message: format!("complete 响应解析失败（{text}）: {e}"),
+    })?;
+    Ok((parsed.file_info, parsed.ttl))
+}
+
+/// 分块 PUT 到 COS 预签名 URL（不带 Authorization，COS 只认预签名），
+/// 失败按 2s/4s 退避重试两次。
+async fn put_part_with_retry(
+    http: &reqwest::Client,
+    url: &str,
+    bytes: &[u8],
+) -> Result<(), MediaError> {
+    let mut delay = Duration::from_secs(2);
+    let mut last_error = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            kovi::tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+        let response = http
+            .put(url)
+            .timeout(UPLOAD_TIMEOUT)
+            .body(bytes.to_vec())
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                last_error = Some(MediaError {
+                    message: format!("分块 PUT HTTP {status}: {body}"),
+                });
+            }
+            Err(e) => {
+                last_error = Some(MediaError {
+                    message: format!("分块 PUT 失败: {e}"),
+                });
+            }
+        }
+        if let Some(error) = &last_error {
+            tracing::warn!("第 {} 次分块 PUT 失败: {error}", attempt + 1);
+        }
+    }
+    Err(last_error.unwrap_or_else(|| MediaError {
+        message: "分块 PUT 失败".to_owned(),
+    }))
+}
+
+/// upload_prepare 的三件套哈希：全量 md5 / sha1 / 前 `MD5_10M_SIZE`
+/// 字节的 md5（不足时等于全量 md5）。
+fn prepare_hashes(data: &[u8]) -> (String, String, String) {
+    let md5 = md5_hex(data);
+    let sha1 = sha1_hex(data);
+    let md5_10m = if data.len() > MD5_10M_SIZE {
+        md5_hex(&data[..MD5_10M_SIZE])
+    } else {
+        md5.clone()
+    };
+    (md5, sha1, md5_10m)
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    to_hex(&md5::Md5::digest(bytes))
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    to_hex(&sha1::Sha1::digest(bytes))
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare三件套哈希() {
+        // 不足 10M 时 md5_10m 等于全量 md5。
+        let (md5, sha1, md5_10m) = prepare_hashes(b"hello");
+        assert_eq!(md5, "5d41402abc4b2a76b9719d911017c592");
+        assert_eq!(sha1, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d");
+        assert_eq!(md5_10m, md5);
+    }
+
+    #[test]
+    fn prepare响应数字字段收字符串形态() {
+        let parsed: PrepareResponse = serde_json::from_str(
+            r#"{"upload_id":"U1","block_size":"10485760","parts":[{"index":"1","presigned_url":"https://cos.example/p1"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.block_size, 10_485_760);
+        assert_eq!(parsed.parts[0].index, 1);
+        assert_eq!(parsed.parts[0].presigned_url, "https://cos.example/p1");
     }
 }
