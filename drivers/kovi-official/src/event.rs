@@ -1,7 +1,4 @@
 //! 官方事件类型、注册器与回复 API。
-//!
-//! 身份自始至终是 openid 字符串：群 `group_openid`、成员 `member_openid`、
-//! 单聊 `user_openid`。不映射成数字，插件与存储直接持有字符串。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -48,8 +45,7 @@ impl MsgEvent {
         }
     }
 
-    /// 快速回复（被动消息，引用触发消息）。发送形态（markdown / media
-    /// / 拆分）由 outbound 统一决策。
+    /// 回复触发本事件的消息（被动消息）；发送形态由 outbound 决定。
     pub fn reply<M: Into<KoviMessage>>(&self, msg: M) {
         let message = msg.into();
         let (scope, openid) = self.conversation();
@@ -70,7 +66,8 @@ impl MsgEvent {
         self.reply(markdown_message(content));
     }
 
-    /// 官方的被动回复天然带引用展示，与 [`MsgEvent::reply`] 等价。
+    /// 与 [`MsgEvent::reply`] 等价：官方的回复由 msg_id 绑定原消息，不另发
+    /// message_reference。
     pub fn reply_and_quote<M: Into<KoviMessage>>(&self, msg: M) {
         self.reply(msg);
     }

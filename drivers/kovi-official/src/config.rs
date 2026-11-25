@@ -44,59 +44,48 @@ pub enum ConfigError {
     Empty,
 }
 
-/// 从 `kovi.conf.toml` 读取 `[official]` 段；只在 `official` feature 构建下被调用。
-pub fn load_local_conf() -> Result<OfficialDriverConfig, ConfigError> {
-    let path = Path::new("kovi.conf.toml");
-    let raw = fs::read_to_string(path).map_err(|e| ConfigError::Read(e.to_string()))?;
+#[derive(serde::Deserialize)]
+struct ConfFile {
+    official: Option<OfficialDriverConfig>,
+}
 
-    #[derive(serde::Deserialize)]
-    struct FileWithOfficial {
-        official: Option<OfficialDriverConfig>,
-    }
-
-    let parsed: FileWithOfficial =
-        toml::from_str(&raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
-    let config = parsed.official.ok_or(ConfigError::MissingSection)?;
-
+fn parse_conf(raw: &str) -> Result<OfficialDriverConfig, ConfigError> {
+    let file: ConfFile = toml::from_str(raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let config = file.official.ok_or(ConfigError::MissingSection)?;
     if config.app_id.trim().is_empty() || config.app_secret.trim().is_empty() {
         return Err(ConfigError::Empty);
     }
     Ok(config)
 }
 
+/// 从 `kovi.conf.toml` 读取 `[official]` 段。
+pub fn load_local_conf() -> Result<OfficialDriverConfig, ConfigError> {
+    let raw = fs::read_to_string(Path::new("kovi.conf.toml"))
+        .map_err(|e| ConfigError::Read(e.to_string()))?;
+    parse_conf(&raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse(raw: &str) -> Result<OfficialDriverConfig, ConfigError> {
-        #[derive(serde::Deserialize)]
-        struct FileWithOfficial {
-            official: Option<OfficialDriverConfig>,
-        }
-        let parsed: FileWithOfficial =
-            toml::from_str(raw).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        parsed.official.ok_or(ConfigError::MissingSection)
-    }
-
     #[test]
-    fn 缺段报错() {
-        let err = parse("[config]\nmain_admin = 1\n").unwrap_err();
-        assert!(matches!(err, ConfigError::MissingSection));
-    }
-
-    #[test]
-    fn 与其他段共存() {
+    fn 只取official段并按沙箱切基地址() {
         let raw = "[server]\nport = 8080\n\n[official]\napp_id = \"1020\"\napp_secret = \"s\"\n";
-        let config = parse(raw).unwrap();
+        let config = parse_conf(raw).unwrap();
         assert_eq!(config.app_id, "1020");
-        assert!(!config.sandbox);
         assert_eq!(config.api_base(), "https://api.bot.qq.com");
+
+        let raw = "[official]\napp_id = \"1\"\napp_secret = \"s\"\nsandbox = true\n";
+        let sandbox = parse_conf(raw).unwrap();
+        assert_eq!(sandbox.api_base(), "https://sandbox.api.sgroup.qq.com");
     }
 
     #[test]
-    fn 沙箱切换基地址() {
-        let raw = "[official]\napp_id = \"1\"\napp_secret = \"s\"\nsandbox = true\n";
-        let config = parse(raw).unwrap();
-        assert_eq!(config.api_base(), "https://sandbox.api.sgroup.qq.com");
+    fn 缺段或凭据为空报错() {
+        let missing = parse_conf("[config]\nmain_admin = 1\n");
+        let empty = parse_conf("[official]\napp_id = \" \"\napp_secret = \"s\"\n");
+        assert!(matches!(missing, Err(ConfigError::MissingSection)));
+        assert!(matches!(empty, Err(ConfigError::Empty)));
     }
 }

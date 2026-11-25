@@ -26,23 +26,140 @@ use kovi::bot::SendApi;
 use kovi::driver::{AnyError, ApiHandlerResult, Driver, DriverEvent, MessageEventRegister};
 use kovi::futures_util::Stream;
 use kovi::tokio::sync::{mpsc, oneshot};
+use serde::Deserialize;
+use serde_json::Value;
+
+/// REST 请求超时。
+const REST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 上传类请求超时。
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 发送目标会话：群按 `group_openid`，单聊按 `user_openid`。
+enum ChatScope {
+    Group(String),
+    User(String),
+}
+
+impl ChatScope {
+    /// REST 路径前缀：`/v2/groups/{group_openid}` 或 `/v2/users/{openid}`。
+    fn base_path(&self) -> String {
+        match self {
+            ChatScope::Group(openid) => format!("/v2/groups/{openid}"),
+            ChatScope::User(openid) => format!("/v2/users/{openid}"),
+        }
+    }
+
+    /// 会话类型标签：群 `g`，单聊 `u`。
+    fn kind(&self) -> &'static str {
+        match self {
+            ChatScope::Group(_) => "g",
+            ChatScope::User(_) => "u",
+        }
+    }
+
+    /// 被动回复槽位与发送节流共用的会话键。
+    fn key(&self) -> String {
+        let openid = match self {
+            ChatScope::Group(openid) | ChatScope::User(openid) => openid,
+        };
+        format!("{}:{openid}", self.kind())
+    }
+
+    /// 被动回复有效窗口：群 5 分钟，单聊 60 分钟。
+    fn passive_window(&self) -> Duration {
+        match self {
+            ChatScope::Group(_) => Duration::from_secs(5 * 60),
+            ChatScope::User(_) => Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+/// POST 失败：传输出错，或平台返回非 2xx。
+#[derive(Debug, thiserror::Error)]
+enum PostError {
+    #[error(transparent)]
+    Transport(#[from] reqwest::Error),
+    #[error("HTTP {status}: {body}")]
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
+impl PostError {
+    /// 响应体里的业务错误码（`err_code` 或 `code`）。
+    fn biz_code(&self) -> Option<u64> {
+        let PostError::Rejected { body, .. } = self else {
+            return None;
+        };
+        let body: Value = serde_json::from_str(body).ok()?;
+        ["err_code", "code"].into_iter().find_map(|key| {
+            body[key]
+                .as_u64()
+                .or_else(|| body[key].as_str()?.parse().ok())
+        })
+    }
+}
+
+/// 带 Authorization 的 JSON POST；成功返回响应体文本。
+async fn post_json(
+    http: &reqwest::Client,
+    authorization: &str,
+    url: String,
+    body: &Value,
+    timeout: Duration,
+) -> Result<String, PostError> {
+    let response = http
+        .post(url)
+        .timeout(timeout)
+        .header("Authorization", authorization)
+        .json(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(PostError::Rejected { status, body: text })
+    }
+}
+
+/// 官方接口会把数字返回成字符串，u64 字段两种形态都收。
+fn de_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match StringOrNumber::deserialize(deserializer)? {
+        StringOrNumber::Number(number) => Ok(number),
+        StringOrNumber::Text(text) => text.parse().map_err(serde::de::Error::custom),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrNumber {
+    Number(u64),
+    Text(String),
+}
 
 /// 驱动内各模块共享的状态。
-pub(crate) struct Context {
-    pub(crate) config: OfficialDriverConfig,
-    pub(crate) http: reqwest::Client,
-    pub(crate) token: token::TokenManager,
-    pub(crate) members: member_cache::MemberCache,
-    pub(crate) media: media::MediaStore,
-    pub(crate) limiter: rate_limit::SendRateLimiter,
-    pub(crate) inbound: passive::RecentInbound,
-    pub(crate) seen: inbound::SeenMessages,
-    pub(crate) session: std::sync::Mutex<Option<gateway::Session>>,
+struct Context {
+    config: OfficialDriverConfig,
+    http: reqwest::Client,
+    token: token::TokenManager,
+    members: member_cache::MemberCache,
+    media: media::MediaStore,
+    limiter: rate_limit::SendRateLimiter,
+    inbound: passive::RecentInbound,
+    seen: inbound::SeenMessages,
+    session: std::sync::Mutex<Option<gateway::Session>>,
 }
 
 impl Context {
     #[cfg(test)]
-    pub(crate) fn for_tests() -> Self {
+    fn for_tests() -> Self {
         Self::build(OfficialDriverConfig {
             app_id: "test".to_owned(),
             app_secret: "test".to_owned(),
@@ -52,9 +169,8 @@ impl Context {
     }
 
     fn build(config: OfficialDriverConfig) -> Self {
-        // 官方 SDK 口径：REST 默认 30 秒超时，上传类请求单独放宽（media.rs）。
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(REST_TIMEOUT)
             .build()
             .expect("固定配置的 reqwest client 必然合法");
         let token = token::TokenManager::new(

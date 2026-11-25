@@ -86,7 +86,7 @@ impl Outcome {
 }
 
 async fn connection(
-    ctx: &Arc<Context>,
+    ctx: &Context,
     events: &mpsc::Sender<Result<DriverEvent, AnyError>>,
     mut ready: Option<oneshot::Sender<()>>,
 ) -> Outcome {
@@ -221,10 +221,10 @@ enum FrameAction {
     InvalidSession,
 }
 
-/// 关闭码分档（对齐官方 Node SDK）：4914/4915 致命不重连；4004 只刷新
+/// 关闭码分档（官方 Node SDK 同款）：4914/4915 致命不重连；4004 只刷新
 /// token；4006/4007/4009 与 4900~4913 清 session 重新鉴权；4008 限流等
 /// 60 秒；其余按常规退避重连。
-async fn close_outcome(ctx: &Arc<Context>, was_ready: bool, code: Option<u16>) -> Outcome {
+async fn close_outcome(ctx: &Context, was_ready: bool, code: Option<u16>) -> Outcome {
     let outcome = |error: String| Outcome::breakdown(was_ready, error);
     match code {
         Some(4914) => Outcome {
@@ -239,15 +239,10 @@ async fn close_outcome(ctx: &Arc<Context>, was_ready: bool, code: Option<u16>) -
             ctx.token.invalidate().await;
             outcome("鉴权失败（关闭码 4004），已丢弃 token 缓存".to_owned())
         }
-        Some(code @ (4006 | 4007 | 4009)) => {
-            *ctx.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        Some(code @ (4006 | 4007 | 4009 | 4900..=4913)) => {
+            clear_session(ctx);
             ctx.token.invalidate().await;
             outcome(format!("会话失效（关闭码 {code}），重新鉴权"))
-        }
-        Some(code @ 4900..=4913) => {
-            *ctx.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
-            ctx.token.invalidate().await;
-            outcome(format!("服务端内部错误（关闭码 {code}），重新鉴权"))
         }
         Some(4008) => Outcome {
             delay: Some(Duration::from_secs(60)),
@@ -261,7 +256,7 @@ async fn close_outcome(ctx: &Arc<Context>, was_ready: bool, code: Option<u16>) -
 }
 
 async fn dispatch_frame(
-    ctx: &Arc<Context>,
+    ctx: &Context,
     events: &mpsc::Sender<Result<DriverEvent, AnyError>>,
     ready: &mut Option<oneshot::Sender<()>>,
     was_ready: &mut bool,
@@ -323,7 +318,7 @@ async fn dispatch_frame(
             // d 标记会话是否可恢复：false 清 session 与 token 重新 Identify，
             // true 保留 session 由上层走 Resume。
             if frame["d"].as_bool() != Some(true) {
-                *ctx.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                clear_session(ctx);
                 ctx.token.invalidate().await;
             }
             return FrameAction::InvalidSession;
@@ -333,7 +328,11 @@ async fn dispatch_frame(
     FrameAction::Continue
 }
 
-fn record_seq(ctx: &Arc<Context>, frame: &Value) {
+fn clear_session(ctx: &Context) {
+    *ctx.session.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+fn record_seq(ctx: &Context, frame: &Value) {
     let Some(seq) = frame["s"].as_u64() else {
         return;
     };
@@ -365,31 +364,27 @@ async fn expect_hello(
 }
 
 /// 官方推荐先调 `GET /gateway` 拿接入点；失败时退回配置或默认地址。
-async fn resolve_endpoint(ctx: &Arc<Context>) -> String {
+async fn resolve_endpoint(ctx: &Context) -> String {
     if let Some(url) = &ctx.config.ws_url {
         return url.clone();
     }
-    let endpoint = match ctx.token.authorization().await {
-        Ok(authorization) => match ctx
+    let probed = async {
+        let authorization = ctx.token.authorization().await.ok()?;
+        let body = ctx
             .http
             .get(format!("{}/gateway", ctx.config.api_base()))
             .header("Authorization", authorization)
             .send()
             .await
-        {
-            Ok(response) => match response.json::<Value>().await {
-                Ok(body) => body["url"].as_str().map(str::to_owned),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
-    match endpoint {
-        Some(url) => url,
-        None => {
-            tracing::debug!("接入点探测失败，使用默认地址");
-            ctx.config.fallback_ws_url().to_owned()
-        }
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()?;
+        body["url"].as_str().map(str::to_owned)
     }
+    .await;
+    probed.unwrap_or_else(|| {
+        tracing::debug!("接入点探测失败，使用默认地址");
+        ctx.config.fallback_ws_url().to_owned()
+    })
 }

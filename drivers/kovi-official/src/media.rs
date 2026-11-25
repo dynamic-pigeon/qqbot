@@ -7,58 +7,18 @@
 //! 换回同构的 file_info。file_info 带 ttl，按内容键缓存复用。
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use md5::Digest as _;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::token::TokenError;
-
-pub enum MediaScope {
-    Group(String),
-    User(String),
-}
-
-impl MediaScope {
-    fn upload_path(&self) -> String {
-        match self {
-            MediaScope::Group(openid) => format!("/v2/groups/{openid}/files"),
-            MediaScope::User(openid) => format!("/v2/users/{openid}/files"),
-        }
-    }
-
-    fn upload_prepare_path(&self) -> String {
-        match self {
-            MediaScope::Group(openid) => format!("/v2/groups/{openid}/upload_prepare"),
-            MediaScope::User(openid) => format!("/v2/users/{openid}/upload_prepare"),
-        }
-    }
-
-    fn upload_part_finish_path(&self) -> String {
-        match self {
-            MediaScope::Group(openid) => format!("/v2/groups/{openid}/upload_part_finish"),
-            MediaScope::User(openid) => format!("/v2/users/{openid}/upload_part_finish"),
-        }
-    }
-
-    pub fn send_path(&self) -> String {
-        match self {
-            MediaScope::Group(openid) => format!("/v2/groups/{openid}/messages"),
-            MediaScope::User(openid) => format!("/v2/users/{openid}/messages"),
-        }
-    }
-
-    /// file_info 只能在同类型会话内使用，缓存键带上会话。
-    fn cache_tag(&self) -> &str {
-        match self {
-            MediaScope::Group(_) => "g",
-            MediaScope::User(_) => "u",
-        }
-    }
-}
+use crate::token::{TokenError, TokenManager};
+use crate::{ChatScope, PostError, UPLOAD_TIMEOUT, de_u64, post_json};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MediaSource {
@@ -72,12 +32,30 @@ pub enum MediaSource {
 }
 
 impl MediaSource {
+    /// 缓存键只认内容；本地图读成字节之后才有键。
     fn cache_key(&self) -> String {
         match self {
             MediaSource::Url(url) => format!("url:{url}"),
             MediaSource::Bytes { data, .. } => format!("bytes:{:016x}", fnv1a(data)),
-            MediaSource::FilePath(_) => unreachable!("本地路径在缓存键构造前已展开为字节"),
+            MediaSource::FilePath(_) => unreachable!("本地图在读成字节之后才有缓存键"),
         }
+    }
+
+    /// 读出本地图；URL 与字节原样返回。
+    async fn read_local(&self) -> Result<Self, MediaError> {
+        let MediaSource::FilePath(path) = self else {
+            return Ok(self.clone());
+        };
+        let data = kovi::tokio::fs::read(path)
+            .await
+            .map_err(|error| MediaError {
+                message: format!("读取 {path} 失败: {error}"),
+            })?;
+        let filename = Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image.png".to_owned());
+        Ok(MediaSource::Bytes { data, filename })
     }
 }
 
@@ -91,21 +69,33 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// 官方接口会把数字返回成字符串，u64 字段两种形态都收。
-fn de_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum U64 {
-        Number(u64),
-        Text(String),
-    }
+#[derive(Debug, thiserror::Error)]
+#[error("富媒体上传失败: {message}")]
+pub struct MediaError {
+    pub message: String,
+}
 
-    match U64::deserialize(deserializer)? {
-        U64::Number(number) => Ok(number),
-        U64::Text(text) => text.parse().map_err(serde::de::Error::custom),
+impl From<reqwest::Error> for MediaError {
+    fn from(error: reqwest::Error) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<TokenError> for MediaError {
+    fn from(error: TokenError) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<PostError> for MediaError {
+    fn from(error: PostError) -> Self {
+        Self {
+            message: error.to_string(),
+        }
     }
 }
 
@@ -113,32 +103,63 @@ where
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 const LONG_TTL_FALLBACK: Duration = Duration::from_secs(60 * 60);
 
-/// 上传类请求的超时（官方 SDK 同款 120 秒），覆盖 client 默认 30 秒。
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// 直传的字节上限，达到即改走分块。生产实测 10,809,442 字节被平台拒
-/// （HTTP 400 err_code 40093011），门槛按十进制 10MB 收口。
+/// 直传的字节上限，达到即改走分块。平台对 10,809,442 字节即回
+/// err_code 40093011，门槛取十进制 10MB。
 const DIRECT_UPLOAD_LIMIT: usize = 10_000_000;
 
 /// upload_prepare 要求的 md5_10m 截断长度（官方 SDK 同款魔数）。
 const MD5_10M_SIZE: usize = 10_002_432;
 
+/// upload_part_finish 报此业务码表示分块尚未被平台确认。
+const PART_PENDING_CODE: u64 = 40093001;
+const PART_FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// prepare 没给 retry_timeout 时的确认重试时限。
+const DEFAULT_PART_FINISH_RETRY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const MAX_PART_FINISH_RETRY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
+
+#[derive(Deserialize)]
+struct UploadResponse {
+    file_info: String,
+    #[serde(default, deserialize_with = "de_u64")]
+    ttl: u64,
+}
+
+#[derive(Deserialize)]
+struct UploadPrepareResponse {
+    upload_id: String,
+    #[serde(deserialize_with = "de_u64")]
+    block_size: u64,
+    parts: Vec<UploadPart>,
+    /// 平台给的分块确认重试时限（秒）。
+    #[serde(default, deserialize_with = "de_u64")]
+    retry_timeout: u64,
+}
+
+#[derive(Deserialize)]
+struct UploadPart {
+    #[serde(deserialize_with = "de_u64")]
+    index: u64,
+    presigned_url: String,
+}
+
+#[derive(Deserialize)]
+struct MaterialPrepareResponse {
+    upload_id: String,
+    presigned_url: String,
+}
+
+#[derive(Deserialize)]
+struct MaterialCompleteResponse {
+    url: String,
+    #[serde(default, deserialize_with = "de_u64")]
+    ttl: u64,
+}
+
 pub struct MediaStore {
     inner: std::sync::Mutex<HashMap<String, (String, Instant)>>,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("富媒体上传失败: {message}")]
-pub struct MediaError {
-    pub message: String,
-}
-
-impl From<TokenError> for MediaError {
-    fn from(error: TokenError) -> Self {
-        MediaError {
-            message: error.to_string(),
-        }
-    }
 }
 
 /// 嗅探图片 Content-Type；素材接口要求扩展名与声明一致。
@@ -219,26 +240,15 @@ fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// 满额时平台报错，由调用方回退为独立 media 消息。
 pub(crate) async fn material_url(
     http: &reqwest::Client,
-    token: &crate::token::TokenManager,
+    token: &TokenManager,
     api_base: &str,
     store: &MediaStore,
     source: &MediaSource,
 ) -> Result<MaterialRef, MediaError> {
-    let resolved = match source {
-        MediaSource::FilePath(path) => MediaSource::Bytes {
-            data: kovi::tokio::fs::read(path).await.map_err(|e| MediaError {
-                message: format!("读取 {path} 失败: {e}"),
-            })?,
-            filename: std::path::Path::new(path)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "image.png".to_owned()),
-        },
-        other => other.clone(),
-    };
-    let MediaSource::Bytes { data, .. } = resolved else {
+    let source = source.read_local().await?;
+    let MediaSource::Bytes { data, .. } = source else {
         return Err(MediaError {
-            message: "markdown 嵌图只接受本地图或公网 URL".to_owned(),
+            message: "markdown 嵌图只接受本地图".to_owned(),
         });
     };
 
@@ -258,105 +268,51 @@ pub(crate) async fn material_url(
     }
 
     let (content_type, extension) = sniff_content_type(&data);
-    let file_name = format!("image.{extension}");
     let md5 = md5_hex(&data);
-    let sha1 = sha1_hex(&data);
+    let prepare = json!({
+        "file_name": format!("image.{extension}"),
+        "file_size": data.len(),
+        "content_type": content_type,
+        "md5": md5,
+        "sha1": sha1_hex(&data),
+    });
 
     let authorization = token.authorization().await?;
-    // 1. 申请上传
-    let prepare = http
-        .post(format!("{api_base}/v2/media-images/prepare"))
-        .header("Authorization", &authorization)
-        .json(&serde_json::json!({
-            "file_name": file_name,
-            "file_size": data.len(),
-            "content_type": content_type,
-            "md5": md5.clone(),
-            "sha1": sha1,
-        }))
-        .send()
-        .await
-        .map_err(|e| MediaError {
-            message: e.to_string(),
-        })?;
-    let status = prepare.status();
-    let text = prepare.text().await.map_err(|e| MediaError {
-        message: e.to_string(),
-    })?;
-    if !status.is_success() {
-        return Err(MediaError {
-            message: format!("prepare HTTP {status}: {text}"),
-        });
-    }
-    #[derive(Deserialize)]
-    struct PrepareResponse {
-        upload_id: String,
-        presigned_url: String,
-    }
-    let parsed: PrepareResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-        message: format!("prepare 响应解析失败（{text}）: {e}"),
-    })?;
+    let text = post_upload(
+        http,
+        &authorization,
+        format!("{api_base}/v2/media-images/prepare"),
+        &prepare,
+        "prepare",
+    )
+    .await?;
+    let prepared: MaterialPrepareResponse = parse_response(&text, "prepare")?;
 
-    // 2. 预签名 PUT 直传（不能带 Authorization 头，COS 只认预签名）
-    let put = http
-        .put(&parsed.presigned_url)
-        .timeout(UPLOAD_TIMEOUT)
-        .header("Content-Type", content_type)
-        .body(data.clone())
-        .send()
-        .await
-        .map_err(|e| MediaError {
-            message: format!("上传失败: {e}"),
-        })?;
-    let put_status = put.status();
-    if !put_status.is_success() {
-        let body = put.text().await.unwrap_or_default();
-        return Err(MediaError {
-            message: format!("上传 HTTP {put_status}: {body}"),
-        });
-    }
+    put_presigned(http, &prepared.presigned_url, data, Some(content_type)).await?;
 
-    // 3. 完成上传，拿 qqbot-media:// 引用
-    let complete = http
-        .post(format!("{api_base}/v2/media-images/complete"))
-        .header("Authorization", authorization)
-        .json(&serde_json::json!({
-            "upload_id": parsed.upload_id,
-            "md5": md5,
-        }))
-        .send()
-        .await
-        .map_err(|e| MediaError {
-            message: e.to_string(),
-        })?;
-    let status = complete.status();
-    let text = complete.text().await.map_err(|e| MediaError {
-        message: e.to_string(),
-    })?;
-    if !status.is_success() {
-        return Err(MediaError {
-            message: format!("complete HTTP {status}: {text}"),
-        });
-    }
-    #[derive(Deserialize)]
-    struct CompleteResponse {
-        url: String,
-        #[serde(default)]
-        ttl: u64,
-    }
-    let parsed: CompleteResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-        message: format!("complete 响应解析失败（{text}）: {e}"),
-    })?;
+    let complete = json!({
+        "upload_id": prepared.upload_id,
+        "md5": md5,
+    });
+    let text = post_upload(
+        http,
+        &authorization,
+        format!("{api_base}/v2/media-images/complete"),
+        &complete,
+        "complete",
+    )
+    .await?;
+    let completed: MaterialCompleteResponse = parse_response(&text, "complete")?;
 
-    // 滑动 90 天有效，缓存按 7 天保守收口。
-    let lifetime = if parsed.ttl == 0 {
+    // 引用 90 天滑动有效，缓存按 7 天收口。
+    let lifetime = if completed.ttl == 0 {
         Duration::from_secs(7 * 24 * 60 * 60)
     } else {
-        Duration::from_secs(parsed.ttl).saturating_sub(EXPIRY_MARGIN)
+        Duration::from_secs(completed.ttl).saturating_sub(EXPIRY_MARGIN)
     };
-    store.store(&cache_key, &parsed.url, lifetime);
+    store.store(&cache_key, &completed.url, lifetime);
     Ok(MaterialRef {
-        url: parsed.url,
+        url: completed.url,
         width,
         height,
     })
@@ -372,27 +328,13 @@ impl MediaStore {
     pub async fn upload(
         &self,
         http: &reqwest::Client,
-        token: &crate::token::TokenManager,
+        token: &TokenManager,
         api_base: &str,
-        scope: &MediaScope,
+        scope: &ChatScope,
         source: MediaSource,
     ) -> Result<String, MediaError> {
-        // 本地路径先读成字节，之后统一按 URL / 字节两种来源处理。
-        let source = match source {
-            MediaSource::FilePath(path) => {
-                let data = kovi::tokio::fs::read(&path).await.map_err(|e| MediaError {
-                    message: format!("读取 {path} 失败: {e}"),
-                })?;
-                let filename = std::path::Path::new(&path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "image.png".to_owned());
-                MediaSource::Bytes { data, filename }
-            }
-            resolved => resolved,
-        };
-
-        let cache_key = format!("{}:{}", scope.cache_tag(), source.cache_key());
+        let source = source.read_local().await?;
+        let cache_key = format!("{}:{}", scope.kind(), source.cache_key());
         if let Some(cached) = self.lookup(&cache_key) {
             return Ok(cached);
         }
@@ -436,48 +378,12 @@ impl MediaStore {
     }
 }
 
-/// 带 Authorization 的上传类 POST，非 2xx 时把状态与响应体并入错误。
-async fn post_authorized(
-    http: &reqwest::Client,
-    authorization: &str,
-    url: String,
-    body: &serde_json::Value,
-) -> Result<String, MediaError> {
-    let response = http
-        .post(url)
-        .timeout(UPLOAD_TIMEOUT)
-        .header("Authorization", authorization)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| MediaError {
-            message: e.to_string(),
-        })?;
-    let status = response.status();
-    let text = response.text().await.map_err(|e| MediaError {
-        message: e.to_string(),
-    })?;
-    if !status.is_success() {
-        return Err(MediaError {
-            message: format!("HTTP {status}: {text}"),
-        });
-    }
-    Ok(text)
-}
-
-#[derive(Deserialize)]
-struct UploadResponse {
-    file_info: String,
-    #[serde(default, deserialize_with = "de_u64")]
-    ttl: u64,
-}
-
 /// 直传：远程 URL 由平台代下载，本地图走 base64 file_data。
 async fn upload_direct(
     http: &reqwest::Client,
-    token: &crate::token::TokenManager,
+    token: &TokenManager,
     api_base: &str,
-    scope: &MediaScope,
+    scope: &ChatScope,
     source: &MediaSource,
 ) -> Result<(String, u64), MediaError> {
     // srv_send_msg=false：只取 file_info 由发送接口发出，直发会占主动消息频次。
@@ -490,54 +396,36 @@ async fn upload_direct(
             body["file_data"] = json!(BASE64.encode(data));
             body["file_name"] = json!(filename);
         }
-        MediaSource::FilePath(_) => unreachable!("本地路径在 upload 入口已展开为字节"),
+        MediaSource::FilePath(_) => unreachable!("本地图在 upload 入口已读成字节"),
     }
 
     let authorization = token.authorization().await?;
-    let text = post_authorized(
+    let text = post_upload(
         http,
         &authorization,
-        format!("{}{}", api_base, scope.upload_path()),
+        format!("{}{}/files", api_base, scope.base_path()),
         &body,
+        "直传",
     )
     .await?;
-    let parsed: UploadResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-        message: format!("响应解析失败（{text}）: {e}"),
-    })?;
-    Ok((parsed.file_info, parsed.ttl))
+    let response: UploadResponse = parse_response(&text, "直传")?;
+    Ok((response.file_info, response.ttl))
 }
 
-#[derive(Deserialize)]
-struct UploadPart {
-    #[serde(deserialize_with = "de_u64")]
-    index: u64,
-    presigned_url: String,
-}
-
-#[derive(Deserialize)]
-struct PrepareResponse {
-    upload_id: String,
-    #[serde(deserialize_with = "de_u64")]
-    block_size: u64,
-    parts: Vec<UploadPart>,
-}
-
-/// 分块上传（对齐官方 SDK 的三段流程）：
-/// `upload_prepare` 提交三个哈希换分块预签名 URL；逐块 PUT 到 COS 后
-/// `upload_part_finish` 确认；`complete`（同直传的 /files 路径）换回
-/// 与直传同构的 file_info，发送侧无感。
+/// 分块上传（官方 SDK 同款三段流程）：`upload_prepare` 提交三个哈希换分块
+/// 预签名 URL；逐块 PUT 到 COS 后 `upload_part_finish` 确认；complete 复用
+/// 直传的 /files 路径换回同构的 file_info。
 async fn upload_chunked(
     http: &reqwest::Client,
-    token: &crate::token::TokenManager,
+    token: &TokenManager,
     api_base: &str,
-    scope: &MediaScope,
+    scope: &ChatScope,
     data: &[u8],
     filename: &str,
 ) -> Result<(String, u64), MediaError> {
     let (md5, sha1, md5_10m) = prepare_hashes(data);
     let authorization = token.authorization().await?;
-
-    let body = json!({
+    let prepare = json!({
         "file_type": 1,
         "file_name": filename,
         "file_size": data.len(),
@@ -545,112 +433,160 @@ async fn upload_chunked(
         "sha1": sha1,
         "md5_10m": md5_10m,
     });
-    let text = post_authorized(
+    let text = post_upload(
         http,
         &authorization,
-        format!("{}{}", api_base, scope.upload_prepare_path()),
-        &body,
+        format!("{}{}/upload_prepare", api_base, scope.base_path()),
+        &prepare,
+        "upload_prepare",
     )
     .await?;
-    let parsed: PrepareResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-        message: format!("prepare 响应解析失败（{text}）: {e}"),
-    })?;
+    let prepared: UploadPrepareResponse = parse_response(&text, "upload_prepare")?;
     tracing::info!(
         "分块上传开始 size={} block_size={} parts={}",
         data.len(),
-        parsed.block_size,
-        parsed.parts.len()
+        prepared.block_size,
+        prepared.parts.len()
     );
 
-    for part in &parsed.parts {
-        let offset = ((part.index - 1) * parsed.block_size) as usize;
-        let end = (offset + parsed.block_size as usize).min(data.len());
-        if offset > end || end > data.len() {
+    let retry_timeout = match prepared.retry_timeout {
+        0 => DEFAULT_PART_FINISH_RETRY_TIMEOUT,
+        seconds => Duration::from_secs(seconds).min(MAX_PART_FINISH_RETRY_TIMEOUT),
+    };
+    let finish_url = format!("{}{}/upload_part_finish", api_base, scope.base_path());
+    for part in &prepared.parts {
+        let Some(range) = part_range(part.index, prepared.block_size, data.len()) else {
             return Err(MediaError {
                 message: format!(
-                    "分块 {} 区间非法: offset={offset} end={end} size={}",
+                    "分块 {} 区间非法: block_size={} size={}",
                     part.index,
+                    prepared.block_size,
                     data.len()
                 ),
             });
-        }
-        let bytes = &data[offset..end];
-        put_part_with_retry(http, &part.presigned_url, bytes).await?;
+        };
+        let bytes = &data[range];
+
+        let url = &part.presigned_url;
+        let put = || put_presigned(http, url, bytes.to_vec(), None);
+        retry_backoff(put).await?;
 
         let finish = json!({
-            "upload_id": parsed.upload_id,
+            "upload_id": prepared.upload_id,
             "part_index": part.index,
-            "block_size": end - offset,
+            "block_size": bytes.len(),
             "md5": md5_hex(bytes),
         });
-        post_authorized(
-            http,
-            &authorization,
-            format!("{}{}", api_base, scope.upload_part_finish_path()),
-            &finish,
-        )
-        .await
-        .map_err(|e| MediaError {
-            message: format!("upload_part_finish 失败（第 {} 块）: {e}", part.index),
-        })?;
+        finish_part(http, &authorization, &finish_url, &finish, retry_timeout)
+            .await
+            .map_err(|error| MediaError {
+                message: format!("upload_part_finish 失败（第 {} 块）: {error}", part.index),
+            })?;
     }
 
-    let complete = json!({ "upload_id": parsed.upload_id });
-    let text = post_authorized(
-        http,
-        &authorization,
-        format!("{}{}", api_base, scope.upload_path()),
-        &complete,
-    )
-    .await?;
-    let parsed: UploadResponse = serde_json::from_str(&text).map_err(|e| MediaError {
-        message: format!("complete 响应解析失败（{text}）: {e}"),
-    })?;
-    Ok((parsed.file_info, parsed.ttl))
+    let complete = json!({ "upload_id": prepared.upload_id });
+    let url = format!("{}{}/files", api_base, scope.base_path());
+    let post = || post_upload(http, &authorization, url.clone(), &complete, "complete");
+    let text = retry_backoff(post).await?;
+    let response: UploadResponse = parse_response(&text, "complete")?;
+    Ok((response.file_info, response.ttl))
 }
 
-/// 分块 PUT 到 COS 预签名 URL（不带 Authorization，COS 只认预签名），
-/// 失败按 2s/4s 退避重试两次。
-async fn put_part_with_retry(
+/// 分块在文件里的字节区间；`index` 从 1 起。
+fn part_range(index: u64, block_size: u64, len: usize) -> Option<std::ops::Range<usize>> {
+    let block_size = usize::try_from(block_size).ok()?;
+    let start = usize::try_from(index.checked_sub(1)?)
+        .ok()?
+        .checked_mul(block_size)?;
+    let end = start.checked_add(block_size)?.min(len);
+    (start < end).then_some(start..end)
+}
+
+/// 分块确认。业务码 40093001 表示平台尚未确认该分块，在 `retry_timeout`
+/// 内每秒重试。
+async fn finish_part(
+    http: &reqwest::Client,
+    authorization: &str,
+    url: &str,
+    body: &Value,
+    retry_timeout: Duration,
+) -> Result<(), PostError> {
+    let deadline = Instant::now() + retry_timeout;
+    loop {
+        match post_json(http, authorization, url.to_owned(), body, UPLOAD_TIMEOUT).await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.biz_code() == Some(PART_PENDING_CODE) && Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+        }
+        kovi::tokio::time::sleep(PART_FINISH_RETRY_INTERVAL).await;
+    }
+}
+
+/// 上传步骤的 POST：上传类超时，失败信息带步骤名。
+async fn post_upload(
+    http: &reqwest::Client,
+    authorization: &str,
+    url: String,
+    body: &Value,
+    step: &str,
+) -> Result<String, MediaError> {
+    post_json(http, authorization, url, body, UPLOAD_TIMEOUT)
+        .await
+        .map_err(|error| MediaError {
+            message: format!("{step}: {error}"),
+        })
+}
+
+fn parse_response<'a, T: Deserialize<'a>>(text: &'a str, step: &str) -> Result<T, MediaError> {
+    serde_json::from_str(text).map_err(|error| MediaError {
+        message: format!("{step} 响应解析失败（{text}）: {error}"),
+    })
+}
+
+/// 失败按 2s / 4s 退避重试两次。
+async fn retry_backoff<T, F, Fut>(mut attempt: F) -> Result<T, MediaError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, MediaError>>,
+{
+    let mut delay = RETRY_INITIAL_DELAY;
+    loop {
+        let error = match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if delay > RETRY_MAX_DELAY {
+            return Err(error);
+        }
+        tracing::warn!("上传步骤失败，{} 秒后重试: {error}", delay.as_secs());
+        kovi::tokio::time::sleep(delay).await;
+        delay *= 2;
+    }
+}
+
+/// PUT 字节到预签名 URL（不带 Authorization，COS 只认预签名）。
+async fn put_presigned(
     http: &reqwest::Client,
     url: &str,
-    bytes: &[u8],
+    bytes: Vec<u8>,
+    content_type: Option<&str>,
 ) -> Result<(), MediaError> {
-    let mut delay = Duration::from_secs(2);
-    let mut last_error = None;
-    for attempt in 0..3 {
-        if attempt > 0 {
-            kovi::tokio::time::sleep(delay).await;
-            delay *= 2;
-        }
-        let response = http
-            .put(url)
-            .timeout(UPLOAD_TIMEOUT)
-            .body(bytes.to_vec())
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                last_error = Some(MediaError {
-                    message: format!("分块 PUT HTTP {status}: {body}"),
-                });
-            }
-            Err(e) => {
-                last_error = Some(MediaError {
-                    message: format!("分块 PUT 失败: {e}"),
-                });
-            }
-        }
-        if let Some(error) = &last_error {
-            tracing::warn!("第 {} 次分块 PUT 失败: {error}", attempt + 1);
-        }
+    let mut request = http.put(url).timeout(UPLOAD_TIMEOUT).body(bytes);
+    if let Some(content_type) = content_type {
+        request = request.header("Content-Type", content_type);
     }
-    Err(last_error.unwrap_or_else(|| MediaError {
-        message: "分块 PUT 失败".to_owned(),
-    }))
+    let response = request.send().await.map_err(|error| MediaError {
+        message: format!("预签名 PUT 失败: {error}"),
+    })?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(MediaError {
+        message: format!("预签名 PUT HTTP {status}: {body}"),
+    })
 }
 
 /// upload_prepare 的三件套哈希：全量 md5 / sha1 / 前 `MD5_10M_SIZE`
@@ -693,12 +629,62 @@ mod tests {
 
     #[test]
     fn prepare响应数字字段收字符串形态() {
-        let parsed: PrepareResponse = serde_json::from_str(
-            r#"{"upload_id":"U1","block_size":"10485760","parts":[{"index":"1","presigned_url":"https://cos.example/p1"}]}"#,
+        let parsed: UploadPrepareResponse = serde_json::from_str(
+            r#"{"upload_id":"U1","block_size":"10485760","parts":[{"index":"1","presigned_url":"https://cos.example/p1"}],"retry_timeout":"120"}"#,
         )
         .unwrap();
         assert_eq!(parsed.block_size, 10_485_760);
         assert_eq!(parsed.parts[0].index, 1);
         assert_eq!(parsed.parts[0].presigned_url, "https://cos.example/p1");
+        assert_eq!(parsed.retry_timeout, 120);
+    }
+
+    #[test]
+    fn 分块区间按序号顺延且末块截到文件尾() {
+        let range = |index, block_size| part_range(index, block_size, 25);
+        assert_eq!(range(1, 10), Some(0..10));
+        assert_eq!(range(2, 10), Some(10..20));
+        assert_eq!(range(3, 10), Some(20..25));
+        // 序号越界、序号为 0、块大小为 0 都没有合法区间。
+        assert_eq!(range(4, 10), None);
+        assert_eq!(range(0, 10), None);
+        assert_eq!(range(1, 0), None);
+        assert_eq!(range(u64::MAX, u64::MAX), None);
+    }
+
+    #[test]
+    fn 业务错误码取响应体里的err_code或code() {
+        let biz_code = |body: &str| {
+            PostError::Rejected {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: body.to_owned(),
+            }
+            .biz_code()
+        };
+        assert_eq!(biz_code(r#"{"err_code":40093001}"#), Some(40093001));
+        assert_eq!(biz_code(r#"{"code":"40093002"}"#), Some(40093002));
+        assert_eq!(biz_code("not json"), None);
+    }
+
+    #[test]
+    fn 图片尺寸嗅探() {
+        // PNG 的宽高在 IHDR（大端），GIF 的在逻辑屏幕描述符（小端）。
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x01\x00\x00\x00\x00\xc8";
+        let gif = b"GIF89a\x40\x01\xd0\x00";
+        assert_eq!(sniff_dimensions(png), Some((256, 200)));
+        assert_eq!(sniff_dimensions(gif), Some((320, 208)));
+        assert_eq!(sniff_dimensions(b"junk"), None);
+    }
+
+    #[test]
+    fn 图片类型嗅探() {
+        assert_eq!(sniff_content_type(b"\x89PNG"), ("image/png", "png"));
+        assert_eq!(
+            sniff_content_type(b"\xff\xd8\xff\xe0"),
+            ("image/jpeg", "jpg")
+        );
+        assert_eq!(sniff_content_type(b"GIF89a"), ("image/gif", "gif"));
+        // 未知内容按 png 兜底，交给平台校验。
+        assert_eq!(sniff_content_type(b"junk"), ("image/png", "png"));
     }
 }

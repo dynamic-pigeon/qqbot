@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use kovi::message::Segment;
 use serde_json::{Value, json};
 
+use crate::ChatScope;
 use crate::Context;
-use crate::passive::{Conversation, conversation_key};
 
 pub fn translate(ctx: &Context, event_type: &str, payload: &Value) -> Option<Value> {
     let message_id = payload["id"].as_str()?;
@@ -18,8 +18,10 @@ pub fn translate(ctx: &Context, event_type: &str, payload: &Value) -> Option<Val
         return None;
     }
     match event_type {
-        "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" => translate_group(ctx, payload),
-        "C2C_MESSAGE_CREATE" => translate_private(ctx, payload),
+        "GROUP_AT_MESSAGE_CREATE" | "GROUP_MESSAGE_CREATE" => {
+            translate_group(ctx, payload, message_id)
+        }
+        "C2C_MESSAGE_CREATE" => translate_private(ctx, payload, message_id),
         _ => None,
     }
 }
@@ -53,9 +55,8 @@ impl SeenMessages {
     }
 }
 
-fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
+fn translate_group(ctx: &Context, payload: &Value, message_id: &str) -> Option<Value> {
     let group_openid = payload["group_openid"].as_str()?;
-    let message_id = payload["id"].as_str()?;
     let author = &payload["author"];
     let member_openid = author["member_openid"].as_str()?;
     let nickname = author["username"].as_str().unwrap_or_default();
@@ -64,24 +65,52 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
         .filter(|name| !name.is_empty());
     let avatar = author["avatar"].as_str();
 
-    // 官方没有按需查询成员的接口，事件流是唯一来源，路过即入缓存。
     ctx.members
         .update(group_openid, member_openid, nickname, card, avatar);
-    ctx.inbound.register(
-        &conversation_key(Conversation::Group, group_openid),
-        message_id,
-    );
+    ctx.inbound
+        .register(&ChatScope::Group(group_openid.to_owned()), message_id);
 
-    let raw_text = sanitize_content(payload["content"].as_str().unwrap_or_default());
-    // 生产实测：引用回复时用户正文仍在顶层 content（纯引用不打字才剩
-    // 空白）；顶层为空时回退读 msg_elements 的正文元素。被引用消息
-    // （message_type 102/103）是别人的内容，不并入正文。
     if payload["msg_elements"]
         .as_array()
         .is_some_and(|list| !list.is_empty())
     {
         tracing::debug!("携带 msg_elements 的群消息，原始载荷: {payload}");
     }
+
+    Some(json!({
+        "time": timestamp_to_epoch(payload["timestamp"].as_str()),
+        "group_openid": group_openid,
+        "user_openid": member_openid,
+        "nickname": nickname,
+        "card": card,
+        "avatar": avatar,
+        "message_id": message_id,
+        "message": message_segments(payload),
+    }))
+}
+
+fn translate_private(ctx: &Context, payload: &Value, message_id: &str) -> Option<Value> {
+    let author = &payload["author"];
+    let user_openid = author["user_openid"]
+        .as_str()
+        .or_else(|| author["id"].as_str())?;
+    ctx.inbound
+        .register(&ChatScope::User(user_openid.to_owned()), message_id);
+
+    Some(json!({
+        "time": timestamp_to_epoch(payload["timestamp"].as_str()),
+        "user_openid": user_openid,
+        "nickname": author["username"].as_str().unwrap_or_default(),
+        "avatar": author["avatar"].as_str(),
+        "message_id": message_id,
+        "message": message_segments(payload),
+    }))
+}
+
+/// 一条消息的消息段：引用、正文、图片。
+fn message_segments(payload: &Value) -> Vec<Segment> {
+    let raw_text = sanitize_content(payload["content"].as_str().unwrap_or_default());
+    // 顶层 content 非空时就是用户正文；为空时回退读 msg_elements 的正文元素。
     let (text, element_attachments) = if raw_text.is_empty() {
         text_from_msg_elements(&payload["msg_elements"])
     } else {
@@ -92,88 +121,38 @@ fn translate_group(ctx: &Context, payload: &Value) -> Option<Value> {
         .map(|list| list.iter().collect())
         .unwrap_or_default();
     attachments.extend(element_attachments);
-    let mut segments = Vec::new();
-    if let Some(reply) = reply_segment(payload) {
-        segments.push(reply);
-    }
-    let built = build_segments(&text, &attachments);
-    if built.is_empty() && segments.is_empty() {
-        tracing::debug!("群消息无可解析内容，原始载荷: {payload}");
-    }
-    segments.extend(built);
 
-    Some(json!({
-        "time": timestamp_to_epoch(payload["timestamp"].as_str()),
-        "group_openid": group_openid,
-        "user_openid": member_openid,
-        "nickname": nickname,
-        "card": card,
-        "avatar": avatar,
-        "message_id": message_id,
-        "message": segments,
-    }))
+    let mut segments = reply_segment(payload).into_iter().collect::<Vec<_>>();
+    segments.extend(build_segments(&text, &attachments));
+    if segments.is_empty() {
+        tracing::debug!("消息无可解析内容，原始载荷: {payload}");
+    }
+    segments
 }
 
-/// 引用回复转 reply 段：data 是官方 msg_elements 首个元素原样（平台
-/// 契约：引用时它就是被引消息，含 content/attachments/ark_data 与自身
-/// 的 msg_idx 索引），不做字段重解释——卡片是卡片、附件是附件。触发
-/// 判定用官方自己的信号：元素 message_type=103 或 ext 带 ref_msg_idx。
+/// 引用回复转 reply 段：data 是官方 msg_elements 首个元素原样（引用时它就是
+/// 被引消息，含 content / attachments / ark_data 与自身的 msg_idx），不做
+/// 字段重解释。触发信号取官方自己的标记：元素 message_type=103 或 ext 带
+/// ref_msg_idx。
 fn reply_segment(payload: &Value) -> Option<Segment> {
-    let elements = payload["msg_elements"].as_array()?;
-    let quoted = elements.first()?;
+    let quoted = payload["msg_elements"].as_array()?.first()?;
     let is_quote = quoted["message_type"].as_i64() == Some(103)
-        || ext_value(payload["message_scene"]["ext"].as_array(), "ref_msg_idx").is_some();
+        || has_ref_msg_idx(payload["message_scene"]["ext"].as_array());
     is_quote.then(|| Segment::new("reply", quoted.clone()))
 }
 
-/// message_scene.ext 是 `key=value` 字符串数组，按等号切分并去空白，
-/// 空值跳过。
-fn ext_value<'a>(ext: Option<&'a Vec<Value>>, key: &str) -> Option<&'a str> {
-    ext?.iter().find_map(|entry| {
-        let entry = entry.as_str()?;
-        let equals = entry.find('=')?;
-        (entry[..equals].trim() == key).then_some(entry[equals + 1..].trim())
-    })
-}
-
-fn translate_private(ctx: &Context, payload: &Value) -> Option<Value> {
-    let message_id = payload["id"].as_str()?;
-    let author = &payload["author"];
-    let user_openid = author["user_openid"]
-        .as_str()
-        .or_else(|| author["id"].as_str())?;
-    let nickname = author["username"].as_str().unwrap_or_default();
-    let avatar = author["avatar"].as_str();
-
-    ctx.inbound.register(
-        &conversation_key(Conversation::User, user_openid),
-        message_id,
-    );
-
-    let raw_text = sanitize_content(payload["content"].as_str().unwrap_or_default());
-    let (text, element_attachments) = if raw_text.trim().is_empty() {
-        text_from_msg_elements(&payload["msg_elements"])
-    } else {
-        (raw_text, Vec::new())
+/// message_scene.ext 是 `key=value` 字符串数组；`ref_msg_idx` 取值为空的
+/// 条目不算引用。
+fn has_ref_msg_idx(ext: Option<&Vec<Value>>) -> bool {
+    let Some(entries) = ext else {
+        return false;
     };
-    let mut attachments: Vec<&Value> = payload["attachments"]
-        .as_array()
-        .map(|list| list.iter().collect())
-        .unwrap_or_default();
-    attachments.extend(element_attachments);
-    let segments = build_segments(&text, &attachments);
-    if segments.is_empty() {
-        tracing::debug!("单聊消息无可解析内容，原始载荷: {payload}");
-    }
-
-    Some(json!({
-        "time": timestamp_to_epoch(payload["timestamp"].as_str()),
-        "user_openid": user_openid,
-        "nickname": nickname,
-        "avatar": avatar,
-        "message_id": message_id,
-        "message": segments,
-    }))
+    entries.iter().any(|entry| {
+        entry
+            .as_str()
+            .and_then(|entry| entry.split_once('='))
+            .is_some_and(|(key, value)| key.trim() == "ref_msg_idx" && !value.trim().is_empty())
+    })
 }
 
 /// 从 msg_elements 提取用户输入的正文与随信附件。message_type：
@@ -241,7 +220,7 @@ const CHAT_RECORD_PREFIX: &str = "[群聊的聊天记录]";
 
 /// 官方顶层 content 是整条消息的文本化产物：@ 提及、表情、合并转发
 /// 都会序列化成标记文本。这里只留用户敲的字——提及与表情、内部标记
-/// 剥除（形态对齐 qqbot-nodejs 的 content-sanitizer 与 text-parsing），
+/// 剥除（形态同 qqbot-nodejs 的 content-sanitizer 与 text-parsing），
 /// 合并转发摘要整条置空。剥完只剩空白即无正文。
 fn sanitize_content(content: &str) -> String {
     let text = strip_platform_markers(&strip_mentions(content));
@@ -348,29 +327,45 @@ fn timestamp_to_epoch(timestamp: Option<&str>) -> i64 {
 mod tests {
     use super::*;
 
+    /// 走生产同款反序列化路径取段列表（event.rs 的 from_value 链）。
+    fn segments_of(event: &Value) -> Vec<Segment> {
+        serde_json::from_value(event["message"].clone()).unwrap()
+    }
+
     fn group_event() -> Value {
         json!({
             "id": "MSG-001",
             "group_openid": "GROUP-ABC",
             "content": "<@!BOTID> /B话榜 日",
             "timestamp": "2026-11-20T12:00:00+08:00",
-            "author": {
-                "member_openid": "MEMBER-1",
-                "username": "张三",
-                "member_nickname": "三哥",
-                "avatar": "https://avatar.example/1.png",
-            },
+            "author": { "member_openid": "MEMBER-1", "username": "张三", "member_nickname": "三哥" },
             "attachments": [
-                {
-                    "content_type": "image/jpeg",
-                    "url": "https://media.example/a.jpg",
-                    "filename": "a.jpg",
-                },
-                {
-                    "content_type": "file",
-                    "url": "https://media.example/b.bin",
-                },
+                { "content_type": "image/jpeg", "url": "https://media.example/a.jpg" },
+                { "content_type": "file", "url": "https://media.example/b.bin" },
             ],
+        })
+    }
+
+    /// 带引用的群消息：`content` 是用户正文，`ext` 是 message_scene.ext，
+    /// `elements` 是 msg_elements。
+    fn quote_event(content: &str, ext: Value, elements: Value) -> Value {
+        json!({
+            "id": "MSG-R",
+            "group_openid": "GROUP-ABC",
+            "content": content,
+            "author": { "member_openid": "MEMBER-1", "username": "张三" },
+            "message_scene": { "ext": ext },
+            "msg_elements": elements,
+        })
+    }
+
+    /// 被引的图片消息：引用时官方把它内联在 msg_elements 首位。
+    fn quoted_image() -> Value {
+        json!({
+            "message_type": 103,
+            "msg_idx": "REFIDX",
+            "content": "原消息",
+            "attachments": [{ "content_type": "image/png", "url": "https://media.example/q.png" }],
         })
     }
 
@@ -382,281 +377,134 @@ mod tests {
         assert!(translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &event).is_none());
     }
 
-    /// 走生产同款反序列化路径取段列表（event.rs 的 from_value 链）。
-    fn segments_of(event: &Value) -> Vec<Segment> {
-        serde_json::from_value(event["message"].clone()).unwrap()
-    }
-
     #[test]
-    fn 群事件翻译携带openid身份() {
+    fn 群事件翻译身份并登记成员与被动槽位() {
         let ctx = Context::for_tests();
         let event = translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &group_event()).unwrap();
 
         assert_eq!(event["group_openid"], "GROUP-ABC");
         assert_eq!(event["user_openid"], "MEMBER-1");
-        assert_eq!(event["message_id"], "MSG-001");
         assert_eq!(event["nickname"], "张三");
         assert_eq!(event["card"], "三哥");
         assert_eq!(event["time"], 1_795_147_200_i64);
+        // 只有图片附件进消息段。
         let segments = segments_of(&event);
         assert_eq!(segments[0].kind, "text");
         assert_eq!(segments[0].data["text"], "/B话榜 日");
-        // 非图片附件不进消息段。
-        assert_eq!(segments.len(), 2);
         assert_eq!(segments[1].kind, "image");
-        assert_eq!(segments[1].data["url"], "https://media.example/a.jpg");
-    }
+        assert_eq!(segments.len(), 2);
 
-    #[test]
-    fn 群事件顺手更新成员缓存与被动槽位() {
-        let ctx = Context::for_tests();
-        translate(&ctx, "GROUP_AT_MESSAGE_CREATE", &group_event());
         let info = ctx.members.member_info("GROUP-ABC", "MEMBER-1").unwrap();
         assert_eq!(info["nickname"], "张三");
-        assert_eq!(
-            ctx.inbound
-                .take_reply_slot(&conversation_key(Conversation::Group, "GROUP-ABC"))
-                .unwrap()
-                .0,
-            "MSG-001"
-        );
+        let scope = ChatScope::Group("GROUP-ABC".to_owned());
+        assert_eq!(ctx.inbound.take_reply_slot(&scope).unwrap().0, "MSG-001");
     }
 
     #[test]
-    fn 单聊事件无群字段() {
+    fn 单聊事件身份与引用段() {
         let ctx = Context::for_tests();
         let payload = json!({
             "id": "C2C-1",
-            "content": "你好",
+            "content": " 666",
             "author": { "user_openid": "USER-9", "username": "李四" },
+            "message_scene": { "ext": ["ref_msg_idx=REFIDX"] },
+            "msg_elements": [quoted_image()],
         });
         let event = translate(&ctx, "C2C_MESSAGE_CREATE", &payload).unwrap();
+
         assert_eq!(event["user_openid"], "USER-9");
         assert!(event.get("group_openid").is_none());
         let segments = segments_of(&event);
-        assert_eq!(segments[0].kind, "text");
-        assert_eq!(segments[0].data["text"], "你好");
-    }
-
-    #[test]
-    fn 提及标记剥离() {
-        assert_eq!(strip_mentions("<@!abc> 文字"), "文字");
-        assert_eq!(strip_mentions("a <@abc> b"), "a b");
-        assert_eq!(strip_mentions("<@!abc>"), "");
-        assert_eq!(strip_mentions("无标记 < 保持"), "无标记 < 保持");
-    }
-
-    #[test]
-    fn 表情标记剥离() {
-        // 生产实测形态：ext 是 base64 JSON。
-        assert_eq!(
-            sanitize_content(r#"看看<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">"#),
-            "看看"
-        );
-        assert_eq!(
-            sanitize_content(r#"<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0="> 哈哈"#),
-            "哈哈"
-        );
-        // 纯表情剥完为空，消息不再有正文。
-        assert_eq!(
-            sanitize_content(r#"<faceType=6,faceId="0",ext="eyJ0ZXh0IjoiIn0=">"#),
-            ""
-        );
-        assert_eq!(sanitize_content("[<face,id=6/>]"), "");
-        assert_eq!(sanitize_content("[<face,id=6>]"), "");
-        // 手打的 < / [ / 半截标记原样保留。
-        assert_eq!(sanitize_content("a < b [c] d"), "a < b [c] d");
-        assert_eq!(
-            sanitize_content("<faceType=6 后面没了"),
-            "<faceType=6 后面没了"
-        );
-        assert_eq!(
-            sanitize_content(r#"<faceType=6,faceId="0" 结构不完整"#),
-            r#"<faceType=6,faceId="0" 结构不完整"#
-        );
-    }
-
-    #[test]
-    fn 内部标记剥离() {
-        assert_eq!(sanitize_content("[internal: foo] 文字"), "文字");
-        assert_eq!(sanitize_content("[Debug] x"), "x");
-        assert_eq!(sanitize_content("[system]"), "");
-        // 与 SDK 正则同款前缀语义：internal 之后直到 `]` 都算标记。
-        assert_eq!(sanitize_content("[internalism] x"), "x");
-    }
-
-    #[test]
-    fn 合并转发摘要整条置空() {
-        // 生产实测形态：固定前缀 + 「=== 消息 n ===」展开。
-        assert_eq!(
-            sanitize_content("[群聊的聊天记录] === 消息 1 === [消息内容] 早 [发送者] 张三"),
-            ""
-        );
-        assert_eq!(sanitize_content("[群聊的聊天记录]"), "");
-        assert_eq!(
-            sanitize_content("说到[群聊的聊天记录]这个词"),
-            "说到[群聊的聊天记录]这个词"
-        );
-    }
-
-    #[test]
-    fn 群消息纯表情无正文段() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "MSG-F2",
-            "group_openid": "GROUP-ABC",
-            "content": "<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiW++8gV0ifQ==\">",
-            "author": { "member_openid": "MEMBER-1", "username": "张三" },
-        });
-        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        let segments: Vec<Segment> = serde_json::from_value(event["message"].clone()).unwrap();
-        assert!(segments.is_empty());
-    }
-
-    #[test]
-    fn 单聊正文同样清理() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "C2C-F1",
-            "content": "<faceType=6,faceId=\"0\",ext=\"eyJ0ZXh0IjoiIn0=\">",
-            "author": { "user_openid": "USER-9", "username": "李四" },
-        });
-        let event = translate(&ctx, "C2C_MESSAGE_CREATE", &payload).unwrap();
-        let segments: Vec<Segment> = serde_json::from_value(event["message"].clone()).unwrap();
-        assert!(segments.is_empty());
-    }
-
-    #[test]
-    fn 引用回复生成reply段并保留正文() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "MSG-R1",
-            "group_openid": "GROUP-ABC",
-            "content": " 666",
-            "author": { "member_openid": "MEMBER-1", "username": "张三" },
-            "message_scene": { "ext": ["ref_msg_idx=REFIDX_QUOTED", "msg_idx=REFIDX_SELF"] },
-            "msg_elements": [
-                {
-                    "message_type": 103,
-                    "content": "6",
-                    "msg_idx": "REFIDX_QUOTED",
-                    "attachments": [
-                        {
-                            "content_type": "image/jpeg",
-                            "url": "https://multimedia.nt.qq.com.cn/download?a=1",
-                        },
-                        {
-                            "content_type": "image/jpeg",
-                            "url": "https://multimedia.nt.qq.com.cn/download?a=2",
-                        },
-                    ],
-                },
-            ],
-        });
-        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        // 引用独立成段，data 是官方被引元素原样：字段名与结构不变。
-        let segments = segments_of(&event);
         assert_eq!(segments[0].kind, "reply");
-        assert_eq!(segments[0].data["msg_idx"], "REFIDX_QUOTED");
-        assert_eq!(segments[0].data["content"], "6");
-        assert_eq!(segments[0].data["attachments"].as_array().unwrap().len(), 2);
-        // 用户正文照常成段，被引图片不进正文图片段。
         assert_eq!(segments[1].kind, "text");
         assert_eq!(segments[1].data["text"], "666");
-        assert_eq!(segments.len(), 2);
+        let scope = ChatScope::User("USER-9".to_owned());
+        assert_eq!(ctx.inbound.take_reply_slot(&scope).unwrap().0, "C2C-1");
     }
 
     #[test]
-    fn 纯引用不打字只有reply段() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "MSG-R2",
-            "group_openid": "GROUP-ABC",
-            "content": " ",
-            "author": { "member_openid": "MEMBER-1", "username": "张三" },
-            "message_scene": { "ext": ["ref_msg_idx=REFIDX_Q"] },
-            "msg_elements": [
-                {
-                    "message_type": 103,
-                    "content": "原消息",
-                    "msg_idx": "REFIDX_Q",
-                    "attachments": [
-                        { "content_type": "image/png", "url": "https://media.example/q.png" },
-                    ],
-                },
-            ],
+    fn 正文清理只留用户敲的字() {
+        let cases = [
+            // @ 提及。
+            ("<@!abc> 文字", "文字"),
+            ("a <@abc> b", "a b"),
+            ("<@!abc>", ""),
+            // 表情：旧版 [<face,id=6/>]，新版 <faceType=…>。
+            ("[<face,id=6/>]", ""),
+            ("[<face,id=6>] 哈哈", "哈哈"),
+            (r#"看看<faceType=6,faceId="0",ext="eA==">"#, "看看"),
+            (r#"<faceType=6,faceId="0",ext="eA=="> 哈哈"#, "哈哈"),
+            // 平台内部标记；internal 之后直到 `]` 都算标记。
+            ("[internal: foo] 文字", "文字"),
+            ("[Debug] x", "x"),
+            ("[system]x", "x"),
+            ("[internalism] x", "x"),
+            // 合并转发摘要整条置空。
+            ("[群聊的聊天记录] === 消息 1 === [消息内容] 早", ""),
+            // 手打的符号与半截标记原样保留。
+            ("无标记 < 保持", "无标记 < 保持"),
+            ("a < b [c] d", "a < b [c] d"),
+            ("<faceType=6 后面没了", "<faceType=6 后面没了"),
+            ("<faceType=6,faceId=\"0\" x", "<faceType=6,faceId=\"0\" x"),
+            ("说到[群聊的聊天记录]这个词", "说到[群聊的聊天记录]这个词"),
+        ];
+        for (content, expected) in cases {
+            assert_eq!(sanitize_content(content), expected, "{content}");
+        }
+    }
+
+    #[test]
+    fn 纯表情消息没有正文段() {
+        let payload = json!({ "content": r#"<faceType=6,faceId="0",ext="eA==">"# });
+        assert!(message_segments(&payload).is_empty());
+    }
+
+    #[test]
+    fn 引用信号与reply段原样透传() {
+        // 各用例共用消息 id，各用一份入站去重表。
+        let segments_of_quote = |content: &str, ext: Value, elements: Value| {
+            let ctx = Context::for_tests();
+            let payload = quote_event(content, ext, elements);
+            segments_of(&translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap())
+        };
+
+        let card = json!({
+            "message_type": 103,
+            "msg_idx": "REFIDX",
+            "ark_data": { "ark_type": "miniapp", "fields": { "preview": "https://qq.ugcimg.cn/v1/PREVIEW" } },
+            "content": "[卡片消息] 小程序",
         });
-        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        let segments = segments_of(&event);
+        // 元素 message_type=103 即引用，ext 没有 ref 也算；ext 带 ref_msg_idx 也算。
+        let quoted = [
+            (json!(["msg_idx=SELF"]), card),
+            (json!(["ref_msg_idx=REFIDX"]), quoted_image()),
+        ];
+        for (ext, element) in quoted {
+            let segments = segments_of_quote(" 666", ext, json!([element.clone()]));
+            assert_eq!(segments[0].kind, "reply");
+            // data 是被引元素原样：字段名与结构不变。
+            assert_eq!(segments[0].data, element);
+            // 卡片预览图、被引图片都不收进正文图片段，用户正文照常成段。
+            assert_eq!(segments.len(), 2);
+            assert_eq!(segments[1].data["text"], "666");
+        }
+
+        // ref_msg_idx 取值为空不算引用。
+        let not_quoted = [
+            json!(["ref_msg_idx=", "msg_idx=SELF"]),
+            json!(["msg_idx=SELF"]),
+        ];
+        for ext in not_quoted {
+            let plain = json!({ "message_type": 0, "content": "普通消息" });
+            let segments = segments_of_quote(" 666", ext, json!([plain]));
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].kind, "text");
+        }
+
+        // 纯引用不打字只剩 reply 段。
+        let ext = json!(["ref_msg_idx=REFIDX"]);
+        let segments = segments_of_quote(" ", ext, json!([quoted_image()]));
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].kind, "reply");
-        assert_eq!(
-            segments[0].data["attachments"][0]["url"],
-            "https://media.example/q.png"
-        );
-    }
-
-    #[test]
-    fn 卡片引用原样携带ark数据() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "MSG-R3",
-            "group_openid": "GROUP-ABC",
-            "content": "看看这个",
-            "author": { "member_openid": "MEMBER-1", "username": "张三" },
-            "message_scene": { "ext": ["ref_msg_idx=REFIDX_CARD"] },
-            "msg_elements": [
-                {
-                    "ark_data": {
-                        "ark_name": "小程序",
-                        "ark_type": "miniapp",
-                        "fields": {
-                            "preview": "https://qq.ugcimg.cn/v1/PREVIEW",
-                            "source": "哔哩哔哩",
-                            "title": "我的新书要发售啦！"
-                        },
-                        "prompt": "[QQ小程序]我的新书要发售啦！"
-                    },
-                    "content": "[卡片消息] 小程序\n摘要: [QQ小程序]我的新书要发售啦！",
-                    "message_type": 103,
-                    "msg_idx": "REFIDX_CARD",
-                },
-            ],
-        });
-        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        let segments = segments_of(&event);
-        assert_eq!(segments[0].kind, "reply");
-        // 卡片是卡片：ark_data 原样透传，不收进图片。
-        assert_eq!(
-            segments[0].data["ark_data"]["fields"]["title"],
-            "我的新书要发售啦！"
-        );
-        assert!(segments[0].data.get("attachments").is_none());
-        // 用户正文照常成段。
-        assert_eq!(segments[1].kind, "text");
-    }
-
-    #[test]
-    fn 元素自带索引ext缺ref也产段() {
-        let ctx = Context::for_tests();
-        let payload = json!({
-            "id": "MSG-R4",
-            "group_openid": "GROUP-ABC",
-            "content": " ",
-            "message_type": 103,
-            "author": { "member_openid": "MEMBER-1", "username": "张三" },
-            "msg_elements": [
-                {
-                    "message_type": 103,
-                    "content": "被引的原文",
-                    "msg_idx": "REFIDX_FALLBACK",
-                },
-            ],
-        });
-        let event = translate(&ctx, "GROUP_MESSAGE_CREATE", &payload).unwrap();
-        let segments = segments_of(&event);
-        assert_eq!(segments[0].kind, "reply");
-        assert_eq!(segments[0].data["msg_idx"], "REFIDX_FALLBACK");
-        assert_eq!(segments[0].data["content"], "被引的原文");
     }
 }

@@ -67,18 +67,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 事件更新后可查询() {
+    fn 事件更新后可查询未命中为空() {
         let cache = MemberCache::new();
-        cache.update("G1", "U1", "昵称", Some("群名片"), Some("https://avatar"));
-        let info = cache.member_info("G1", "U1").unwrap();
-        assert_eq!(info["nickname"], "昵称");
-        assert_eq!(info["card"], "群名片");
-        assert_eq!(info["avatar"], "https://avatar");
-    }
+        assert!(cache.member_info("G1", "U1").is_none());
 
-    #[test]
-    fn 未命中无成员信息() {
-        let cache = MemberCache::new();
-        assert!(cache.member_info("G1", "U2").is_none());
+        cache.update("G1", "U1", "昵称", Some("群名片"), Some("https://avatar"));
+        assert_eq!(
+            cache.member_info("G1", "U1").unwrap(),
+            json!({ "nickname": "昵称", "card": "群名片", "avatar": "https://avatar" })
+        );
     }
 }

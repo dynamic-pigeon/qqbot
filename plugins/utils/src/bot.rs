@@ -8,8 +8,13 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use kovi::Message;
-use kovi::RuntimeBot;
+#[cfg(feature = "official")]
+use kovi::{ApiReturn, serde_json::json};
+use kovi::{Message, PluginBuilder, RuntimeBot};
+#[cfg(feature = "official")]
+use kovi_official::event::EventRegistrar as _;
+#[cfg(not(feature = "official"))]
+use kovi_onebot::{EventRegistrar as _, OnebotTrait as _};
 
 /// 机器人驱动栈。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +43,7 @@ pub trait MessageExt: Sized {
     fn add_image(self, file: &str) -> Self;
     /// @ 人：官方栈 id 是 openid，OneBot 栈是 QQ 号十进制串。
     fn add_at(self, id: &str) -> Self;
-    /// 引用回复：id 形态由栈决定（官方 ref_msg_idx 串 / OneBot 消息 id）。
+    /// 引用回复段，id 是 OneBot 消息 id；官方栈出站不使用该段。
     fn add_reply(self, id: &str) -> Self;
     fn push_image(&mut self, file: &str);
 }
@@ -102,7 +107,6 @@ pub fn message_segments_json(message: &Message) -> kovi::serde_json::Value {
 pub async fn bot_key(bot: &RuntimeBot) -> String {
     #[cfg(not(feature = "official"))]
     {
-        use kovi_onebot::OnebotTrait as _;
         bot.get_login_info()
             .await
             .ok()
@@ -279,18 +283,7 @@ where
     Fut: Future + Send,
     Fut::Output: Send,
 {
-    #[cfg(not(feature = "official"))]
-    {
-        use kovi::PluginBuilder;
-        use kovi_onebot::EventRegistrar as _;
-        PluginBuilder::on_msg(move |event| handler(event as Arc<dyn BotMsgEvent>));
-    }
-    #[cfg(feature = "official")]
-    {
-        use kovi::PluginBuilder;
-        use kovi_official::event::EventRegistrar as _;
-        PluginBuilder::on_msg(move |event| handler(event as Arc<dyn BotMsgEvent>));
-    }
+    PluginBuilder::on_msg(move |event| handler(event as Arc<dyn BotMsgEvent>));
 }
 
 /// 只监听群消息事件。
@@ -302,14 +295,10 @@ where
 {
     #[cfg(not(feature = "official"))]
     {
-        use kovi::PluginBuilder;
-        use kovi_onebot::EventRegistrar as _;
         PluginBuilder::on_group_msg(move |event| handler(event as Arc<dyn BotMsgEvent>));
     }
     #[cfg(feature = "official")]
     {
-        use kovi::PluginBuilder;
-        use kovi_official::event::EventRegistrar as _;
         PluginBuilder::on_group_msg(move |event| {
             handler(Arc::clone(&event.0) as Arc<dyn BotMsgEvent>)
         });
@@ -325,14 +314,10 @@ where
 {
     #[cfg(not(feature = "official"))]
     {
-        use kovi::PluginBuilder;
-        use kovi_onebot::EventRegistrar as _;
         PluginBuilder::on_private_msg(move |event| handler(event as Arc<dyn BotMsgEvent>));
     }
     #[cfg(feature = "official")]
     {
-        use kovi::PluginBuilder;
-        use kovi_official::event::EventRegistrar as _;
         PluginBuilder::on_private_msg(move |event| {
             handler(Arc::clone(&event.0) as Arc<dyn BotMsgEvent>)
         });
@@ -349,7 +334,6 @@ pub async fn send_group_message(
 ) -> Result<(), String> {
     #[cfg(not(feature = "official"))]
     {
-        use kovi_onebot::OnebotTrait as _;
         let group_id: i64 = group.parse().map_err(|_| format!("群号非法: {group}"))?;
         bot.send_group_msg_return(group_id, message)
             .await
@@ -361,7 +345,7 @@ pub async fn send_group_message(
     }
     #[cfg(feature = "official")]
     {
-        send_official(bot, "group", group, message, None).await
+        send_official(bot, "group", group, message).await
     }
 }
 
@@ -373,7 +357,6 @@ pub async fn send_private_message(
 ) -> Result<(), String> {
     #[cfg(not(feature = "official"))]
     {
-        use kovi_onebot::OnebotTrait as _;
         let user_id: i64 = user.parse().map_err(|_| format!("QQ 号非法: {user}"))?;
         bot.send_private_msg_return(user_id, message)
             .await
@@ -385,7 +368,7 @@ pub async fn send_private_message(
     }
     #[cfg(feature = "official")]
     {
-        send_official(bot, "private", user, message, None).await
+        send_official(bot, "private", user, message).await
     }
 }
 
@@ -406,19 +389,12 @@ async fn send_official(
     scope: &str,
     openid: &str,
     message: Message,
-    reply_to: Option<&str>,
 ) -> Result<(), String> {
-    use kovi::ApiReturn;
-    use kovi::serde_json::json;
-
-    let mut params = json!({
+    let params = json!({
         "scope": scope,
         "openid": openid,
         "message": message_segments_json(&message),
     });
-    if let Some(reply_to) = reply_to {
-        params["reply_to"] = json!(reply_to);
-    }
     match bot.send_api_return("official_send", params).await {
         Ok(_) => Ok(()),
         Err(ApiReturn {
@@ -472,7 +448,6 @@ pub async fn quoted_image_segments(
     }
     #[cfg(not(feature = "official"))]
     {
-        use kovi_onebot::OnebotTrait as _;
         let id = reply
             .data
             .get("id")
@@ -527,7 +502,6 @@ pub async fn member_profile(
 ) -> Result<MemberProfile, String> {
     #[cfg(not(feature = "official"))]
     {
-        use kovi_onebot::OnebotTrait as _;
         let group_id: i64 = group.parse().map_err(|_| format!("群号非法: {group}"))?;
         let user_id: i64 = user.parse().map_err(|_| format!("QQ 号非法: {user}"))?;
         let response = bot
@@ -554,8 +528,6 @@ pub async fn member_profile(
     }
     #[cfg(feature = "official")]
     {
-        use kovi::serde_json::json;
-
         let params = json!({ "group_openid": group, "member_openid": user });
         let info = bot
             .send_api_return("official_member_info", params)

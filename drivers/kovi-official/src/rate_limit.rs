@@ -1,7 +1,4 @@
-//! 单会话发送节流。
-//!
-//! 官方频控里最紧的一条是单群每分钟最多 20 条，被动 / 主动消息都算。
-//! 发送前在这里排队，窗口滑出后放行。
+//! 单会话发送节流：窗口内的发送次数超过上限时排队，窗口滑出后放行。
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -53,33 +50,22 @@ impl SendRateLimiter {
 
 #[cfg(test)]
 mod tests {
+    use kovi::tokio;
+
     use super::*;
 
-    #[test]
-    fn 窗口内超出上限需要等待() {
-        kovi::tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                let limiter = SendRateLimiter::new(Duration::from_millis(80), 2);
-                limiter.acquire("g1").await;
-                limiter.acquire("g1").await;
-                // 第 3 条必须等第一条滑出窗口，不应该立刻返回。
-                let start = Instant::now();
-                limiter.acquire("g1").await;
-                assert!(start.elapsed() >= Duration::from_millis(70));
-            });
-    }
+    #[kovi::tokio::test]
+    async fn 窗口内超出上限需要等待且会话之间互不影响() {
+        let limiter = SendRateLimiter::new(Duration::from_millis(80), 2);
+        limiter.acquire("g1").await;
+        limiter.acquire("g1").await;
 
-    #[test]
-    fn 不同会话互不影响() {
-        kovi::tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                let limiter = SendRateLimiter::new(Duration::from_secs(60), 1);
-                limiter.acquire("g1").await;
-                let start = Instant::now();
-                limiter.acquire("g2").await;
-                assert!(start.elapsed() < Duration::from_millis(200));
-            });
+        let start = Instant::now();
+        limiter.acquire("g2").await;
+        assert!(start.elapsed() < Duration::from_millis(70));
+
+        // 第 3 条必须等第一条滑出窗口，不应该立刻返回。
+        limiter.acquire("g1").await;
+        assert!(start.elapsed() >= Duration::from_millis(70));
     }
 }
